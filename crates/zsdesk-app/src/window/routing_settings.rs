@@ -107,7 +107,7 @@ impl WindowState {
                 false,
             ));
         }
-        let choice = super::input::popup(self.hwnd, &menu(items), Some(self.layout.app_menu));
+        let choice = super::input::popup(self.hwnd, &menu(items), Some(self.layout.settings_button));
         let result = match choice.as_deref() {
             Some("discover") => routing_control::request_discovery(&self.config_path, self.hwnd),
             Some("add") => match pick_executable(self.hwnd) {

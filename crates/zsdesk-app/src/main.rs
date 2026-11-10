@@ -4,12 +4,10 @@
 
 mod app;
 mod commands;
-// Compiled in every edition; unreachable without the `desktop` feature and dropped by the linker.
-#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
-mod desktop;
 mod edition;
 mod storage;
 mod window;
+mod settings;
 mod instance;
 mod reveal;
 mod context_preferences;
@@ -21,8 +19,8 @@ mod explorer_forwarder;
 mod runtime;
 mod context_menu_process;
 
-/// Lets the installer wait for all application windows and desktop guards to
-/// finish before replacing or uninstalling their files.
+/// Lets the installer wait for all application windows to finish before
+/// replacing or uninstalling their files.
 struct ApplicationLifetime(Option<windows::Win32::Foundation::HANDLE>);
 impl ApplicationLifetime {
     fn new() -> Self {
@@ -52,6 +50,7 @@ fn main() {
             let _=app::open_original_explorer(target);
             return;
         }
+        if app::is_recycle_bin() && app::open_original_explorer(zsdesk_core::model::explorer::RECYCLE_BIN_ADDRESS.into()).is_ok(){return;}
         if app::is_win_e() && app::open_original_explorer("shell:MyComputerFolder".into()).is_ok(){return;}
         let message:Vec<u16>=format!("{error:#}").encode_utf16().chain(Some(0)).collect();
         unsafe {windows::Win32::UI::WindowsAndMessaging::MessageBoxW(None,windows::core::PCWSTR(message.as_ptr()),

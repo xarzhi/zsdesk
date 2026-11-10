@@ -46,7 +46,7 @@ use windows::{core::{PCWSTR, PWSTR}, Win32::{
     Foundation::{COLORREF, HWND, HINSTANCE, LPARAM, LRESULT, WPARAM, POINT, RECT},
     Graphics::{Dwm::DwmDefWindowProc, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint,
         InvalidateRect, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
-        MonitorFromRect, MONITOR_DEFAULTTONULL}},
+        MonitorFromRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL}},
     System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_LINK, DROPEFFECT_NONE}},
     UI::{Controls::*, HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi},
         Input::KeyboardAndMouse::*, Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
@@ -155,6 +155,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     state.secondary_window = secondary_window;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
+    // A window opened from an already running one cascades instead of covering it.
+    let (x, y, w, h) = if secondary_window && !placement.is_some_and(|p| p.maximized) {
+        cascade_rect((x, y, w, h), unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96))
+    } else { (x, y, w, h) };
     let hwnd = unsafe { CreateWindowExW(WINDOW_EX_STYLE::default(), pcwstr(&class), PCWSTR(wide("ZSDesk").as_ptr()),
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, w, h, None, None, Some(instance), Some((&*slot as *const Slot).cast()))? };
     // Apply the custom frame before anything is painted.
@@ -289,6 +293,27 @@ fn initial_rect(placement: Option<WindowPlacement>) -> (i32, i32, i32, i32) {
     (CW_USEDEFAULT, CW_USEDEFAULT, scale(1180, dpi), scale(760, dpi))
 }
 
+/// Additional windows start at the saved position; each one steps down and
+/// right from the previous window by a fixed offset, so a new window never
+/// hides exactly behind the one that opened it and the cascade stays legible
+/// however many windows are open. Once the work area runs out the cascade
+/// restarts near its corner.
+fn cascade_rect(rect: (i32, i32, i32, i32), dpi: u32) -> (i32, i32, i32, i32) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    /// Origin of the last window this process placed, if any.
+    static LAST: std::sync::Mutex<Option<(i32, i32)>> = std::sync::Mutex::new(None);
+    let (x, y, w, h) = rect;
+    if x == CW_USEDEFAULT { return rect; }
+    let monitor = unsafe { MonitorFromRect(&RECT { left: x, top: y, right: x + w, bottom: y + h }, MONITOR_DEFAULTTONEAREST) };
+    let mut area = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let work = if !monitor.is_invalid() && unsafe { GetMonitorInfoW(monitor, &mut area) }.as_bool() { area.rcWork }
+        else { RECT { left: 0, top: 0, right: i32::MAX, bottom: i32::MAX } };
+    let previous = LAST.lock().ok().and_then(|last| *last);
+    let (left, top) = geometry::cascaded_origin(previous, (x, y), (w, h), scale(28, dpi), scale(24, dpi), work);
+    if let Ok(mut last) = LAST.lock() { *last = Some((left, top)); }
+    (left, top, w, h)
+}
+
 fn is_text_box(hwnd: HWND) -> bool {
     [ID_ADDRESS as i32, ID_BOOKMARK_RENAME as i32, ID_SEARCH as i32].contains(&unsafe { GetDlgCtrlID(hwnd) })
 }
@@ -347,6 +372,8 @@ struct WindowState {
     tab_drag: Option<TabDrag>,
     splitter_drag: Option<(i32, i32)>,
     icons: HashMap<String, paint::IconEntry>,
+    /// Embedded application icon shown at the far left of the title bar.
+    app_icon: Option<paint::IconEntry>,
     view_status: ViewStatus,
     view_mode: (i32, i32),
     bookmark_widths: Vec<i32>,
@@ -393,7 +420,7 @@ impl WindowState {
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, splitter_drag: None,
-            icons: HashMap::new(), view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),
+            icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
             launch_selection, launch_selections:Vec::new(), open_requests: Default::default(), search_scope: None, search_result: None,
@@ -464,8 +491,9 @@ impl WindowState {
         let level = integration::current();
         if level == Integration::Off { return; }
         if level==Integration::Default {
+            let recycle=self.session.ui.recycle_bin_takeover;
             if let Ok(exe)=std::env::current_exe(){
-                if let Err(error)=integration::upgrade_default(&exe,&self.config_path.with_file_name("takeover-backup.json")) {
+                if let Err(error)=integration::upgrade_default(&exe,&self.config_path.with_file_name("takeover-backup.json"),recycle) {
                     self.show_message(format!("Win+E 接管尚未更新：{error}"));
                 }
             }
@@ -475,7 +503,7 @@ impl WindowState {
         if std::path::Path::new(&registered).exists() { return; }
         if let Ok(exe) = std::env::current_exe() {
             let backup = self.config_path.with_file_name("takeover-backup.json");
-            if integration::apply(level, &exe, &backup).is_err() { self.show_message("系统集成需要修复：请在 ≡ → 系统集成 中重新选择".into()); }
+            if integration::apply(level, &exe, &backup, self.session.ui.recycle_bin_takeover).is_err() { self.show_message("系统集成需要修复：请在“设置 → 系统集成”中重新选择".into()); }
         }
     }
 
@@ -515,7 +543,8 @@ impl WindowState {
             width, height, dpi: self.dpi, caption_width: self.caption_width(),
             caption_button: self.caption_buttons().map(|r|r[0]), command_bar: &self.session.ui.command_bar,
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
-            show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
+            single_tab: zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS,
+            show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS||self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
             show_bookmarks: self.session.ui.show_bookmarks, status_bar: !self.status.is_empty() || self.search_progress.is_some(), bookmark_widths: &self.bookmark_widths,
         };
         let mut layout=ChromeLayout::new(&input);
@@ -611,6 +640,49 @@ impl WindowState {
         let cue = wide(&format!("搜索 {}", self.current_location().title()));
         unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); }
         for edit in [self.address_edit, self.search_edit] { theme::theme_control(edit, self.dark); }
+    }
+
+    /// The settings dialog edits the saved preferences on its own; this pulls
+    /// them back in and re-applies everything they drive.
+    fn reload_preferences(&mut self) {
+        let Ok(saved) = storage::load(&self.config_path) else { return };
+        let old = std::mem::replace(&mut self.session.ui, saved.ui);
+        let ui = self.session.ui.clone();
+        if old.appearance != ui.appearance {
+            self.apply_theme();
+            self.theme_children();
+            if old.appearance.color_scheme != ui.appearance.color_scheme {
+                self.set_panes(ui.show_preview, ui.show_details);
+            }
+        }
+        if old.context_menu != ui.context_menu {
+            self.modern = ui.context_menu.mode == zsdesk_core::model::explorer::ContextMenuMode::Windows11;
+            let options = crate::context_preferences::native(&ui.context_menu);
+            zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
+            if let Some(browser) = &self.browser { browser.set_context_menu_options(options); }
+        }
+        if old.search_all_files != ui.search_all_files {
+            let scope = if ui.search_all_files { None } else {
+                self.search_scope.as_ref().unwrap_or_else(|| self.current_location()).as_path().map(PathBuf::from)
+            };
+            self.search_controls_mut().scope = scope;
+            unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 20, None); }
+        }
+        if old.search_backend != ui.search_backend { self.search_backend_changed(); }
+        self.crumbs_for = None;
+        self.measure_bookmarks();
+        self.relayout();
+        self.position_children();
+        if self.pending.is_none() && ui.show_tree && old.show_tree != ui.show_tree {
+            if let Some(tree) = &self.tree {
+                let location = self.current_location();
+                if !matches!(location, ShellLocation::Search { .. }) {
+                    unsafe { tree.select_location_with_policy(location, self.navigation_auto_expand()); }
+                }
+            }
+        }
+        unsafe { self.update_address(); }
+        self.invalidate();
     }
 
     fn refresh_system_theme(&mut self){
@@ -728,9 +800,12 @@ fn caption_rects(hwnd:HWND)->Option<[LayoutRect;3]>{
         if let Some(bounds)=theme::caption_button_bounds(hwnd){
             let mut window=RECT::default();unsafe{GetWindowRect(hwnd,&mut window)}.ok()?;
             let mut origin=POINT::default();unsafe{ClientToScreen(hwnd,&mut origin)}.ok().ok()?;
-            let x=bounds.left-(origin.x-window.left);let y=(bounds.top-(origin.y-window.top)).max(0);
-            let width=(bounds.right-bounds.left)/3;let height=bounds.bottom-(origin.y-window.top)-y;
-            if width>0&&height>0&&x>=0&&x<client.right{return Some([0,1,2].map(|i|LayoutRect::new(x+width*i,y,width,height)));}
+            // DWM reports the whole button band, which starts at the frame border
+            // and is a few pixels wider than the three buttons; the buttons
+            // themselves are one `scale(46)` cell wide and end at the client edge.
+            let y=(bounds.top-(origin.y-window.top)).max(0);
+            let width=scale(46,dpi);let height=bounds.bottom-(origin.y-window.top)-y;
+            if height>0&&client.right>=width*3{return Some([0,1,2].map(|i|LayoutRect::new(client.right-width*(3-i),y,width,height)));}
         }
     }
     let width=scale(46,dpi);Some([0,1,2].map(|i|LayoutRect::new(client.right-width*(3-i),0,width,scale(STRIP_H,dpi))))
@@ -854,6 +929,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             if data.dwData==crate::reveal::VERIFY_THIS_PC&&data.cbData==0{
                 let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
                 let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()&&matches!(state.current_location(),ShellLocation::ThisPc)));
+                return LRESULT(accepted as isize);
+            }
+            if data.dwData==crate::reveal::VERIFY_RECYCLE_BIN&&data.cbData==0{
+                let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
+                let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()
+                    &&matches!(state.current_location(),ShellLocation::Shell{parsing_name,..} if parsing_name.eq_ignore_ascii_case(zsdesk_core::model::explorer::RECYCLE_BIN_ADDRESS))));
                 return LRESULT(accepted as isize);
             }
             if data.dwData==crate::reveal::VERIFY_TAG {
@@ -1199,6 +1280,14 @@ impl WindowState {
             },
             message if message >= 0xC000 && message == zsdesk_windows::shell::menu::failure_message() => {
                 self.show_message(format!("右键菜单加载失败（0x{:08X}），隐藏设置仍保留。", wp.0 as u32));
+            }
+            crate::settings::WM_SETTINGS_CHANGED => self.reload_preferences(),
+            crate::settings::WM_SETTINGS_ACTION => {
+                if lp.0 != 0 {
+                    let action = unsafe { *Box::from_raw(lp.0 as *mut String) };
+                    unsafe { self.run_app_action(Some(action.as_str())) };
+                    return Some(LRESULT(1));
+                }
             }
             WM_DESTROY => { crate::runtime::trace("window-destroy");unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
             _ => return None,

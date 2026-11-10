@@ -89,6 +89,9 @@ pub struct ChromeInput<'a> {
     pub caption_button: Option<Rect>,
     pub tab_count: usize,
     pub active_tab: usize,
+    /// One tab per window: the strip keeps the caption and the menu only, and
+    /// every tab placement collapses to the title bar.
+    pub single_tab: bool,
     pub show_tree: bool,
     pub tree_width: i32,
     pub show_bookmarks: bool,
@@ -203,12 +206,14 @@ impl SearchPanelLayout {
 pub struct ChromeLayout {
     pub dpi: u32,
     pub strip: Rect,
+    /// Application mark at the very left of the title bar.
+    pub app_icon: Rect,
     pub tab_panel: Rect,
     pub vertical_tabs: bool,
     pub tabs: Vec<TabSlot>,
     pub new_tab: Rect,
     pub tab_list: Rect,
-    pub app_menu: Rect,
+    pub settings_button: Rect,
     pub nav_row: Rect,
     pub back: Rect,
     pub forward: Rect,
@@ -244,7 +249,7 @@ pub enum Hit {
     TabClose(usize),
     NewTab,
     TabList,
-    AppMenu,
+    Settings,
     Back,
     Forward,
     Up,
@@ -270,46 +275,57 @@ impl ChromeLayout {
         let height = input.height.max(0);
         let mut layout = ChromeLayout { dpi, ..Default::default() };
 
-        // Tab strip (title bar).
+        // Tab strip (title bar). The caption buttons are anchored to the top of
+        // the frame, so the strip is exactly as tall as the button band plus the
+        // same offset above it: that keeps the group centred with no dead band
+        // underneath it.
         let caption = input.caption_button.filter(|r| !r.is_empty());
-        let strip_height = s(STRIP_H).max(caption.map_or(0, |r| r.bottom()));
+        let strip_height = caption.map_or(s(STRIP_H), |r| (r.bottom() + r.y.max(0)).max(s(24)));
         layout.strip = Rect::clamped(0, 0, width, strip_height);
+        // The application mark owns the leftmost slot of the title bar: tabs,
+        // the tab count and the window title all start after it.
+        let mark = s(16);
+        layout.app_icon = Rect::clamped(s(10), ((strip_height - mark) / 2).max(0), mark, mark);
+        let content_left = layout.app_icon.right() + s(8);
         let tab_y = s(TAB_TOP);
         let tab_h = strip_height - tab_y;
         let button = caption.map_or(s(46), |r| r.width);
         let button_h = caption.map_or(s(STRIP_H), |r| r.height);
         let button_y = caption.map_or(0, |r| r.y);
         let caption_left = caption.map_or(width - input.caption_width.max(0), |r| r.x).clamp(0, width);
-        let right_edge = (caption_left - s(4)).max(0);
+        // No gap: the gear sits flush against the system caption buttons.
+        let right_edge = caption_left.max(0);
         if right_edge >= button {
-            layout.app_menu = Rect::clamped(right_edge - button, button_y, button, button_h);
-            if layout.app_menu.x >= button + s(2) {
-                layout.tab_list = Rect::clamped(layout.app_menu.x - s(2) - button, button_y, button, button_h);
+            layout.settings_button = Rect::clamped(right_edge - button, button_y, button, button_h);
+            if !input.single_tab && layout.settings_button.x >= button + s(2) {
+                layout.tab_list = Rect::clamped(layout.settings_button.x - s(2) - button, button_y, button, button_h);
             }
         }
-        let drag_space = s(40);
-        let tabs_left = s(8);
-        let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x } else { layout.app_menu.x };
-        let tabs_right = (utility_left - drag_space - button - s(4)).max(tabs_left);
-        let available = tabs_right - tabs_left;
-        let count = input.tab_count.max(1) as i32;
-        let natural = (available / count).clamp(s(TAB_MIN_W), s(TAB_MAX_W)).min(available);
-        let visible = if available > 0 { ((available / natural.max(1)).max(1) as usize).min(input.tab_count.max(1)) } else { 0 };
-        let first = first_visible(input.tab_count, input.active_tab, visible);
-        let mut x = tabs_left;
-        for index in first..(first + visible).min(input.tab_count) {
-            let rect = Rect::clamped(x, tab_y, natural, tab_h);
-            let close = Rect::clamped(rect.right() - s(8) - s(24), tab_y + (tab_h - s(24)) / 2, s(24), s(24));
-            let show_close = natural >= s(96) || index == input.active_tab;
-            layout.tabs.push(TabSlot { index, rect, close, show_close });
-            x += natural;
-        }
-        if x + s(4) + button <= utility_left {
-            layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
+        if !input.single_tab {
+            let drag_space = s(40);
+            let tabs_left = content_left;
+            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x } else { layout.settings_button.x };
+            let tabs_right = (utility_left - drag_space - button - s(4)).max(tabs_left);
+            let available = tabs_right - tabs_left;
+            let count = input.tab_count.max(1) as i32;
+            let natural = (available / count).clamp(s(TAB_MIN_W), s(TAB_MAX_W)).min(available);
+            let visible = if available > 0 { ((available / natural.max(1)).max(1) as usize).min(input.tab_count.max(1)) } else { 0 };
+            let first = first_visible(input.tab_count, input.active_tab, visible);
+            let mut x = tabs_left;
+            for index in first..(first + visible).min(input.tab_count) {
+                let rect = Rect::clamped(x, tab_y, natural, tab_h);
+                let close = Rect::clamped(rect.right() - s(8) - s(24), tab_y + (tab_h - s(24)) / 2, s(24), s(24));
+                let show_close = natural >= s(96) || index == input.active_tab;
+                layout.tabs.push(TabSlot { index, rect, close, show_close });
+                x += natural;
+            }
+            if x + s(4) + button <= utility_left {
+                layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
+            }
         }
 
         let full_width=width;
-        let panel_width=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{0}else{s(210).min((width-s(440)).max(s(140))).min(width)};
+        let panel_width=if input.single_tab||input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{0}else{s(210).min((width-s(440)).max(s(140))).min(width)};
         let content_offset=if input.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left{panel_width}else{0};
         let width=(width-panel_width).max(0);
         // Bookmarks bar, directly under the tabs.
@@ -460,7 +476,7 @@ impl ChromeLayout {
             }
             if self.new_tab.contains(x, y) { return Hit::NewTab; }
             if self.tab_list.contains(x, y) { return Hit::TabList; }
-            if self.app_menu.contains(x, y) { return Hit::AppMenu; }
+            if self.settings_button.contains(x, y) { return Hit::Settings; }
             return if self.strip.contains(x,y){Hit::Caption}else{Hit::None};
         }
         if self.nav_row.contains(x, y) {
@@ -557,8 +573,41 @@ mod tests {
 
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
-            tab_count: tabs, active_tab: active, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
+            tab_count: tabs, active_tab: active, single_tab: false, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
             command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+    }
+
+    #[test]
+    fn single_tab_windows_keep_the_caption_and_menu_only() {
+        for placement in [zsdesk_core::model::explorer::TabPlacement::Top,
+            zsdesk_core::model::explorer::TabPlacement::Left, zsdesk_core::model::explorer::TabPlacement::Right] {
+            let layout = ChromeLayout::new(&ChromeInput { tab_placement: placement, single_tab: true, ..input(1200, 1, 0, 96) });
+            assert!(layout.tabs.is_empty() && layout.new_tab.is_empty() && layout.tab_list.is_empty());
+            assert!(layout.tab_panel.is_empty() && !layout.vertical_tabs);
+            assert!(!layout.settings_button.is_empty(), "the application menu stays reachable");
+            // The whole strip is window drag area, and no tab hit target exists.
+            assert_eq!(layout.hit(600, 20), Hit::Caption);
+            assert_eq!(layout.hit(layout.settings_button.x + 2, layout.settings_button.y + 2), Hit::Settings);
+        }
+    }
+
+    #[test]
+    fn the_app_mark_owns_the_leftmost_title_bar_slot() {
+        use zsdesk_core::model::explorer::TabPlacement;
+        for dpi in [96, 120, 144, 192] {
+            for placement in [TabPlacement::Top, TabPlacement::Left, TabPlacement::Right] {
+                let single = ChromeLayout::new(&ChromeInput { tab_placement: placement, single_tab: true, ..input(scale(1200, dpi), 1, 0, dpi) });
+                assert_eq!(single.app_icon.x, scale(10, dpi));
+                assert_eq!(single.app_icon.y * 2 + single.app_icon.height, single.strip.height, "the mark is centred in the strip");
+                assert!(single.app_icon.right() + scale(8, dpi) <= single.settings_button.x);
+                // The mark is window drag area, not a button.
+                assert_eq!(single.hit(single.app_icon.x + 3, single.app_icon.y + 3), Hit::Caption);
+            }
+            // Tabs begin after the mark instead of sliding underneath it.
+            let tabs = ChromeLayout::new(&input(scale(1200, dpi), 3, 0, dpi));
+            assert_eq!(tabs.tabs[0].rect.x, tabs.app_icon.right() + scale(8, dpi));
+            assert!(tabs.tab_list.x > tabs.app_icon.right());
+        }
     }
 
     #[test]
@@ -609,7 +658,7 @@ mod tests {
             assert_eq!(l.status.bottom(), 800);
             assert!(l.address.right() < l.search.x);
             assert!(l.tabs.iter().all(|t| t.rect.right() <= l.new_tab.x));
-            assert!(l.app_menu.right() <= 1400 - scale(138, dpi));
+            assert!(l.settings_button.right() <= 1400 - scale(138, dpi));
         }
     }
 
@@ -701,12 +750,15 @@ mod tests {
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
             assert_eq!(l.new_tab.y, l.tabs[0].rect.y);
             assert_eq!(l.new_tab.height, l.tabs[0].rect.height);
-            for rect in [l.tab_list, l.app_menu] {
+            for rect in [l.tab_list, l.settings_button] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);
-                assert!(rect.right() < caption.x);
+                assert!(rect.right() <= caption.x);
             }
+            assert_eq!(l.settings_button.right(), caption.x, "the gear sits flush against the system buttons");
+            assert!(l.tab_list.right() < l.settings_button.x, "the tab list keeps its own slot");
+            assert_eq!(l.strip.height, caption.y * 2 + caption.height, "the bar ends where the button band is centred");
         }
     }
 

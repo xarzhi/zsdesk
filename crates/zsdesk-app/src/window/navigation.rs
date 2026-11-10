@@ -24,6 +24,13 @@ impl WindowState {
             if let (Some(browser),Some(name))=(&self.browser,request.selection){let _=browser.select_child(&name);}
             return;
         }
+        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+            // One tab per window: a request for another folder opens its own
+            // window instead of replacing this window's folder.
+            let selection=request.selection.or_else(||request.selections.first().cloned());
+            self.open_in_new_window(request.location,selection);
+            return;
+        }
         self.launch_selection=request.selection;
         self.launch_selections=request.selections;
         if let Some(index)=index {unsafe {self.select_tab(index);}}
@@ -166,6 +173,11 @@ impl WindowState {
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
     }
     pub(super) unsafe fn new_tab(&mut self,location:ShellLocation) {
+        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+            // One tab per window: the location opens in a new window.
+            self.open_in_new_window(location,None);
+            return;
+        }
         unsafe {self.capture_active();}
         let id=self.session.take_id();
         self.session.tabs.push(ExplorerTab::new(id,location));
@@ -180,6 +192,11 @@ impl WindowState {
         unsafe {self.rebuild_tabs();self.navigate_current();}
     }
     pub(super) unsafe fn close_tab(&mut self,index:usize) {
+        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+            // The only tab is the window.
+            let _=unsafe{PostMessageW(Some(self.hwnd),WM_CLOSE,WPARAM(0),LPARAM(0))};
+            return;
+        }
         if index>=self.session.tabs.len() {return;}
         unsafe {self.capture_active();}
         let active_id=self.session.active_tab().id;
@@ -196,6 +213,10 @@ impl WindowState {
         self.save();
     }
     pub(super) unsafe fn reopen_tab(&mut self) {
+        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+            if let Some(tab)=self.closed_tabs.pop() {let location=tab.current().clone();self.open_in_new_window(location,None);}
+            return;
+        }
         if let Some(mut tab)=self.closed_tabs.pop() {
             unsafe {self.capture_active();}
             tab.id=self.session.take_id();self.session.tabs.push(tab);self.session.active_tab=self.session.tabs.len()-1;

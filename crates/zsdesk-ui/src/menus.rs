@@ -137,7 +137,7 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
     let buttons = COMMAND_BAR_CHOICES.iter().map(|(label, key)| {
         entry(label, &format!("command-bar-item-{}", key.key()), true, ui.command_bar.item_visible(*key))
     }).collect();
-    menu(vec![
+    let mut items = vec![
         entry("显示命令栏", "command-bar-visible", true, ui.command_bar.visible),
         submenu("命令栏按钮", buttons),
         item("恢复命令栏默认设置", "command-bar-defaults"),
@@ -146,11 +146,16 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
         entry("展开到当前文件夹", "navigation-auto-expand", true, ui.navigation_auto_expand.unwrap_or(false)),
         item("跟随系统导航展开设置", "navigation-expand-system"),
         entry("收藏栏", "interface-bookmarks", true, ui.show_bookmarks),
-        submenu("标签栏位置",vec![
+    ];
+    // A single-tab window has no tab bar to place.
+    if !zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+        items.push(submenu("标签栏位置",vec![
             entry("上方","tab-placement-top",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top),
             entry("左侧","tab-placement-left",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left),
             entry("右侧","tab-placement-right",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Right),
-        ]),
+        ]));
+    }
+    items.extend([
         entry("空格快速预览", "space-preview", true, ui.space_preview),
         submenu("快速预览插件优先级", vec![
             entry("系统默认", "preview-provider-system", true, ui.preview_provider == PreviewProviderPreference::System),
@@ -167,7 +172,8 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
             item("启用快速索引服务…", "search-everything-service"),
             item("选择已安装的 Everything…","search-everything-program"),
         ]),
-    ])
+    ]);
+    menu(items)
 }
 
 /// Applies a recognized settings choice; the host then saves and relayouts.
@@ -244,61 +250,6 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
         _ => return false,
     }
     true
-}
-
-/// State shown in the application menu.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AppMenuState {
-    pub forward_unhandled_windows: bool,
-    /// `None` when this edition has no desktop fences.
-    pub desktop_running: Option<bool>,
-    /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
-    pub integration: u8,
-}
-
-/// Application menu (≡) next to the window buttons.
-pub fn app_menu(state: AppMenuState) -> MenuSpec {
-    app_menu_with_capabilities(state, false)
-}
-
-pub fn app_menu_with_capabilities(state: AppMenuState, themed: bool) -> MenuSpec {
-    let mut items = vec![item("新建标签页\tCtrl+T", "new-tab"),item("窗口内搜索\tCtrl+F","quick-search"),
-        item("开机启动与搜索快捷键…", "quick-search-settings"),
-        item("重建文件名索引","search-rebuild-index"), MenuItemSpec::Separator];
-    if themed { items.push(item("主题与材质", "appearance-settings")); }
-    if let Some(running) = state.desktop_running {
-        items.push(submenu("桌面格子", vec![
-            item(if running { "显示桌面格子" } else { "启动桌面格子" }, "desktop-start"),
-            item("一键整理桌面", "desktop-organize"),
-            item("将当前文件夹映射为格子", "desktop-map"),
-            MenuItemSpec::Separator,
-            entry("显示托盘图标", "desktop-tray", running, false),
-            entry("退出桌面格子", "desktop-quit", running, false),
-        ]));
-    }
-    items.push(submenu("系统集成", vec![
-        entry("不接管", "integration-off", true, state.integration == 0),
-        entry("右键菜单“使用 ZSDesk 打开”", "integration-context", true, state.integration == 1),
-        entry("默认打开文件夹、磁盘和此电脑", "integration-default", true, state.integration == 2),
-        entry("接管新出现的系统浏览窗口", "integration-forward-unhandled", state.integration == 2, state.forward_unhandled_windows),
-        MenuItemSpec::Separator,
-        entry("恢复系统资源管理器", "integration-restore", state.integration != 0, false),
-        MenuItemSpec::Separator,
-        item("文件位置转发…", "routing-settings"),
-    ]));
-    let mut rest = vec![
-        MenuItemSpec::Separator,
-        item("界面设置", "interface-settings"),
-        item("右键菜单设置", "context-menu-settings"),
-        MenuItemSpec::Separator,
-        item("收藏当前文件夹\tCtrl+D", "bookmark"),
-        item("文件夹选项", "folder-options"),
-        item("键盘快捷键", "shortcuts"),
-        MenuItemSpec::Separator,
-        item("关于 ZSDesk", "about"),
-    ];
-    items.append(&mut rest);
-    menu(items)
 }
 
 pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
@@ -385,9 +336,9 @@ mod tests {
         ui.show_bookmarks = false;
         ui.command_bar.visible = false;
         ui.command_bar.hidden_items = CommandBarItem::ALL.to_vec();
-        let app = ids(&app_menu(AppMenuState::default()));
-        assert!(app.contains(&"interface-settings".into()));
-        assert!(app.contains(&"context-menu-settings".into()));
+        let settings = nested_ids(&interface_settings_menu(&ui));
+        assert!(settings.contains(&"interface-bookmarks".into()));
+        assert!(settings.contains(&"command-bar-visible".into()));
         for id in nested_ids(&interface_settings_menu(&ui)) {
             assert!(apply_interface_setting(&mut ui.clone(), &id)||interface_requires_dialog(&id), "unhandled setting {id}");
         }

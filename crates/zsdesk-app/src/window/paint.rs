@@ -38,6 +38,31 @@ impl WindowState {
         entry.bitmap.as_ref().map(|(_, b)| b.clone())
     }
 
+    /// Loads (once) the embedded application icon for the title-bar mark.
+    fn app_mark(&mut self) -> Option<ID2D1Bitmap> {
+        let px = self.s(ICON_DIP);
+        let gfx = self.gfx.as_ref()?;
+        let generation = gfx.generation();
+        if self.app_icon.is_none() {
+            let wic = unsafe { GetModuleHandleW(None) }.ok()
+                .and_then(|module| unsafe {
+                    LoadImageW(Some(HINSTANCE(module.0)), PCWSTR(101 as *const u16), IMAGE_ICON, px, px, LR_DEFAULTCOLOR).ok()
+                })
+                .and_then(|handle| {
+                    let icon = HICON(handle.0);
+                    let wic = gfx.wic_from_icon(icon);
+                    let _ = unsafe { DestroyIcon(icon) };
+                    wic
+                });
+            self.app_icon = Some(IconEntry { wic, bitmap: None });
+        }
+        let entry = self.app_icon.as_mut()?;
+        if entry.bitmap.as_ref().is_none_or(|(g, _)| *g != generation) {
+            entry.bitmap = entry.wic.as_ref().and_then(|w| gfx.upload(w)).map(|b| (generation, b));
+        }
+        entry.bitmap.as_ref().map(|(_, b)| b.clone())
+    }
+
     pub(super) fn paint(&mut self) {
         let (width, height) = self.client_size();
         if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
@@ -48,9 +73,10 @@ impl WindowState {
         let address_icon = self.icon_for(&current);
         let bookmark_icons: Vec<Option<ID2D1Bitmap>> = (0..self.layout.bookmarks.len())
             .map(|i| { let t = self.session.bookmarks[i].target.clone(); self.icon_for(&t) }).collect();
+        let mark = self.app_mark();
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
         let result = gfx.draw(surface, |cv| {
-            self.paint_strip(cv, &tab_icons);
+            self.paint_strip(cv, &tab_icons, mark.as_ref());
             self.paint_nav(cv, address_icon.as_ref());
             self.paint_commands(cv);
             self.paint_bookmarks(cv, &bookmark_icons);
@@ -58,7 +84,10 @@ impl WindowState {
             self.paint_content(cv);
             self.paint_status(cv);
         });
-        if result.is_err() { self.icons.values_mut().for_each(|e| e.bitmap = None); }
+        if result.is_err() {
+            self.icons.values_mut().for_each(|e| e.bitmap = None);
+            if let Some(mark) = self.app_icon.as_mut() { mark.bitmap = None; }
+        }
     }
 
     fn button_fill(&self, cv: &Canvas, rect: LayoutRect, hit: Hit, radius: f32) {
@@ -75,7 +104,7 @@ impl WindowState {
         } else { cv.fill(rect, c(self.palette.layer)); }
     }
 
-    fn paint_strip(&self, cv: &Canvas, icons: &[Option<ID2D1Bitmap>]) {
+    fn paint_strip(&self, cv: &Canvas, icons: &[Option<ID2D1Bitmap>], mark: Option<&ID2D1Bitmap>) {
         let p = &self.palette;
         let strip = rf(self.layout.strip);
         // With a system material, transparent pixels expose the DWM backdrop; otherwise use the
@@ -84,16 +113,30 @@ impl WindowState {
         // Fullscreen has no extended DWM frame: transparent pixels otherwise
         // become black and hide the dark caption glyphs.
         if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
+        // Application mark: far left of the title bar, above the strip tint.
+        if let Some(bitmap) = mark {
+            let rect = rf(self.layout.app_icon);
+            if rect.w > 0.0 { cv.image(bitmap, pixel_aligned_icon(rect), 1.0); }
+        }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
         let active = self.session.active_tab;
         let radius = self.sf(8.0);
         let foot = self.sf(6.0);
+        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+            // One tab per window: the strip names the open folder and stays the
+            // window's drag area instead of showing a tab. The title starts
+            // after the application mark at the far left.
+            let right = if self.layout.settings_button.is_empty() { strip.w } else { self.layout.settings_button.x as f32 - self.sf(10.0) };
+            let left = self.layout.app_icon.right() as f32 + self.sf(8.0);
+            let title = self.session.current_location().title();
+            cv.text(&title, RectF::new(left, strip.y, (right - left).max(0.0), strip.h), &self.ui_style(), text);
+        }
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
             cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
             let title=self.session.current_location().title();
-            cv.text(&title,RectF::new(self.sf(14.0),strip.y,(self.layout.tab_list.x as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
+            cv.text(&title,RectF::new(self.layout.app_icon.right() as f32+self.sf(8.0),strip.y,(self.layout.tab_list.x as f32-self.sf(24.0)).max(0.0),strip.h),&self.ui_style(),text);
         }
         for (n, slot) in self.layout.tabs.iter().enumerate() {
             let r = rf(slot.rect);
@@ -146,9 +189,9 @@ impl WindowState {
             cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
             cv.text(&label, badge, &TextStyle::ui(self.sf(if label.len()>4{9.0}else{11.0})).weight(600).align(Align::Center), text);
         }
-        if !self.layout.app_menu.is_empty() {
-            self.button_fill(cv, self.layout.app_menu, Hit::AppMenu, self.sf(4.0));
-            cv.glyph(glyph::MENU, rf(self.layout.app_menu), self.sf(14.0), text);
+        if !self.layout.settings_button.is_empty() {
+            self.button_fill(cv, self.layout.settings_button, Hit::Settings, self.sf(4.0));
+            cv.glyph(glyph::SETTINGS, rf(self.layout.settings_button), self.sf(14.0), text);
         }
         if !native_caption(self.hwnd) { self.paint_caption_buttons(cv, text); }
     }

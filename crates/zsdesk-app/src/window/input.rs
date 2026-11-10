@@ -98,7 +98,7 @@ impl WindowState {
         Some(match hit {
             Hit::None | Hit::Splitter => return None,
             Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab if self.layout.vertical_tabs=>self.layout.tab_panel,
-            Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::AppMenu => self.layout.strip,
+            Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::Settings => self.layout.strip,
             Hit::Search if self.search_panel.open => self.layout.search,
             Hit::SearchPanel(_) => self.layout.search,
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::Address | Hit::Search => self.layout.nav_row,
@@ -116,7 +116,7 @@ impl WindowState {
             Hit::TabClose(i) => ("关闭标签页 (Ctrl+W)".into(), self.layout.tabs.iter().find(|t| t.index == i).map(|t| t.close).unwrap_or_default()),
             Hit::NewTab => ("新建标签页 (Ctrl+T)".into(), self.layout.new_tab),
             Hit::TabList => (format!("所有标签页（{} 个）", self.session.tabs.len()), self.layout.tab_list),
-            Hit::AppMenu => ("菜单".into(), self.layout.app_menu),
+            Hit::Settings => ("设置".into(), self.layout.settings_button),
             Hit::Back => ("后退 (Alt+左箭头)".into(), self.layout.back),
             Hit::Forward => ("前进 (Alt+右箭头)".into(), self.layout.forward),
             Hit::Up => ("上移到上一级 (Alt+上箭头)".into(), self.layout.up),
@@ -237,7 +237,7 @@ impl WindowState {
             Hit::TabClose(i) => unsafe { self.close_tab(i) },
             Hit::NewTab => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Hit::TabList => unsafe { self.tab_list_menu() },
-            Hit::AppMenu => unsafe { self.app_menu() },
+            Hit::Settings => self.open_settings(),
             Hit::Back => unsafe { self.execute(Command::Back) },
             Hit::Forward => unsafe { self.execute(Command::Forward) },
             Hit::Up => unsafe { self.execute(Command::Up) },
@@ -273,7 +273,7 @@ impl WindowState {
             Hit::Address => {
                 let target = match self.crumb_at(p.x, p.y) { Some(CrumbPart::Crumb(i)) => self.crumbs[i].location.clone(), _ => self.current_location().clone() };
                 let spec = menus::menu(vec![
-                    menus::item("在新标签页中打开", "open-tab"),
+                    menus::item("在新窗口中打开", "open-tab"),
                     menus::item("复制地址", "copy"),
                     menus::item("编辑地址", "edit"),
                 ]);
@@ -504,107 +504,45 @@ impl WindowState {
         self.launch_default_terminal();
     }
 
-    unsafe fn app_menu(&mut self) {
-        use zsdesk_windows::integration::{self, Integration};
-        let state = menus::AppMenuState {
-            forward_unhandled_windows:self.session.ui.forward_unhandled_windows,
-            desktop_running: crate::edition::DESKTOP.then(desktop_host_running),
-            integration: match integration::current() { Integration::Off => 0, Integration::ContextMenu => 1, Integration::Default => 2 },
-        };
-        let anchor = Some(self.layout.app_menu);
-        let choice = popup(self.hwnd, &menus::app_menu_with_capabilities(state, crate::edition::THEMED), anchor);
-        match choice.as_deref() {
-            Some("new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
+    /// Opens the settings dialog. Every preference lives there; the gear is the
+    /// only entry point left in the title strip.
+    fn open_settings(&mut self) {
+        if let Err(error) = crate::settings::open(self.hwnd, &self.config_path) {
+            self.show_message(format!("无法打开设置：{error:#}"));
+        }
+    }
+
+    /// Runs one application action by id. The settings dialog sends the ids it
+    /// cannot perform itself back through `WM_SETTINGS_ACTION`, so the dialog
+    /// and the shell window share a single implementation.
+    pub(super) unsafe fn run_app_action(&mut self, choice: Option<&str>) {
+        match choice {
+            Some("new-window" | "new-tab") => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Some("quick-search") => unsafe{self.execute(Command::FocusSearch)},
-            Some("quick-search-window") => unsafe { self.open_integrated_search(); },
             Some("quick-search-settings") => unsafe { self.search_settings_menu(); },
             Some(id @ ("search-index-settings" | "search-everything-service")) => { self.search_engine_menu_action(id); },
-            Some("appearance-settings") if crate::edition::THEMED => {
-                if self.pending.is_some(){self.show_message("当前文件夹正在加载，请完成后切换主题".into());return;}
-                let old=self.session.ui.appearance.clone();
-                let spec=menus::appearance_menu(&old);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)) {
-                    if menus::apply_appearance(&mut self.session.ui.appearance,&id) {
-                        self.apply_theme();self.theme_children();
-                        if old.color_scheme!=self.session.ui.appearance.color_scheme {
-                            self.set_panes(self.session.ui.show_preview,self.session.ui.show_details);
-                        }
-                        self.save();self.relayout();self.position_children();self.invalidate();
-                        let _=crate::quick_search::control::signal(&self.config_path,"reload");
-                    }
+            Some("search-everything-program") => {
+                match crate::fast_search::everything::choose_executable(self.hwnd) {
+                    Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.save();self.search_backend_changed();},
+                    Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
                 }
             },
             Some("search-rebuild-index") => {
                 self.rebuild_search_index();
             },
-            Some("interface-settings") => {
-                let mut menu_ui=self.session.ui.clone();
-                menu_ui.navigation_auto_expand=Some(self.navigation_auto_expand());
-                let spec=menus::interface_settings_menu(&menu_ui);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
-                    if self.search_engine_menu_action(&id) { return; }
-                    if menus::interface_requires_dialog(&id){
-                        match crate::fast_search::everything::choose_executable(self.hwnd){
-                            Ok(Some(path))=>{self.session.ui.everything_executable=Some(path);self.session.ui.search_backend=zsdesk_core::model::explorer::SearchBackendPreference::Everything;self.save();self.search_backend_changed();},
-                            Ok(None)=>{},Err(error)=>self.show_message(error.to_string()),
-                        }return;
-                    }
-                    if id=="navigation-auto-expand" {self.session.ui.navigation_auto_expand=menu_ui.navigation_auto_expand;}
-                    if menus::apply_interface_setting(&mut self.session.ui,&id){
-                        self.crumbs_for=None;
-                        if id=="search-all-files" || id=="search-current-folder"{
-                            let scope=if self.session.ui.search_all_files{None}else{
-                                self.search_scope.as_ref().unwrap_or_else(||self.current_location()).as_path().map(PathBuf::from)
-                            };
-                            self.search_controls_mut().scope=scope;
-                            unsafe{SetTimer(Some(self.hwnd),TIMER_SEARCH,20,None);}
-                        }
-                        self.save();self.measure_bookmarks();self.relayout();self.position_children();
-                        if id.starts_with("search-backend-"){self.search_backend_changed();}
-                        if (id=="navigation-auto-expand" || id=="navigation-expand-system" || id=="interface-navigation") && self.pending.is_none() && self.session.ui.show_tree {
-                            if let Some(tree)=&self.tree {
-                                let location=self.current_location();
-                                if !matches!(location,ShellLocation::Search{..}) { unsafe {tree.select_location_with_policy(location,self.navigation_auto_expand());} }
-                            }
-                        }
-                        unsafe{self.update_address();}self.invalidate();
-                    }
-                }
-            },
-            Some("context-menu-settings") => {
-                let spec=menus::context_menu_settings_menu(&self.session.ui.context_menu);
-                if let Some(id)=popup(self.hwnd,&spec,Some(self.layout.app_menu)){
-                    if menus::apply_context_menu_setting(&mut self.session.ui.context_menu,&id){
-                        self.modern=self.session.ui.context_menu.mode==zsdesk_core::model::explorer::ContextMenuMode::Windows11;
-                        let options=crate::context_preferences::native(&self.session.ui.context_menu);
-                        zsdesk_windows::shell::menu::set_context_menu_options(options.clone());
-                        if let Some(browser)=&self.browser{browser.set_context_menu_options(options);}
-                        self.save();
-                    }
-                }
-            },
             Some("routing-settings") => self.show_routing_settings(),
-            Some("desktop-start") => self.launch_desktop(&[]),
-            Some("desktop-organize") => self.launch_desktop(&["--organize".into()]),
-            Some("desktop-map") => match self.current_location().as_path() {
-                Some(path) => { let path = path.to_string_lossy().into_owned(); self.launch_desktop(&["--map".into(), path]); }
-                None => self.show_message("只能映射文件系统中的文件夹".into()),
-            },
-            Some("desktop-quit") => self.launch_desktop(&["--quit".into()]),
-            Some("desktop-tray") => self.launch_desktop(&["--tray".into()]),
             Some(id @ ("integration-off" | "integration-context" | "integration-default" | "integration-restore")) => self.set_integration(id),
-            Some("integration-forward-unhandled") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
+            Some("integration-recycle") => self.set_recycle_bin_takeover(),
+            Some("integration-forward") => {self.session.ui.forward_unhandled_windows=!self.session.ui.forward_unhandled_windows;self.save();let _=crate::quick_search::start_if_enabled(&self.config_path);},
             Some("bookmark") => self.add_current_bookmark(),
             Some("folder-options") => open_folder_options(),
             Some("shortcuts") => {
-                let text = if crate::edition::DESKTOP { SHORTCUTS } else { SHORTCUTS.split("\n\n桌面格子").next().unwrap_or(SHORTCUTS) };
-                let text = wide(text);
+                let text = wide(SHORTCUTS);
                 unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("键盘快捷键").as_ptr()), MB_OK | MB_ICONINFORMATION); }
             }
             Some("about") => {
-                let mut parts = vec!["多标签文件管理器"];
+                let mut parts = vec!["单标签文件管理器"];
                 if crate::edition::NETWORK { parts.push("FTP / SSH 访问"); }
-                if crate::edition::DESKTOP { parts.push("桌面格子"); }
                 let text = wide(&format!("ZSDesk {} {}\n\nWindows 11 风格：{}。\n界面设计基于 ZSUI，内容区为系统 Shell 视图。", env!("CARGO_PKG_VERSION"), crate::edition::name(), parts.join("、")));
                 unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("关于 ZSDesk").as_ptr()), MB_OK | MB_ICONINFORMATION); }
             }
@@ -626,17 +564,20 @@ impl WindowState {
     fn set_integration(&mut self, id: &str) {
         use zsdesk_windows::integration::{self, Integration};
         let level = match id { "integration-context" => Integration::ContextMenu, "integration-default" => Integration::Default, _ => Integration::Off };
+        let recycle = self.session.ui.recycle_bin_takeover;
         if level == Integration::Default {
-            let text = wide("Win+E、文件夹、磁盘和桌面“此电脑”将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在 ≡ → 系统集成 → 恢复系统资源管理器 中还原。\n\n继续？");
+            let scope = if recycle { "Win+E、文件夹、磁盘、桌面“此电脑”和“回收站”" } else { "Win+E、文件夹、磁盘和桌面“此电脑”" };
+            let text = wide(&format!("{scope}将用 ZSDesk 打开（仅当前用户）。\n\n修改前会备份原有设置，可随时在“设置 → 系统集成 → 恢复系统资源管理器”中还原。\n\n继续？"));
             if unsafe { MessageBoxW(Some(self.hwnd), pcwstr(&text), PCWSTR(wide("默认用 ZSDesk 打开").as_ptr()), MB_OKCANCEL | MB_ICONQUESTION) } != IDOK { return; }
         }
         let Ok(exe) = std::env::current_exe() else { return };
         let backup = self.config_path.with_file_name("takeover-backup.json");
-        match integration::apply(level, &exe, &backup) {
+        match integration::apply(level, &exe, &backup, recycle) {
             Ok(()) => {
                 let message=match level {
                 Integration::Off => "已恢复接管前的文件夹设置".into(),
                 Integration::ContextMenu => "已添加右键菜单“使用 ZSDesk 打开”".into(),
+                Integration::Default if recycle => "Win+E、文件夹、磁盘、此电脑和回收站将默认用 ZSDesk 打开".into(),
                 Integration::Default => "Win+E、文件夹、磁盘和此电脑将默认用 ZSDesk 打开".into(),
                 };self.show_message(message);
                 if let Err(error)=crate::routing_control::configure(&self.config_path,level==Integration::Default,self.hwnd){self.show_message(format!("文件夹设置已保存；文件位置转发未更新：{error}"));}
@@ -646,12 +587,30 @@ impl WindowState {
         }
     }
 
-    fn launch_desktop(&mut self, extra: &[String]) {
+    /// Turns the desktop Recycle Bin verb on or off without touching the other
+    /// owned verbs; the switch is stored per profile so it survives restarts.
+    fn set_recycle_bin_takeover(&mut self) {
+        use zsdesk_windows::integration::{self, Integration};
+        let recycle = !self.session.ui.recycle_bin_takeover;
+        self.session.ui.recycle_bin_takeover = recycle;
+        self.save();
+        if integration::current() != Integration::Default { return; }
         let Ok(exe) = std::env::current_exe() else { return };
-        let mut command = std::process::Command::new(exe);
-        command.arg("--desktop").args(extra);
-        if let Some(dir) = self.config_path.parent() { command.arg("--profile-dir").arg(dir); }
-        if let Err(error) = command.spawn() { self.show_message(format!("无法启动桌面格子：{error}")); }
+        let backup = self.config_path.with_file_name("takeover-backup.json");
+        match integration::upgrade_default(&exe, &backup, recycle) {
+            Ok(_) => {}
+            Err(error) => {
+                self.session.ui.recycle_bin_takeover = !recycle;
+                self.save();
+                self.show_message(format!("回收站接管更新失败：{error}"));
+                return;
+            }
+        }
+        if !recycle || integration::recycle_bin_enabled(&exe) == recycle {
+            self.show_message(if recycle { "桌面回收站已在 ZSDesk 中打开".into() } else { "桌面回收站已交还系统资源管理器".into() });
+        } else {
+            self.show_message("回收站接管未生效：请在“设置 → 系统集成”中重新选择“默认打开文件夹、磁盘和此电脑”".into());
+        }
     }
 
     unsafe fn tab_list_menu(&mut self) {
@@ -713,11 +672,7 @@ impl WindowState {
 
 }
 
-const SHORTCUTS: &str = "文件管理器\nCtrl+T 新建标签　Ctrl+W / Ctrl+F4 关闭标签　Ctrl+Shift+T 恢复标签\nCtrl+Tab / Ctrl+Shift+Tab 切换标签　Ctrl+1…9 第 N 个标签\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n标签：中键关闭，拖动排序；收藏：中键在新标签打开\n\n桌面格子\n鼠标悬停 展开折叠的格子　双击标题 折叠/展开　拖动标题 移动　拖动边缘 调整大小\nEnter 打开　F2 重命名　Del 删除　Ctrl+A / C / X / V\n方向键 选择　Backspace 返回上一级（文件夹格子）　F5 刷新\n双击桌面空白处 隐藏/显示全部格子";
-
-fn desktop_host_running() -> bool {
-    unsafe { FindWindowW(windows::core::w!("ZSDesk.Native.DesktopHost"), PCWSTR::null()) }.is_ok_and(|h| !h.0.is_null())
-}
+const SHORTCUTS: &str = "文件管理器\n每个窗口一个标签页：Ctrl+T / Ctrl+N 新建窗口　Ctrl+W / Ctrl+F4 关闭窗口\nAlt+← / Backspace 后退　Alt+→ 前进　Alt+↑ 上一级　F5 刷新\nCtrl+L / Alt+D / F4 地址栏　Ctrl+F / Ctrl+E / F3 搜索（输入即搜）\nCtrl+Shift+N 新建文件夹　Ctrl+Shift+C 复制路径　Ctrl+D 收藏\nAlt+P 预览窗格　Alt+Shift+P 详细信息窗格\nF2 重命名　Del 删除　Shift+Del 永久删除　Alt+Enter 属性　Ctrl+A 全选\n文件夹：中键在新窗口打开；收藏：中键在新窗口打开";
 
 fn open_folder_options() {
     let _ = std::process::Command::new("rundll32.exe").args(["shell32.dll,Options_RunDLL", "0"]).spawn();

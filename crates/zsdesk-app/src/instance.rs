@@ -90,6 +90,15 @@ pub fn property(path:&Path)->Vec<u16>{
     let mut h=DefaultHasher::new();path.to_string_lossy().to_lowercase().hash(&mut h);
     format!("Local\\ZSDesk.Profile.{:016x}",h.finish()).encode_utf16().chain(Some(0)).collect()
 }
+/// Takes the per-profile marker without forwarding anything: the caller only
+/// learns whether it owns the profile's first window. Later windows keep their
+/// own location instead of adding a tab to the window that is already open.
+pub fn claim(path:&Path)->Result<(Instance,bool)>{
+    let key=property(path);
+    let handle=unsafe {CreateMutexW(None,false,PCWSTR(key.as_ptr()))?};
+    let first=unsafe {GetLastError()}!=ERROR_ALREADY_EXISTS;
+    Ok((Instance(handle),first))
+}
 pub fn enter(path:&Path,target:Option<&ShellLocation>,selection:Option<&std::ffi::OsStr>)->Result<Option<Instance>>{
     let key=property(path);
     let handle=unsafe {CreateMutexW(None,false,PCWSTR(key.as_ptr()))?};

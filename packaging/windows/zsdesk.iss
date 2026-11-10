@@ -13,16 +13,7 @@
 #ifndef EditionName
 #define EditionName "全量版"
 #endif
-#ifndef HasDesktop
-#define HasDesktop 1
-#endif
-#if Edition == "desktop-box"
-#define ProductAppId "{{A5AF6D62-4581-458B-9CC4-215C078FDDB6}"
-#define ProductName "ZSDesk 桌面盒子"
-#define ProductDirectory "ZSDeskDesktopBox"
-#define ProductMutex "Local\ZSDesk.DesktopBox.Application"
-#define ProductModelId "ZSDesk.DesktopBox"
-#elif Edition == "themed"
+#if Edition == "themed"
 #define ProductAppId "{{6C520A87-056A-4CD2-9989-F06398B6A284}"
 #define ProductName "ZSDesk 主题版"
 #define ProductDirectory "ZSDeskTheme"
@@ -89,31 +80,16 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 [Icons]
 Name: "{group}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Check: not WizardNoIcons
 Name: "{autodesktop}\{#ProductName}"; Filename: "{app}\ZSDesk.exe"; AppUserModelID: "{#ProductModelId}"; Tasks: desktopicon; Check: not WizardNoIcons
-#if (Int(HasDesktop) != 0) && (Edition != "desktop-box")
-Name: "{group}\{cm:Fences}"; Filename: "{app}\ZSDesk.exe"; Parameters: "--desktop"; Check: not WizardNoIcons
-#endif
-
 [Run]
 Filename: "{app}\ZSDesk.exe"; Description: "{cm:LaunchProgram,ZSDesk}"; Flags: nowait postinstall skipifsilent
 
 [CustomMessages]
-chinesesimp.Fences=ZSDesk 桌面格子
-english.Fences=ZSDesk Desktop Fences
-#if Edition == "desktop-box"
-chinesesimp.LandingTitle=独立桌面盒子，分类整理。
-english.LandingTitle=Standalone desktop fences. Organize your workspace.
-chinesesimp.LandingDetail=文件夹映射 · 格子标签页 · 拖放整理
-english.LandingDetail=Folder mapping · Fence tabs · Drag and drop
-chinesesimp.KeepSettings=保留桌面盒子设置；配置与文件管理版独立。
-english.KeepSettings=Desktop box settings are kept separately from the file manager.
-#else
-chinesesimp.LandingTitle=原生文件管理，桌面有序。
-english.LandingTitle=Native file management. An organized desktop.
-chinesesimp.LandingDetail=多标签 · 快速搜索 · 文件预览
-english.LandingDetail=Tabs · Fast search · File preview
+chinesesimp.LandingTitle=原生文件管理，简洁高效。
+english.LandingTitle=Native file management, kept simple.
+chinesesimp.LandingDetail=快速搜索 · 文件预览 · 系统集成
+english.LandingDetail=Fast search · File preview · Shell integration
 chinesesimp.KeepSettings=保留现有个人设置；文件打开方式可在软件内设置。
 english.KeepSettings=Personal settings are kept. Folder integration is configured in the app.
-#endif
 chinesesimp.InstallFolder=安装位置
 english.InstallFolder=Install location
 chinesesimp.BrowseFolder=浏览…

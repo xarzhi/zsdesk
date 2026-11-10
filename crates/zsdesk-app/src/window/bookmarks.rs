@@ -37,7 +37,7 @@ impl WindowState {
         let last = self.session.bookmarks.len() - 1;
         let spec = menu(vec![
             entry("打开", "open", true, false),
-            entry("在新标签页中打开", "open-tab", true, false),
+            entry("在新窗口中打开", "open-tab", true, false),
             MenuItemSpec::Separator,
             entry("重命名", "rename", true, false),
             entry("向左移动", "left", index > 0, false),

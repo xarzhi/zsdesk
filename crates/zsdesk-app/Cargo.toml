@@ -21,16 +21,10 @@ rusqlite.workspace = true
 zsui = { path = "../../../zsui", default-features = false }
 
 [features]
-# Editions: standard, network, desktop, full, and a separate themed edition.
-default = ["network", "desktop"]
+# Editions: standard, network, full and a separate themed edition.
+default = ["network"]
 network = []
-desktop = []
-desktop-box = ["desktop"]
-themed = ["network", "desktop"]
-
-[[example]]
-name = "desktop_probe"
-path = "examples/desktop_probe.rs"
+themed = ["network"]
 
 [[example]]
 name = "enum_probe"

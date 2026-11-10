@@ -4,6 +4,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Shell namespace address of the Recycle Bin.
+pub const RECYCLE_BIN_ADDRESS: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
+
+/// Every window hosts exactly one tab: opening another folder starts a new
+/// window instead of adding a tab to an existing one.
+pub const SINGLE_TAB_WINDOWS: bool = true;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShellLocation {
     ThisPc,
@@ -36,6 +43,10 @@ impl ShellLocation {
             Self::Path(path) => Some(path),
             _ => None,
         }
+    }
+
+    pub fn recycle_bin() -> Self {
+        Self::Shell { parsing_name: RECYCLE_BIN_ADDRESS.into(), title: "回收站".into() }
     }
 }
 
@@ -309,6 +320,8 @@ pub struct ExplorerUi {
     pub space_preview: bool,
     pub hover_preview: bool,
     pub forward_unhandled_windows: bool,
+    /// Double-clicking the desktop Recycle Bin opens it here instead of Explorer.
+    pub recycle_bin_takeover: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
     pub appearance: AppearancePreferences,
@@ -323,6 +336,7 @@ impl Default for ExplorerUi {
             everything_executable:None,
             hover_preview: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
+            recycle_bin_takeover: true,
             navigation_auto_expand: None, appearance: AppearancePreferences::default(),
             window: None }
     }
@@ -365,6 +379,22 @@ impl ExplorerSession {
         let largest = self.tabs.iter().map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
+        self.retain_active_tab();
+    }
+
+    /// A single-tab window keeps the active tab only. Sessions written by an
+    /// earlier multi-tab build lose their other tabs without losing the folder
+    /// the user was last looking at.
+    pub fn retain_active_tab(&mut self) {
+        if !SINGLE_TAB_WINDOWS || self.tabs.len() <= 1 {
+            self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
+            return;
+        }
+        let active = self.active_tab.min(self.tabs.len() - 1);
+        let tab = self.tabs.remove(active);
+        self.tabs.clear();
+        self.tabs.push(tab);
+        self.active_tab = 0;
     }
 
     pub fn active_tab(&self) -> &ExplorerTab {
@@ -471,6 +501,31 @@ mod tests {
         session.normalize();
         assert_eq!(session.tabs.len(), 1);
         assert_eq!(session.current_location(), &ShellLocation::ThisPc);
+    }
+
+    #[test]
+    fn single_tab_windows_keep_the_active_tab_of_an_older_session() {
+        let mut session = ExplorerSession {
+            tabs: vec![ExplorerTab::new(1, ShellLocation::ThisPc), ExplorerTab::new(2, ShellLocation::Path(PathBuf::from(r"D:\资料")))],
+            active_tab: 1,
+            ..ExplorerSession::default()
+        };
+        session.normalize();
+        assert_eq!(session.tabs.len(), 1, "a window hosts exactly one tab");
+        assert_eq!(session.active_tab, 0);
+        assert_eq!(session.current_location(), &ShellLocation::Path(PathBuf::from(r"D:\资料")));
+        assert_eq!(ShellLocation::recycle_bin().title(), "回收站");
+        assert_eq!(ShellLocation::recycle_bin().address(), RECYCLE_BIN_ADDRESS);
+    }
+
+    #[test]
+    fn older_profiles_gain_the_recycle_bin_switch_switched_on() {
+        let session: ExplorerSession = serde_json::from_str(
+            r#"{"bookmarks":[],"tabs":[{"id":1,"history":[{"Shell":{"parsing_name":"C:\\Windows","title":"Windows"}}],"history_index":0,"view":null}],"active_tab":0,"next_id":2,"ui":{"show_tree":false}}"#)
+            .expect("a profile written before the switch existed");
+        assert!(!session.ui.show_tree, "existing preferences stay untouched");
+        assert!(session.ui.recycle_bin_takeover, "the desktop Recycle Bin is taken over by default");
+        assert!(session.ui.forward_unhandled_windows);
     }
 
     #[test]

@@ -3,6 +3,8 @@ use std::{ffi::OsString,path::PathBuf};
 pub const COPYDATA_TAG:usize=0x3152464e;
 pub const VERIFY_TAG:usize=0x3252464e;
 pub const VERIFY_THIS_PC:usize=0x3352464e;
+/// Confirmation that the window shows the Recycle Bin namespace.
+pub const VERIFY_RECYCLE_BIN:usize=0x3452464e;
 pub fn encode(folder:&std::path::Path,items:&[PathBuf])->Option<Vec<u8>>{
     use std::os::windows::ffi::OsStrExt;
     if !folder.is_absolute()||items.len()>128{return None;}

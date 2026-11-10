@@ -36,6 +36,23 @@ pub(super) fn restore_maximized(show: u32, flags: u32) -> bool {
             && flags & WPF_RESTORETOMAXIMIZED.0 != 0)
 }
 
+/// Origin of an additional window: a fixed step down and right from the window
+/// opened before it, restarting near the work-area corner when the next step no
+/// longer fits.
+pub(super) fn cascaded_origin(previous: Option<(i32, i32)>, anchor: (i32, i32), size: (i32, i32),
+    step: i32, margin: i32, work: RECT) -> (i32, i32) {
+    let step = step.max(0);
+    let (mut left, mut top) = match previous {
+        Some((last_x, last_y)) => (last_x.saturating_add(step), last_y.saturating_add(step)),
+        None => (anchor.0.saturating_add(step), anchor.1.saturating_add(step)),
+    };
+    if left.saturating_add(size.0) > work.right || top.saturating_add(size.1) > work.bottom {
+        left = work.left.saturating_add(margin.max(0));
+        top = work.top.saturating_add(margin.max(0));
+    }
+    (left, top)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +90,24 @@ mod tests {
         assert!(restore_maximized(SW_SHOWMINIMIZED.0 as u32, WPF_RESTORETOMAXIMIZED.0));
         assert!(!restore_maximized(SW_SHOWMINIMIZED.0 as u32, 0));
         assert!(!restore_maximized(1, WPF_RESTORETOMAXIMIZED.0));
+    }
+    #[test]
+    fn additional_windows_cascade_by_a_fixed_step_and_wrap_before_leaving_the_screen() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        let size = (1180, 760);
+        let first = cascaded_origin(None, (60, 52), size, 28, 24, work);
+        assert_eq!(first, (88, 80));
+        let mut origin = first;
+        let mut origins = vec![origin];
+        for _ in 0..2 {
+            origin = cascaded_origin(Some(origin), (60, 52), size, 28, 24, work);
+            origins.push(origin);
+        }
+        // Every step is the same size until the work area is exhausted.
+        assert_eq!(origins, vec![(88, 80), (116, 108), (144, 136)]);
+        // The last step that still fits stays; the next one restarts the cascade.
+        let last_fit = cascaded_origin(Some((712, 250)), (60, 52), size, 28, 24, work);
+        assert_eq!(last_fit, (740, 278));
+        assert_eq!(cascaded_origin(Some(last_fit), (60, 52), size, 28, 24, work), (24, 24));
     }
 }

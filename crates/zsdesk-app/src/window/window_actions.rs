@@ -124,17 +124,30 @@ impl WindowState {
             windows::Win32::Graphics::Gdi::RDW_INVALIDATE|windows::Win32::Graphics::Gdi::RDW_FRAME|windows::Win32::Graphics::Gdi::RDW_ALLCHILDREN)};
     }
     pub(super) fn new_window(&mut self) {
-        let mut arguments=vec!["--new-window".into(),"--profile-dir".into(),self.config_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().to_owned()];
-        arguments.push(match self.current_location(){ShellLocation::Path(path)=>path.as_os_str().to_owned(),ShellLocation::Shell{parsing_name,..}=>parsing_name.into(),_=>"--this-pc".into()});
+        let location=self.current_location().clone();
+        self.open_in_new_window(location,None);
+    }
+    /// Opens `location` in its own window. A window hosts exactly one tab, so
+    /// this is how "新建标签页", middle clicks and forwarded open requests are
+    /// served. `selection` names an item inside `location` to select on open.
+    pub(super) fn open_in_new_window(&mut self, location: ShellLocation, selection: Option<std::ffi::OsString>) {
+        let (select, target): (bool, std::ffi::OsString) = match &location {
+            ShellLocation::Path(path) => match &selection {
+                Some(name) => (true, path.join(name).into_os_string()),
+                None => (false, path.as_os_str().to_owned()),
+            },
+            ShellLocation::Shell { parsing_name, .. } => (false, parsing_name.into()),
+            _ => (false, "--this-pc".into()),
+        };
+        let profile = self.config_path.parent().unwrap_or(std::path::Path::new("."));
+        let mut arguments: Vec<std::ffi::OsString> = vec!["--new-window".into(), "--profile-dir".into(), profile.as_os_str().to_owned()];
+        if select { arguments.push("--select".into()); }
+        arguments.push(target.clone());
         match crate::runtime::enqueue_local(&self.config_path,arguments){Ok(true)=>return,Err(error)=>{self.show_message(error.to_string());return;},Ok(false)=>{}}
         let mut command = std::process::Command::new(match std::env::current_exe() { Ok(path)=>path, Err(error)=>{self.show_message(error.to_string());return;} });
-        command.arg("--new-window").arg("--profile-dir").arg(self.config_path.parent().unwrap_or(std::path::Path::new(".")));
-        match self.current_location() {
-            ShellLocation::Path(path) => { command.arg(path); }
-            ShellLocation::ThisPc => { command.arg("--this-pc"); }
-            ShellLocation::Shell { parsing_name, .. } => { command.arg(parsing_name); }
-            _ => { command.arg("--this-pc"); }
-        }
+        command.arg("--new-window").arg("--profile-dir").arg(profile);
+        if select { command.arg("--select"); }
+        command.arg(target);
         if let Err(error)=command.spawn() {self.show_message(format!("无法打开新窗口：{error}"));}
     }
 }

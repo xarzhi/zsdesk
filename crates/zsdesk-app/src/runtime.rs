@@ -145,7 +145,7 @@ fn status(profile:&Path,workers:&[Worker],pool:&[WindowWorker],queued:usize,erro
     components.extend(pool.iter().filter(|worker|worker.job.is_some()&&!worker.ending).map(|_|"window"));
     let value=serde_json::json!({"schema":1,"pid":std::process::id(),"version":env!("CARGO_PKG_VERSION"),"components":components,"last_error":error,
         "window_pool":pool.iter().map(|worker|serde_json::json!({"id":worker.id,"thread_id":worker.thread_id,"active":worker.job.is_some(),"requests":worker.requests,"stopping":worker.ending})).collect::<Vec<_>>(),
-        "queued_window_requests":queued,"max_window_threads":MAX_WINDOW_THREADS,"retiring_menu_threads":crate::desktop::pending_menu_threads(),
+        "queued_window_requests":queued,"max_window_threads":MAX_WINDOW_THREADS,
         "pending_file_operations":zsdesk_windows::shell::file_transfer::pending_operations(),"pending_extension_workers":crate::context_menu_process::pending_workers()});
     if let Ok(bytes)=serde_json::to_vec(&value){
         if previous.as_ref()==Some(&bytes){return;}
@@ -174,7 +174,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;
     loop{
         while !shutting_down&&queued.len()<MAX_QUEUED_WINDOWS{let Ok(request)=rx.try_recv()else{break;};
-            let kind=if request.args.iter().any(|a|a=="--desktop"){"desktop"}else if request.args.iter().any(|a|a=="--background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
+            let kind=if request.args.iter().any(|a|a=="--background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
             let destination=hwnd.0 as isize;let finished=finished_tx.clone();serial+=1;let id=serial;
             if kind=="window"{queued.push_back(WindowJob{id,args:request.args});continue;}
             let worker=thread::Builder::new().name(format!("zsdesk-{kind}")).spawn(move||{
@@ -221,7 +221,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
                 }
             }else{break;}
         }
-        // Idle STAs stay reusable while a desktop/background component or
+        // Idle STAs stay reusable while a background component or
         // another window remains alive. Once the last component ends, retire
         // the pool while the host's first STA continues pumping COM messages.
         if !shutting_down&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
@@ -235,7 +235,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         }
         // COM/TLS finalizers can still need the first STA after component code
         // returns. Keep pumping while the OS thread finishes; never block it.
-        let retiring_menus=crate::desktop::pending_menu_threads()+zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers();
+        let retiring_menus=zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers();
         unsafe{if workers.iter().any(|worker|worker.ending)||pool.iter().any(|worker|worker.ending)||retiring_menus>0{SetTimer(Some(hwnd),1,25,None);}else{let _=KillTimer(Some(hwnd),1);}}
         status(&profile,&workers,&pool,queued.len(),last_error.as_deref(),&mut previous_status);
         if shutting_down&&workers.is_empty()&&pool.is_empty()&&retiring_menus==0{break;}

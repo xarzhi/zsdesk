@@ -213,6 +213,7 @@ pub mod glyph {
     pub const VIEW: &str = "\u{E8A9}";
     pub const MORE: &str = ZsIcon::More.windows_fluent_glyph();
     pub const MENU: &str = "\u{E700}";
+    pub const SETTINGS: &str = "\u{E713}";
     pub const STAR: &str = "\u{E734}";
     pub const STAR_FILLED: &str = "\u{E735}";
     pub const DETAILS_VIEW: &str = "\u{E8FD}";
