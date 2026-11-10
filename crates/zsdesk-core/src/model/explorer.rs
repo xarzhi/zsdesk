@@ -11,6 +11,22 @@ pub const RECYCLE_BIN_ADDRESS: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}"
 /// window instead of adding a tab to an existing one.
 pub const SINGLE_TAB_WINDOWS: bool = true;
 
+/// Where a folder that is opened from outside lands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenMode {
+    /// One window per folder (default).
+    #[default]
+    NewWindow,
+    /// Add a tab to the window that is already open.
+    NewTab,
+}
+
+impl OpenMode {
+    /// True when a window shows a single folder and hides the tab strip.
+    pub fn single_tab(self) -> bool { self == Self::NewWindow }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ShellLocation {
     ThisPc,
@@ -47,6 +63,17 @@ impl ShellLocation {
 
     pub fn recycle_bin() -> Self {
         Self::Shell { parsing_name: RECYCLE_BIN_ADDRESS.into(), title: "回收站".into() }
+    }
+
+    /// True for the Recycle Bin, whichever address form the Shell handed back.
+    pub fn is_recycle_bin(&self) -> bool {
+        match self {
+            Self::Shell { parsing_name, .. } => {
+                let name = parsing_name.trim();
+                name.eq_ignore_ascii_case(RECYCLE_BIN_ADDRESS) || name.eq_ignore_ascii_case("RecycleBinFolder")
+            }
+            _ => false,
+        }
     }
 }
 
@@ -324,6 +351,14 @@ pub struct ExplorerUi {
     pub recycle_bin_takeover: bool,
     pub preview_provider: PreviewProviderPreference,
     pub navigation_auto_expand: Option<bool>,
+    /// How another opened folder is placed: its own window, or a new tab here.
+    pub open_mode: OpenMode,
+    /// Branches the navigation tree had open, so the next window opens with the
+    /// same folders unfolded instead of collapsing to the roots.
+    pub tree_expanded: Vec<ShellLocation>,
+    /// Opens the file manager when the user signs in. The login entry is
+    /// reconciled with this switch on every launch.
+    pub autostart: bool,
     pub appearance: AppearancePreferences,
     pub window: Option<WindowPlacement>,
 }
@@ -337,7 +372,9 @@ impl Default for ExplorerUi {
             hover_preview: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
             recycle_bin_takeover: true,
-            navigation_auto_expand: None, appearance: AppearancePreferences::default(),
+            navigation_auto_expand: None, open_mode: OpenMode::default(), tree_expanded: Vec::new(),
+            autostart: true,
+            appearance: AppearancePreferences::default(),
             window: None }
     }
 }
@@ -376,6 +413,7 @@ impl ExplorerSession {
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
+        normalize_expanded(&mut self.ui.tree_expanded);
         let largest = self.tabs.iter().map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);
         self.next_id = self.next_id.max(largest.saturating_add(1));
@@ -386,7 +424,7 @@ impl ExplorerSession {
     /// earlier multi-tab build lose their other tabs without losing the folder
     /// the user was last looking at.
     pub fn retain_active_tab(&mut self) {
-        if !SINGLE_TAB_WINDOWS || self.tabs.len() <= 1 {
+        if !self.ui.open_mode.single_tab() || self.tabs.len() <= 1 {
             self.active_tab = self.active_tab.min(self.tabs.len().saturating_sub(1));
             return;
         }
@@ -416,8 +454,21 @@ impl ExplorerSession {
     }
 }
 
-pub fn path_title(path: &Path) -> String {
-    path.file_name()
+/// Keeps the remembered navigation-tree branches stable and bounded: a repeated
+/// entry collapses to one, a search is not a folder, and a long-lived profile
+/// cannot grow this list without limit.
+pub fn normalize_expanded(list: &mut Vec<ShellLocation>) {
+    const LIMIT: usize = 96;
+    let mut kept: Vec<ShellLocation> = Vec::with_capacity(list.len().min(LIMIT));
+    for location in list.drain(..) {
+        if matches!(location, ShellLocation::Search { .. }) || kept.contains(&location) { continue; }
+        kept.push(location);
+    }
+    if kept.len() > LIMIT { kept.drain(..kept.len() - LIMIT); }
+    *list = kept;
+}
+
+pub fn path_title(path: &Path) -> String {    path.file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
@@ -463,6 +514,38 @@ mod tests {
         let session: ExplorerSession = serde_json::from_str(text).unwrap();
         assert!(session.ui.show_tree && session.ui.show_bookmarks);
         assert_eq!(session.ui.tree_width, 220);
+        assert!(session.ui.tree_expanded.is_empty(), "a profile written before the tree state existed opens with collapsed roots");
+    }
+
+    #[test]
+    fn remembered_tree_branches_survive_a_round_trip_without_duplicates() {
+        let mut session = ExplorerSession::default();
+        session.ui.tree_expanded = vec![
+            ShellLocation::ThisPc,
+            ShellLocation::Path(PathBuf::from(r"C:\")),
+            ShellLocation::ThisPc,
+            ShellLocation::Search { query: "报告".into(), scope: None },
+        ];
+        session.normalize();
+        assert_eq!(session.ui.tree_expanded,
+            vec![ShellLocation::ThisPc, ShellLocation::Path(PathBuf::from(r"C:\"))]);
+        let restored: ExplorerSession = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(restored.ui.tree_expanded, session.ui.tree_expanded);
+        // The stored shape is what a profile carries between versions.
+        assert_eq!(serde_json::to_string(&ShellLocation::ThisPc).unwrap(), "\"ThisPc\"");
+        assert_eq!(serde_json::to_string(&ShellLocation::Path(PathBuf::from(r"C:\Users"))).unwrap(),
+            r#"{"Path":"C:\\Users"}"#);
+    }
+
+    #[test]
+    fn a_long_lived_profile_keeps_the_most_recent_tree_branches() {
+        let mut list: Vec<ShellLocation> = (0..120)
+            .map(|index| ShellLocation::Path(PathBuf::from(format!(r"C:\folder{index}"))))
+            .collect();
+        normalize_expanded(&mut list);
+        assert_eq!(list.len(), 96);
+        assert_eq!(list.first(), Some(&ShellLocation::Path(PathBuf::from(r"C:\folder24"))),
+            "the oldest entries fall off first");
     }
 
     #[test]
@@ -526,6 +609,19 @@ mod tests {
         assert!(!session.ui.show_tree, "existing preferences stay untouched");
         assert!(session.ui.recycle_bin_takeover, "the desktop Recycle Bin is taken over by default");
         assert!(session.ui.forward_unhandled_windows);
+        assert!(session.ui.autostart, "older profiles opt into the login entry by default");
+    }
+
+    #[test]
+    fn the_recycle_bin_answers_to_every_address_form_the_shell_returns() {
+        assert!(ShellLocation::recycle_bin().is_recycle_bin());
+        for address in ["RecycleBinFolder", "::{645FF040-5081-101B-9F08-00AA002F954E}"] {
+            assert!(ShellLocation::Shell { parsing_name: address.into(), title: "回收站".into() }.is_recycle_bin(), "{address}");
+        }
+        for other in [ShellLocation::ThisPc, ShellLocation::Path("C:\\Users".into()),
+            ShellLocation::Shell { parsing_name: "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".into(), title: "此电脑".into() }] {
+            assert!(!other.is_recycle_bin(), "{other:?}");
+        }
     }
 
     #[test]

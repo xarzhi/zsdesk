@@ -148,7 +148,7 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
         entry("收藏栏", "interface-bookmarks", true, ui.show_bookmarks),
     ];
     // A single-tab window has no tab bar to place.
-    if !zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+    if !ui.open_mode.single_tab() {
         items.push(submenu("标签栏位置",vec![
             entry("上方","tab-placement-top",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top),
             entry("左侧","tab-placement-left",true,ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Left),

@@ -14,6 +14,7 @@ mod context_preferences;
 mod routing_control;
 mod fast_search;
 mod quick_search;
+mod startup;
 mod win_e_bridge;
 mod explorer_forwarder;
 mod runtime;

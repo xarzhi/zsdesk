@@ -8,6 +8,8 @@
 
 mod bookmarks;
 mod geometry;
+mod tab_ghost;
+mod tab_transfer;
 mod window_actions;
 mod input;
 mod keyboard;
@@ -83,6 +85,8 @@ const TIMER_MESSAGE: usize = 2;
 const TIMER_SEARCH: usize = 3;
 const TIMER_FAST_SEARCH:usize=4;
 const TIMER_PLACEMENT:usize=9;
+/// Coalesces session writes while the user opens or closes tree branches.
+const TIMER_TREE_STATE:usize=10;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
 type Slot = RefCell<Option<WindowState>>;
@@ -128,17 +132,19 @@ fn release_window_properties(hwnd:HWND){
     for property in [windows::core::w!("ZSDesk.NativeCaption"),windows::core::w!("ZSDesk.CaptionVisual"),windows::core::w!("ZSDesk.CaptionPress")]{let _=unsafe{RemovePropW(hwnd,property)};}
 }
 
-pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
+pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,
+    focus_search:Option<bool>, at: Option<(i32, i32)>) -> Result<()> {
     crate::runtime::trace("window-ole-init");
     unsafe { OleInitialize(None).context("OleInitialize failed")?; }
-    let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search) };
+    let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search,at) };
     crate::runtime::trace("window-loop-return");
     unsafe { OleUninitialize(); }
     crate::runtime::trace("window-ole-uninit-return");
     result
 }
 
-unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,focus_search:Option<bool>) -> Result<()> {
+unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool,
+    secondary_window: bool, focus_search:Option<bool>, at: Option<(i32, i32)>) -> Result<()> {
     unsafe { InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES }) }.ok()?;
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
@@ -155,8 +161,11 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     state.secondary_window = secondary_window;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
-    // A window opened from an already running one cascades instead of covering it.
-    let (x, y, w, h) = if secondary_window && !placement.is_some_and(|p| p.maximized) {
+    // A tab dropped outside its window opens right under the pointer; a window
+    // opened from an already running one cascades instead of covering it.
+    let (x, y, w, h) = if let Some(point) = at {
+        dropped_rect((x, y, w, h), point, unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96))
+    } else if secondary_window && !placement.is_some_and(|p| p.maximized) {
         cascade_rect((x, y, w, h), unsafe { windows::Win32::UI::HiDpi::GetDpiForSystem() }.max(96))
     } else { (x, y, w, h) };
     let hwnd = unsafe { CreateWindowExW(WINDOW_EX_STYLE::default(), pcwstr(&class), PCWSTR(wide("ZSDesk").as_ptr()),
@@ -172,7 +181,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     }
     flush_deferred(hwnd,true);
     let accelerators = unsafe { CreateAcceleratorTableW(&accelerator_table())? };
-    let _ = unsafe { ShowWindow(hwnd, if placement.is_some_and(|p| p.maximized) { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+    // A dropped tab is a new, free-standing window even when the window it came
+    // from was maximized.
+    let maximized = at.is_none() && placement.is_some_and(|p| p.maximized);
+    let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
     let mut quick_preview:Option<preview_process::PreviewProcess>=None;
@@ -264,13 +276,14 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     drop(pane_preview);
     let _ = unsafe { DestroyAcceleratorTable(accelerators) };
     // Posted payloads still own their allocation even after the receiver is destroyed.
-    for message in [WM_SHELL_NAVIGATED, WM_SHELL_FOLDER_INVOKED, WM_BOOKMARK_PATH_DROPPED, WM_OPEN_REQUEST, WM_TREE_NAVIGATE, WM_OPEN_TAB_PATH, WM_SHELL_SELECTION_CHANGED,crate::routing_control::WM_RESULT,WM_DIAGNOSTIC] {
+    for message in [WM_SHELL_NAVIGATED, WM_SHELL_FOLDER_INVOKED, WM_BOOKMARK_PATH_DROPPED, WM_OPEN_REQUEST, WM_TREE_NAVIGATE, WM_OPEN_TAB_PATH, WM_SHELL_SELECTION_CHANGED, crate::routing_control::WM_RESULT, WM_DIAGNOSTIC, tab_transfer::WM_TAB_TRANSFER] {
         while unsafe { PeekMessageW(&mut msg, Some(hwnd), message, message, PM_REMOVE) }.as_bool() {
             if msg.lParam.0 == 0 { continue; }
             unsafe {
                 match message {
                     WM_BOOKMARK_PATH_DROPPED | WM_OPEN_TAB_PATH => drop(Box::from_raw(msg.lParam.0 as *mut PathBuf)),
                     WM_OPEN_REQUEST => drop(Box::from_raw(msg.lParam.0 as *mut crate::instance::OpenRequest)),
+                    tab_transfer::WM_TAB_TRANSFER => drop(Box::from_raw(msg.lParam.0 as *mut tab_transfer::Transfer)),
                     WM_SHELL_SELECTION_CHANGED => acknowledge_selection_changed(msg.lParam.0),
                     crate::routing_control::WM_RESULT => drop(Box::from_raw(msg.lParam.0 as *mut String)),
                     WM_DIAGNOSTIC=>drop(Box::from_raw(msg.lParam.0 as *mut crate::instance::DiagnosticRequest)),
@@ -314,8 +327,20 @@ fn cascade_rect(rect: (i32, i32, i32, i32), dpi: u32) -> (i32, i32, i32, i32) {
     (left, top, w, h)
 }
 
-fn is_text_box(hwnd: HWND) -> bool {
-    [ID_ADDRESS as i32, ID_BOOKMARK_RENAME as i32, ID_SEARCH as i32].contains(&unsafe { GetDlgCtrlID(hwnd) })
+/// A window created by dropping a tab outside its source window starts where
+/// the pointer was released, with the pointer over its tab strip.
+fn dropped_rect(rect: (i32, i32, i32, i32), point: (i32, i32), dpi: u32) -> (i32, i32, i32, i32) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO};
+    let (_, _, w, h) = rect;
+    let monitor = unsafe { MonitorFromPoint(POINT { x: point.0, y: point.1 }, MONITOR_DEFAULTTONEAREST) };
+    let mut area = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let work = if !monitor.is_invalid() && unsafe { GetMonitorInfoW(monitor, &mut area) }.as_bool() { area.rcWork }
+        else { RECT { left: 0, top: 0, right: i32::MAX, bottom: i32::MAX } };
+    let (left, top) = geometry::dropped_origin(point, (w, h), (scale(96, dpi), scale(14, dpi)), work);
+    (left, top, w, h)
+}
+
+fn is_text_box(hwnd: HWND) -> bool {    [ID_ADDRESS as i32, ID_BOOKMARK_RENAME as i32, ID_SEARCH as i32].contains(&unsafe { GetDlgCtrlID(hwnd) })
 }
 fn text_input_window(hwnd:HWND)->bool{
     if is_text_box(hwnd){return true;}
@@ -370,6 +395,8 @@ struct WindowState {
     pressed: Option<Hit>,
     tracking_mouse: bool,
     tab_drag: Option<TabDrag>,
+    /// Card that follows the pointer once a tab is dragged out of the window.
+    drag_ghost: Option<tab_ghost::TabGhost>,
     splitter_drag: Option<(i32, i32)>,
     icons: HashMap<String, paint::IconEntry>,
     /// Embedded application icon shown at the far left of the title bar.
@@ -406,6 +433,10 @@ struct WindowState {
     wheel_remainder: i32,
     secondary_window: bool,
     preview_rect: Option<LayoutRect>,
+    /// Set when the window's last tab left for another window: only the
+    /// teardown messages run from then on, because every other handler would
+    /// index a tab list that no longer has an entry.
+    closing: bool,
 }
 
 impl WindowState {
@@ -419,7 +450,8 @@ impl WindowState {
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
             palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
-            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, splitter_drag: None,
+            hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, drag_ghost: None,
+            splitter_drag: None,
             icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
@@ -430,13 +462,17 @@ impl WindowState {
             fullscreen_restore:None,wheel_remainder:0,
             secondary_window:false,
             preview_rect:None,
+            closing:false,
         }
     }
 
     unsafe fn create(&mut self, hwnd: HWND) -> Result<()> {
+        let started = std::time::Instant::now();
+        let stage = |name: &str| if crate::runtime::tracing() { crate::runtime::trace(&format!("window-create {name} {}ms", started.elapsed().as_millis())) };
         self.hwnd = hwnd;
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         listary::initialize(hwnd)?;
+        stage("listary");
         context_menu::install();
         let key = crate::instance::property(&self.config_path);
         unsafe { SetPropW(hwnd, PCWSTR(key.as_ptr()), Some(windows::Win32::Foundation::HANDLE(1usize as *mut _)))?; }
@@ -447,40 +483,56 @@ impl WindowState {
         unsafe{SetPropW(hwnd,windows::core::w!("ZSDesk.PreferredShow"),Some(windows::Win32::Foundation::HANDLE(preferred_show as usize as *mut _)))?;}
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(hwnd));
         self.gfx = Some(Gfx::new(&family).context("Direct2D 初始化失败")?);
+        stage("gfx");
         self.address_edit = unsafe { child(hwnd, "EDIT", "", ID_ADDRESS, ES_AUTOHSCROLL as u32, false)? };
         self.search_edit = unsafe { child(hwnd, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true)? };
         for (edit, id) in [(self.address_edit, ID_ADDRESS), (self.search_edit, ID_SEARCH)] {
             unsafe { SetWindowSubclass(edit, Some(edit_proc), id, hwnd.0 as usize) }.ok()?;
         }
         self.tooltip = unsafe { create_tooltip(hwnd) };
+        stage("controls");
         self.apply_theme();
         unsafe { self.update_font(); }
         let handler = Rc::new(ChromeDrop { hwnd: hwnd.0 as isize, zones: self.drop_zones.clone(), accepted: Cell::new(false) });
         self.drop_registration = unsafe { DropRegistration::register(hwnd, handler) }.ok();
+        stage("theme-font");
         self.measure_bookmarks();
         self.relayout();
+        stage("measure-relayout");
         let panes = Panes { preview: false, details: self.session.ui.show_details };
         #[cfg(not(test))]
         let browser = unsafe { ExplorerBrowserHost::create(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
         #[cfg(test)]
         let browser = unsafe { ExplorerBrowserHost::create_transient(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
         self.browser = Some(browser);
+        stage("browser");
         if let Some(browser)=&self.browser{browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));}
         self.tree = unsafe { NamespaceTreeHost::create(hwnd, win_rect(self.layout.tree)) }.ok();
+        // The window reopens the branches it was closed with; the tree expands
+        // them level by level while the folder view starts up.
+        if let Some(tree) = self.tree.as_ref().filter(|_| !self.session.ui.tree_expanded.is_empty()) {
+            tree.restore_expanded(&self.session.ui.tree_expanded);
+        }
+        stage("tree");
         self.theme_children();
         self.position_children();
         unsafe { SetTimer(Some(hwnd), TIMER_STATUS, 1200, None); }
         unsafe { self.navigate_current(); }
+        stage("navigate");
         #[cfg(not(test))]
         {
             self.check_integration();
+            stage("integration");
             if let Err(error) = crate::routing_control::refresh_owned_target(&self.config_path, hwnd) {
                 self.show_message(format!("文件位置绑定检查失败：{error}"));
             }
+            stage("routing");
             if let Err(error) = crate::quick_search::start_if_enabled(&self.config_path) {
                 self.show_message(format!("后台搜索启动失败：{error:#}"));
             }
+            stage("quick-search");
         }
+        stage("done");
         Ok(())
     }
 
@@ -543,9 +595,12 @@ impl WindowState {
             width, height, dpi: self.dpi, caption_width: self.caption_width(),
             caption_button: self.caption_buttons().map(|r|r[0]), command_bar: &self.session.ui.command_bar,
             tab_count: self.session.tabs.len(), active_tab: self.session.active_tab,
-            single_tab: zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS,
-            show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS||self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
+            // A window that received a tab while in "new window" mode has a
+            // strip to show, so the single-tab chrome is only for one folder.
+            single_tab: self.session.ui.open_mode.single_tab() && self.session.tabs.len() <= 1,
+            show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.open_mode.single_tab()||self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
             show_bookmarks: self.session.ui.show_bookmarks, status_bar: !self.status.is_empty() || self.search_progress.is_some(), bookmark_widths: &self.bookmark_widths,
+            recycle_bin: self.current_location().is_recycle_bin(),
         };
         let mut layout=ChromeLayout::new(&input);
         layout.retain_tab_viewport(&self.layout,self.session.tabs.len(),self.session.active_tab);
@@ -669,6 +724,11 @@ impl WindowState {
             unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 20, None); }
         }
         if old.search_backend != ui.search_backend { self.search_backend_changed(); }
+        // Switching back to one window per folder collapses this window to the
+        // tab the user is looking at; the tab strip disappears with the layout.
+        if old.open_mode != ui.open_mode && ui.open_mode.single_tab() {
+            self.session.retain_active_tab();
+        }
         self.crumbs_for = None;
         self.measure_bookmarks();
         self.relayout();
@@ -763,9 +823,12 @@ impl WindowState {
     unsafe fn destroy(&mut self) {
         context_menu::destroy(self.hwnd);
         self.cancel_fast_search();self.fast_search=None;
-        unsafe { self.capture_active(); self.commit_bookmark_rename(); }
+        if !self.session.tabs.is_empty() { unsafe { self.capture_active(); } }
+        unsafe { self.commit_bookmark_rename(); }
         self.remember_placement();
         self.drop_registration = None;
+        // Read the tree before dropping it: its branches are part of the session.
+        if let Some(tree) = &self.tree { self.session.ui.tree_expanded = tree.expanded(); }
         self.tree = None;
         self.browser = None;
         self.save();
@@ -931,6 +994,23 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()&&matches!(state.current_location(),ShellLocation::ThisPc)));
                 return LRESULT(accepted as isize);
             }
+            // A tab dragged here from another file window joins this one.
+            if data.dwData==tab_transfer::MAGIC {
+                if data.cbData==0||data.lpData.is_null(){return LRESULT(0);}
+                let bytes=unsafe{std::slice::from_raw_parts(data.lpData as*const u8,data.cbData as usize)};
+                let Ok(transfer)=serde_json::from_slice::<tab_transfer::Transfer>(bytes)else{return LRESULT(0);};
+                let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
+                if pointer.is_null(){return LRESULT(0);}
+                // A window that shows one folder at a time cannot take a tab.
+                let accepted=unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.can_take_tab()));
+                if !accepted{return LRESULT(0);}
+                let payload=Box::into_raw(Box::new(transfer));
+                if unsafe{PostMessageW(Some(hwnd),tab_transfer::WM_TAB_TRANSFER,WPARAM(0),LPARAM(payload as isize))}.is_err(){
+                    unsafe{drop(Box::from_raw(payload));}
+                    return LRESULT(0);
+                }
+                return LRESULT(1);
+            }
             if data.dwData==crate::reveal::VERIFY_RECYCLE_BIN&&data.cbData==0{
                 let pointer=unsafe{GetWindowLongPtrW(hwnd,GWLP_USERDATA)}as*const Slot;
                 let accepted=!pointer.is_null()&&unsafe{&*pointer}.try_borrow().ok().is_some_and(|slot|slot.as_ref().is_some_and(|state|state.pending.is_none()&&state.queued.is_none()
@@ -1077,6 +1157,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_OPEN_TAB_PATH | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
+        | zsdesk_windows::shell::WM_TREE_STATE | tab_transfer::WM_TAB_TRANSFER
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => {
             defer_message(hwnd,msg,wp,lp);
             LRESULT(0)
@@ -1109,6 +1190,7 @@ fn flush_deferred(hwnd:HWND,live:bool){
         unsafe{match message{
             WM_BOOKMARK_PATH_DROPPED|WM_OPEN_TAB_PATH=>drop(Box::from_raw(lp.0 as *mut PathBuf)),
             WM_OPEN_REQUEST=>drop(Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)),
+            tab_transfer::WM_TAB_TRANSFER=>drop(Box::from_raw(lp.0 as *mut tab_transfer::Transfer)),
             WM_SHELL_SELECTION_CHANGED=>acknowledge_selection_changed(lp.0),
             crate::routing_control::WM_RESULT=>drop(Box::from_raw(lp.0 as *mut String)),
             WM_DIAGNOSTIC=>drop(Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)),
@@ -1148,6 +1230,10 @@ unsafe fn hit_test(hwnd: HWND, lp: LPARAM) -> LRESULT {
 impl WindowState {
     unsafe fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let point = || POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
+        // The last tab moved to another window, so this window is on its way
+        // out. Layout, shell callbacks and timers would all read a tab that no
+        // longer exists; only painting (already guarded) and teardown run.
+        if self.closing && !matches!(msg, WM_PAINT | WM_CLOSE | WM_DESTROY) { return Some(LRESULT(0)); }
         match msg {
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();
@@ -1197,6 +1283,13 @@ impl WindowState {
                     self.invalidate_rect(self.layout.command_row);
                     self.invalidate_rect(self.layout.status);
                 }
+                if wp.0 == TIMER_TREE_STATE {
+                    let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_TREE_STATE) };
+                    // A branch reports itself open only once the Shell has
+                    // enumerated its children, which is later than the click.
+                    if let Some(tree) = &self.tree { self.session.ui.tree_expanded = tree.expanded(); }
+                    self.save();
+                }
             }
             WM_MOUSEMOVE => self.mouse_move(point(), wp.0),
             WM_MOUSELEAVE => {
@@ -1209,11 +1302,15 @@ impl WindowState {
             WM_MBUTTONUP => self.middle_click(point()),
             WM_RBUTTONUP => self.right_click(point()),
             WM_CANCELMODE => {
+                self.cancel_tab_drag();
                 self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
-            WM_CAPTURECHANGED => { self.tab_drag = None; self.splitter_drag = None; self.pressed = None; self.invalidate(); }
+            WM_CAPTURECHANGED => {
+                self.cancel_tab_drag();
+                self.tab_drag = None; self.splitter_drag = None; self.pressed = None; self.invalidate();
+            }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
                     let mut p = POINT::default();
@@ -1269,6 +1366,15 @@ impl WindowState {
                 unsafe { self.new_tab(ShellLocation::Path(target)); }
             },
             WM_OPEN_REQUEST => if lp.0 != 0 { unsafe { self.open_requested(*Box::from_raw(lp.0 as *mut crate::instance::OpenRequest)); } },
+            tab_transfer::WM_TAB_TRANSFER => if lp.0 != 0 {
+                unsafe { self.add_transferred_tab(*Box::from_raw(lp.0 as *mut tab_transfer::Transfer)); }
+            },
+            zsdesk_windows::shell::WM_TREE_STATE => {
+                if let Some(tree) = &self.tree { self.session.ui.tree_expanded = tree.expanded(); }
+                crate::runtime::trace(&format!("tree-state open={}",self.session.ui.tree_expanded.len()));
+                // One click can open a whole branch; write once it settles.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_TREE_STATE, 500, None); }
+            }
             WM_FAST_SEARCH => self.poll_fast_search(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},

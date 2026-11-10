@@ -36,7 +36,7 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
 
 /// Command bar entries, left to right.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum CommandId { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, PreviewPane, DetailsPane }
+pub enum CommandId { New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View, More, EmptyRecycle, PreviewPane, DetailsPane }
 
 impl CommandId {
     pub const fn preference(self) -> CommandBarItem {
@@ -45,12 +45,16 @@ impl CommandId {
             Self::Paste => CommandBarItem::Paste, Self::Rename => CommandBarItem::Rename, Self::Share => CommandBarItem::Share,
             Self::Delete => CommandBarItem::Delete, Self::Sort => CommandBarItem::Sort, Self::View => CommandBarItem::View,
             Self::More => CommandBarItem::More, Self::PreviewPane => CommandBarItem::PreviewPane, Self::DetailsPane => CommandBarItem::DetailsPane,
+            // Contextual: it appears only inside the Recycle Bin, so it has no
+            // preference of its own to hide behind.
+            Self::EmptyRecycle => CommandBarItem::Delete,
         }
     }
     /// Label shown next to the icon; icon-only buttons return `None`.
     pub const fn label(self) -> Option<&'static str> {
         match self {
             Self::New => Some("新建"), Self::Sort => Some("排序"), Self::View => Some("查看"),
+            Self::EmptyRecycle => Some("清空回收站"),
             Self::PreviewPane => Some("预览"), Self::DetailsPane => Some("详细信息"), _ => None,
         }
     }
@@ -59,12 +63,14 @@ impl CommandId {
             Self::New => "新建项目", Self::Cut => "剪切 (Ctrl+X)", Self::Copy => "复制 (Ctrl+C)",
             Self::Paste => "粘贴 (Ctrl+V)", Self::Rename => "重命名 (F2)", Self::Share => "共享",
             Self::Delete => "删除 (Del)", Self::Sort => "排序方式", Self::View => "布局和视图选项",
-            Self::More => "查看更多", Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
+            Self::More => "查看更多", Self::EmptyRecycle => "清空回收站",
+            Self::PreviewPane => "预览窗格 (Alt+P)", Self::DetailsPane => "详细信息窗格 (Alt+Shift+P)",
         }
     }
     pub const fn has_dropdown(self) -> bool { matches!(self, Self::New | Self::Sort | Self::View) }
     const fn width(self) -> i32 {
-        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane => 72, Self::DetailsPane => 100, _ => 40 }
+        match self { Self::New | Self::Sort | Self::View => 82, Self::PreviewPane => 72, Self::DetailsPane => 100,
+            Self::EmptyRecycle => 108, _ => 40 }
     }
 }
 
@@ -73,7 +79,7 @@ const COMMAND_GROUPS: &[&[CommandId]] = &[
     &[CommandId::Cut, CommandId::Copy, CommandId::Paste, CommandId::Rename, CommandId::Share, CommandId::Delete],
     &[CommandId::Sort, CommandId::View],
     &[CommandId::More],
-    &[CommandId::PreviewPane],
+    &[CommandId::EmptyRecycle, CommandId::PreviewPane],
 ];
 
 /// Inputs the host measures or owns.
@@ -102,6 +108,8 @@ pub struct ChromeInput<'a> {
     pub status_bar: bool,
     /// Measured chip widths in pixels (icon + text + padding).
     pub bookmark_widths: &'a [i32],
+    /// The folder on screen is the Recycle Bin, so emptying it is on offer.
+    pub recycle_bin: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -322,6 +330,22 @@ impl ChromeLayout {
             if x + s(4) + button <= utility_left {
                 layout.new_tab = Rect::clamped(x + s(4), tab_y, button, tab_h);
             }
+        } else {
+            // One folder per window still gets a tab: it is the handle that
+            // drags the folder into another window. The strip to its right
+            // keeps moving the window.
+            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x } else if !layout.settings_button.is_empty() {
+                layout.settings_button.x
+            } else {
+                width - s(8)
+            };
+            let tabs_right = (utility_left - button - s(4)).max(content_left);
+            let available = tabs_right - content_left;
+            let natural = (available / 2).clamp(s(TAB_MIN_W), s(TAB_MAX_W)).min(available.max(0));
+            if natural > 0 {
+                layout.tabs.push(TabSlot { index: 0, rect: Rect::clamped(content_left, tab_y, natural, tab_h),
+                    close: Rect::default(), show_close: false });
+            }
         }
 
         let full_width=width;
@@ -368,7 +392,9 @@ impl ChromeLayout {
         // Command bar: compact labels first, then wrap without losing actions.
         let cmd_y = layout.nav_row.bottom();
         let groups: Vec<(usize, Vec<CommandId>)> = COMMAND_GROUPS.iter().enumerate().filter_map(|(index, group)| {
-            let items: Vec<CommandId> = group.iter().copied().filter(|id| input.command_bar.item_visible(id.preference())).collect();
+            let items: Vec<CommandId> = group.iter().copied()
+                .filter(|id| if *id == CommandId::EmptyRecycle { input.recycle_bin } else { input.command_bar.item_visible(id.preference()) })
+                .collect();
             (!items.is_empty()).then_some((index, items))
         }).collect();
         let margin = s(12).min(width / 2);
@@ -522,6 +548,9 @@ impl ChromeLayout {
         else if active >= first + visible { first = active + 1 - visible; }
         for (offset, slot) in self.tabs.iter_mut().enumerate() {
             slot.index = first + offset;
+            // A single-tab window draws one wide chip that carries no close
+            // button, so it has no close geometry to fall back on.
+            if slot.close.is_empty() { continue; }
             slot.show_close = self.vertical_tabs || slot.rect.width >= scale(96, self.dpi) || slot.index == active;
         }
     }
@@ -574,21 +603,47 @@ mod tests {
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, single_tab: false, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
-            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false }
+            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false, recycle_bin: false }
     }
 
     #[test]
-    fn single_tab_windows_keep_the_caption_and_menu_only() {
+    fn a_single_tab_window_still_shows_one_draggable_tab() {
         for placement in [zsdesk_core::model::explorer::TabPlacement::Top,
             zsdesk_core::model::explorer::TabPlacement::Left, zsdesk_core::model::explorer::TabPlacement::Right] {
             let layout = ChromeLayout::new(&ChromeInput { tab_placement: placement, single_tab: true, ..input(1200, 1, 0, 96) });
-            assert!(layout.tabs.is_empty() && layout.new_tab.is_empty() && layout.tab_list.is_empty());
+            // The one folder is a tab so it can be dragged into another window;
+            // there is still no tab list, no new-tab button and no close.
+            assert_eq!(layout.tabs.len(), 1);
+            assert_eq!(layout.tabs[0].index, 0);
+            assert!(!layout.tabs[0].show_close);
+            assert!(layout.new_tab.is_empty() && layout.tab_list.is_empty());
             assert!(layout.tab_panel.is_empty() && !layout.vertical_tabs);
-            assert!(!layout.settings_button.is_empty(), "the application menu stays reachable");
-            // The whole strip is window drag area, and no tab hit target exists.
-            assert_eq!(layout.hit(600, 20), Hit::Caption);
+            assert_eq!(layout.hit(layout.tabs[0].rect.x + 20, layout.tabs[0].rect.y + 8), Hit::Tab(0));
+            // The rest of the strip keeps dragging the window.
+            assert_eq!(layout.hit(layout.tabs[0].rect.right() + 120, 20), Hit::Caption);
             assert_eq!(layout.hit(layout.settings_button.x + 2, layout.settings_button.y + 2), Hit::Settings);
+            // Re-checking the tab viewport (every relayout does) must not hand
+            // the chip a close button it has no geometry for: the title would
+            // be pushed off the tab.
+            let mut checked = layout.clone();
+            checked.retain_tab_viewport(&layout, 1, 0);
+            assert_eq!(checked.tabs.len(), 1);
+            assert!(!checked.tabs[0].show_close, "the lone tab keeps its title space");
+            assert!(checked.tabs[0].close.is_empty());
         }
+    }
+
+    #[test]
+    fn emptying_the_recycle_bin_sits_beside_the_preview_button() {
+        let plain = ChromeLayout::new(&input(1200, 1, 0, 96));
+        assert!(plain.command_rect(CommandId::EmptyRecycle).is_none());
+        let bin = ChromeLayout::new(&ChromeInput { recycle_bin: true, ..input(1200, 1, 0, 96) });
+        let empty = bin.command_rect(CommandId::EmptyRecycle).expect("empty button in the Recycle Bin");
+        let preview = bin.command_rect(CommandId::PreviewPane).expect("preview button");
+        assert!(empty.right() <= preview.x, "the button sits left of preview");
+        assert_eq!(bin.hit(empty.x + 4, empty.y + 4), Hit::Command(CommandId::EmptyRecycle));
+        // Hidden again as soon as the folder changes.
+        assert!(ChromeLayout::new(&input(1200, 1, 0, 96)).command_rect(CommandId::EmptyRecycle).is_none());
     }
 
     #[test]

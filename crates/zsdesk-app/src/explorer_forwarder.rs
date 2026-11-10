@@ -73,15 +73,24 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
         else if snapshot.recycle{serde_json::to_vec(&(Some(ShellLocation::recycle_bin()),None::<String>))?}
         else{crate::reveal::encode(&snapshot.folder,&snapshot.selected).context("文件位置请求超出支持范围")?};
     if find_target(profile).is_none(){
-        use std::os::windows::process::CommandExt;
-        let mut command=std::process::Command::new(executable);
-        command.arg("--profile-dir").arg(profile.parent().context("配置目录缺失")?);
-        if snapshot.this_pc{command.arg("--this-pc");}else if snapshot.recycle{command.arg("--recycle-bin");}else{command.arg(&snapshot.folder);}
-        command
-            .creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+        // The application host is already running: hand the folder over with one
+        // packet instead of starting a launcher process that would only forward
+        // the same arguments to it. That process costs a quarter second.
+        let mut arguments:Vec<std::ffi::OsString>=vec!["--profile-dir".into(),profile.parent().context("配置目录缺失")?.as_os_str().to_owned()];
+        if snapshot.this_pc{arguments.push("--this-pc".into());}
+        else if snapshot.recycle{arguments.push("--recycle-bin".into());}
+        else{arguments.push(snapshot.folder.as_os_str().to_owned());}
+        if !crate::runtime::enqueue_host(profile,arguments)?{
+            use std::os::windows::process::CommandExt;
+            let mut command=std::process::Command::new(executable);
+            command.arg("--profile-dir").arg(profile.parent().context("配置目录缺失")?);
+            if snapshot.this_pc{command.arg("--this-pc");}else if snapshot.recycle{command.arg("--recycle-bin");}else{command.arg(&snapshot.folder);}
+            command
+                .creation_flags(0x08000000).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn()?;
+        }
     }
     let deadline=Instant::now()+Duration::from_secs(8);
-    let target=loop{if let Some(target)=find_target(profile){break target;}ensure!(Instant::now()<deadline,"文件管理窗口未就绪");thread::sleep(Duration::from_millis(50));};
+    let target=loop{if let Some(target)=find_target(profile){break target;}ensure!(Instant::now()<deadline,"文件管理窗口未就绪");thread::sleep(Duration::from_millis(10));};
     ensure!(send(target,if snapshot.special(){crate::instance::OPEN_MAGIC}else{crate::reveal::COPYDATA_TAG},&packet),"目标窗口未接受文件位置请求");
     let verify=if snapshot.this_pc{crate::reveal::VERIFY_THIS_PC}
         else if snapshot.recycle{crate::reveal::VERIFY_RECYCLE_BIN}
@@ -92,7 +101,7 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
     let deadline=Instant::now()+Duration::from_secs(4);
     let target=loop{
         if let Some(confirmed)=profile_windows(profile).into_iter().find(|window|send(*window,verify,confirmation)){break confirmed;}
-        ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(75));
+        ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(15));
     };
     // A fresh snapshot prevents closing a window the user has already navigated
     // elsewhere, turned into multiple tabs, or placed behind a modal dialog.
@@ -230,7 +239,7 @@ impl Bridge{
                     if enabled!=active{active=enabled;CONCEAL.store(enabled,Ordering::Relaxed);shell=None;baseline.clear();candidates.clear();write_status(&profile,active,forwarded,None);}
                     refresh=Instant::now();
                 }
-                if active && scan.elapsed()<Duration::from_millis(140){thread::sleep(Duration::from_millis(16));continue;}
+                if active && scan.elapsed()<Duration::from_millis(30){thread::sleep(Duration::from_millis(6));continue;}
                 scan=Instant::now();
                 if active{
                     if shell.is_none(){
@@ -253,7 +262,7 @@ impl Bridge{
                                 let hidden=concealed.contains(&key);
                                 if baseline.contains(&key)||(!hidden&&!unsafe{IsWindowVisible(snapshot.window)}.as_bool())||!unsafe{IsWindowEnabled(snapshot.window)}.as_bool(){continue;}
                                 if snapshot.recycle&&!recycle_allowed{continue;}
-                                let settle=if hidden{Duration::from_millis(80)}else{Duration::from_millis(600)};
+                                let settle=if hidden{Duration::from_millis(40)}else{Duration::from_millis(600)};
                                 match candidates.get(&key){
                                     Some((old,at)) if old.equivalent(&snapshot)&&at.elapsed()>=settle=>{
                                         baseline.insert(key);candidates.remove(&key);concealed.remove(&key);since.remove(&key);
@@ -267,7 +276,7 @@ impl Bridge{
                         }
                     }
                 }
-                thread::sleep(Duration::from_millis(16));
+                thread::sleep(Duration::from_millis(6));
             }
         })?;
         Ok(Some(Self{stop,worker:Some(worker),events:Some(events)}))

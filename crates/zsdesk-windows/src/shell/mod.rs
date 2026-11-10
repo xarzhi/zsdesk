@@ -16,7 +16,7 @@ pub use search::search_location;
 
 pub use events::{
     acknowledge_selection_changed, WM_BOOKMARK_PATH_DROPPED, WM_SHELL_FOLDER_INVOKED, WM_SHELL_NAVIGATED,
-    WM_SHELL_NAVIGATION_FAILED, WM_SHELL_SELECTION_CHANGED, WM_TREE_NAVIGATE,
+    WM_SHELL_NAVIGATION_FAILED, WM_SHELL_SELECTION_CHANGED, WM_TREE_NAVIGATE, WM_TREE_STATE,
 };
 pub use explorer_browser::{ExplorerBrowserHost, Panes, MenuDiagnostics, menu_diagnostics};
 pub use namespace_tree::NamespaceTreeHost;

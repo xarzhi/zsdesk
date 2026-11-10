@@ -42,14 +42,15 @@ use windows::{
             },
             WindowsAndMessaging::{EnumChildWindows, FindWindowExW, GetClassNameW, GetWindowRect, MoveWindow,
                 PostMessageW, ShowWindow, SW_HIDE, SW_SHOW, SendMessageW, WM_GETFONT,
-                IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY},
+                IsChild, IsWindow, IsWindowVisible, SetTimer, KillTimer, WM_KEYDOWN, WM_SYSKEYDOWN, WM_NCDESTROY,
+                WM_LBUTTONDOWN, WM_LBUTTONDBLCLK},
         },
     },
 };
 use zsdesk_core::model::explorer::ShellLocation;
 
 use super::{
-    events::WM_TREE_NAVIGATE,
+    events::{WM_TREE_NAVIGATE, WM_TREE_STATE},
     shell_item::{location_from_shell_item, shell_item},
 };
 
@@ -131,9 +132,11 @@ impl NamespaceTreeHost {
 
         let syncing=Rc::new(Cell::new(0));
         let last_location=Rc::new(RefCell::new(None));
-        let pending_sync=Rc::new(PendingTreeSync{tree:tree.clone(),hwnd,native_tree:Cell::new(HWND::default()),syncing:syncing.clone(),
-            generation:Rc::new(Cell::new(0)),request:RefCell::new(None),last_location:last_location.clone()});
-        let events: INameSpaceTreeControlEvents = TreeEvents { hwnd: parent.0 as isize, syncing: syncing.clone(),pending_sync:Rc::downgrade(&pending_sync) }.into();
+        let pending_sync=Rc::new(PendingTreeSync{tree:tree.clone(),hwnd,owner:parent,native_tree:Cell::new(HWND::default()),syncing:syncing.clone(),
+            generation:Rc::new(Cell::new(0)),request:RefCell::new(None),restore:RefCell::new(None),
+            last_location:last_location.clone()});
+        let events: INameSpaceTreeControlEvents = TreeEvents { hwnd: parent.0 as isize, syncing: syncing.clone(),
+            pending_sync:Rc::downgrade(&pending_sync) }.into();
         let advise_cookie = unsafe { tree.TreeAdvise(&events)? };
         PENDING_SYNCS.with(|pending|{pending.borrow_mut().insert(hwnd.0 as isize,Rc::downgrade(&pending_sync));});
         let host = Self { tree, events, _filter: filter, advise_cookie, hwnd, last_location,
@@ -258,6 +261,32 @@ impl NamespaceTreeHost {
         *self.last_location.borrow_mut()=unsafe {shell_item(location)}.ok();
     }
 
+    /// Branches that are open right now, parents first.
+    ///
+    /// The control reports single state changes rather than the whole set, so
+    /// the open branches are read from the visible rows: an open branch is by
+    /// definition visible, and a collapsed one keeps its children's state to
+    /// itself. The walk is bounded so a huge tree cannot stall the UI thread.
+    pub fn expanded(&self) -> Vec<ShellLocation> {
+        let mut locations = Vec::new();
+        let mut row = unsafe { self.tree.GetRootItems().and_then(|items| items.GetItemAt(0)) }.ok();
+        for _ in 0..4096 {
+            let Some(item) = row else { break };
+            let open = unsafe { self.tree.GetItemState(&item, NSTCIS_EXPANDED.0 as u32) }
+                .is_ok_and(|state| state & NSTCIS_EXPANDED.0 as u32 != 0);
+            if open {
+                if let Some(location) = unsafe { location_from_shell_item(&item) } { locations.push(location); }
+            }
+            row = unsafe { self.tree.GetNextItem(&item, NSTCGNI_NEXTVISIBLE) }.ok();
+        }
+        locations
+    }
+
+    /// Reopens the branches a previous window kept open. Namespace levels
+    /// materialize asynchronously, so the work is queued on the same timer as
+    /// navigation sync instead of expanding everything at once.
+    pub fn restore_expanded(&self, locations: &[ShellLocation]) { self.pending_sync.begin_restore(locations); }
+
     unsafe fn shown_row(&self,item:&IShellItem)->Option<IShellItem> {
         let hint=(SICHINT_CANONICAL.0|SICHINT_TEST_FILESYSPATH_IF_NOT_EQUAL.0)as u32;
         let mut row=unsafe {self.tree.GetRootItems().and_then(|items|items.GetItemAt(0))}.ok();
@@ -298,6 +327,7 @@ impl NamespaceTreeHost {
     /// Must be called exactly once on the STA/UI thread that created this host,
     /// before the COM apartment is uninitialized.
     pub unsafe fn destroy(&self) {
+        self.pending_sync.cancel_restore();
         self.pending_sync.cancel();
         let view=self.pending_sync.native_tree.replace(HWND::default());
         if !view.0.is_null() {let _=unsafe {RemoveWindowSubclass(view,Some(tree_sync_subclass),SYNC_TIMER)};}
@@ -320,13 +350,25 @@ struct TreeSyncRequest {
     attempts:u32,
 }
 
+/// Branches to reopen for a new window. Items are resolved once; expansion
+/// then waits for each parent level to finish loading.
+struct RestoreRequest {
+    queue:Vec<(ShellLocation,IShellItem)>,
+    attempts:u32,
+    deadline:Instant,
+}
+
 struct PendingTreeSync {
     tree:INameSpaceTreeControl,
     hwnd:HWND,
+    /// The window that owns the tree; state notices are posted here, never to
+    /// the tree's own host window, which has no handler for them.
+    owner:HWND,
     native_tree:Cell<HWND>,
     syncing:Rc<Cell<u32>>,
     generation:Rc<Cell<u64>>,
     request:RefCell<Option<TreeSyncRequest>>,
+    restore:RefCell<Option<RestoreRequest>>,
     last_location:Rc<RefCell<Option<IShellItem>>>,
 }
 
@@ -338,20 +380,47 @@ impl PendingTreeSync {
     }
     fn cancel(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
-        self.request.borrow_mut().take();self.stop_timer();
+        self.request.borrow_mut().take();
+        // A pending restore belongs to the window, not to the navigation that
+        // was cancelled: it keeps its own timer until it finishes or expires.
+        if self.restore.borrow().is_none() {self.stop_timer();}
+    }
+    /// A user expand/collapse/click takes over from a session restore.
+    fn cancel_restore(&self) {
+        self.restore.borrow_mut().take();
+        if self.request.borrow().is_none() {self.stop_timer();}
     }
     fn begin(&self,item:IShellItem,ancestors:Vec<IShellItem>) {
         let expansion_requested=vec![false;ancestors.len()];
         *self.request.borrow_mut()=Some(TreeSyncRequest{item,ancestors,expansion_requested,
             deadline:Instant::now()+Duration::from_secs(5),attempts:0});
+        self.tick();
+    }
+    fn begin_restore(&self,locations:&[ShellLocation]) {
+        let mut queue:Vec<(ShellLocation,IShellItem)>=Vec::new();
+        for location in locations {
+            if matches!(location,ShellLocation::Search{..}) {continue;}
+            if let Ok(item)=unsafe {shell_item(location)} {queue.push((location.clone(),item));}
+        }
+        // Shallow branches first: a child only appears once its parent has
+        // finished expanding.
+        queue.sort_by_key(|(location,_)|location_depth(location));
+        if queue.is_empty() {return;}
+        *self.restore.borrow_mut()=Some(RestoreRequest{queue,attempts:0,deadline:Instant::now()+Duration::from_secs(4)});
+        self.tick();
+    }
+    /// One round of both queues; the window timer calls this until both drain.
+    fn tick(&self) {
         self.advance();
+        self.advance_restore();
+        if self.request.borrow().is_none() && self.restore.borrow().is_none() {self.stop_timer();}
     }
     fn advance(&self) {
         // COM can pump messages. Never hold a request borrow across native calls;
         // a new navigation, click or collapse must be able to cancel this work.
-        let Some(mut request)=self.request.borrow_mut().take() else {self.stop_timer();return;};
+        let Some(mut request)=self.request.borrow_mut().take() else {return;};
         if Instant::now()>=request.deadline || request.attempts>=100 || !unsafe {IsWindow(Some(self.hwnd))}.as_bool() {
-            self.stop_timer();return;
+            return;
         }
         request.attempts+=1;
         let generation=self.generation.get();
@@ -375,8 +444,7 @@ impl PendingTreeSync {
         }
         if self.generation.get()!=generation {return;}
         if unsafe {select_exposed(&self.tree,self.hwnd,&request.item)} {
-            if self.generation.get()==generation {*self.last_location.borrow_mut()=Some(request.item);self.stop_timer();}
-            return;
+            if self.generation.get()==generation {*self.last_location.borrow_mut()=Some(request.item);return;}
         }
         if self.generation.get()!=generation {return;}
         // While descendants load, keep the nearest exposed ancestor selected.
@@ -391,12 +459,48 @@ impl PendingTreeSync {
         *self.request.borrow_mut()=Some(request);
         if unsafe {SetTimer(Some(self.hwnd),SYNC_TIMER,50,Some(tree_sync_timer))}==0 {self.request.borrow_mut().take();}
     }
+    fn advance_restore(&self) {
+        let Some(mut request)=self.restore.borrow_mut().take() else {return;};
+        if request.queue.is_empty() || Instant::now()>=request.deadline || !unsafe {IsWindow(Some(self.hwnd))}.as_bool() {
+            return;
+        }
+        request.attempts+=1;
+        let generation=self.generation.get();
+        let mut waiting=Vec::new();
+        for (location,item) in request.queue.drain(..) {
+            if self.generation.get()!=generation {return;}
+            if unsafe {item_is_exposed(&self.tree,&item)} {
+                let _sync=TreeSyncScope::new(self.hwnd,self.syncing.clone(),self.generation.clone());
+                if unsafe {self.tree.SetItemState(&item,NSTCIS_EXPANDED.0 as u32,NSTCIS_EXPANDED.0 as u32)}.is_ok() {
+                    continue;
+                }
+            }
+            // Not materialized yet: the next round tries again.
+            waiting.push((location,item));
+        }
+        request.queue=waiting;
+        if request.queue.is_empty() {return;}
+        if request.attempts>=60 {return;}
+        let deadline=request.deadline;
+        *self.restore.borrow_mut()=Some(RestoreRequest{queue:request.queue,attempts:request.attempts,deadline});
+        if unsafe {SetTimer(Some(self.hwnd),SYNC_TIMER,50,Some(tree_sync_timer))}==0 {self.restore.borrow_mut().take();}
+    }
 }
 
 unsafe extern "system" fn tree_sync_timer(hwnd:HWND,_message:u32,id:usize,_time:u32) {
     if id!=SYNC_TIMER {return;}
     let pending=PENDING_SYNCS.with(|pending|pending.borrow().get(&(hwnd.0 as isize)).and_then(Weak::upgrade));
-    if let Some(pending)=pending {pending.advance();}
+    if let Some(pending)=pending {pending.tick();}
+}
+
+/// How many namespace levels a location has; used to expand parents first.
+fn location_depth(location:&ShellLocation)->usize {
+    match location {
+        ShellLocation::ThisPc=>0,
+        ShellLocation::Path(path)=>path.components().count(),
+        ShellLocation::Shell{..}=>1,
+        ShellLocation::Search{..}=>usize::MAX,
+    }
 }
 
 unsafe extern "system" fn tree_sync_subclass(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM,id:usize,reference:usize)->LRESULT {
@@ -409,6 +513,16 @@ unsafe extern "system" fn tree_sync_subclass(hwnd:HWND,message:u32,wp:WPARAM,lp:
             #[cfg(test)]
             eprintln!("tree-sync native-collapse flags={} pending={}",wp.0,pending.request.borrow().is_some());
             pending.cancel();
+            pending.cancel_restore();
+        }
+        // The rows the window remembers are read back from the tree, so a poke
+        // after any message that can unfold or fold a branch is enough: an extra
+        // one costs nothing, a missed notification loses a branch. A running
+        // restore already owns the session list and must not be overwritten by
+        // the half-open state it is working through.
+        if matches!(message,TVM_EXPAND|WM_LBUTTONDOWN|WM_LBUTTONDBLCLK|WM_KEYDOWN)
+            && pending.restore.borrow().is_none() {
+            let _=unsafe {PostMessageW(Some(pending.owner),WM_TREE_STATE,WPARAM(0),LPARAM(0))};
         }
         if message==WM_NCDESTROY {pending.cancel();pending.native_tree.set(HWND::default());}
     }
@@ -492,7 +606,15 @@ struct TreeEvents {
 }
 
 impl TreeEvents {
-    fn cancel_sync(&self) {if let Some(pending)=self.pending_sync.upgrade(){pending.cancel();}}
+    fn cancel_sync(&self) {
+        if let Some(pending)=self.pending_sync.upgrade(){pending.cancel();pending.cancel_restore();}
+    }
+    /// Asks the window to re-read the open branches. The event carries a single
+    /// item's new state, which is not enough to rebuild the set, and it does not
+    /// arrive for every native expand: the reader looks at the tree instead.
+    fn remember_state(&self) {
+        let _=unsafe {PostMessageW(Some(HWND(self.hwnd as*mut _)),WM_TREE_STATE,WPARAM(0),LPARAM(0))};
+    }
     fn post_item(&self, item: &IShellItem, new_tab: bool) {
         let Some(location) = (unsafe { location_from_shell_item(item) }) else { return };
         let location = Box::into_raw(Box::new(location));
@@ -574,7 +696,10 @@ impl INameSpaceTreeControlEvents_Impl for TreeEvents_Impl {
         if self.syncing.get()==0 && mask&NSTCIS_EXPANDED.0 as u32!=0 && state&NSTCIS_EXPANDED.0 as u32==0 {self.cancel_sync();}
         Ok(())
     }
-    fn OnItemStateChanged(&self, _item: Ref<IShellItem>, _mask: u32, _state: u32) -> Result<()> { Ok(()) }
+    fn OnItemStateChanged(&self, _item: Ref<IShellItem>, mask: u32, _state: u32) -> Result<()> {
+        if mask&NSTCIS_EXPANDED.0 as u32!=0 {self.remember_state();}
+        Ok(())
+    }
     fn OnSelectionChanged(&self, _selection: Ref<IShellItemArray>) -> Result<()> { Ok(()) }
     fn OnKeyboardInput(&self, message: u32, _wparam: WPARAM, _lparam: LPARAM) -> Result<()> {
         if message==WM_KEYDOWN || message==WM_SYSKEYDOWN {self.cancel_sync();}

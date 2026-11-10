@@ -1,7 +1,7 @@
 //! Direct2D painting for the Fluent settings dialog.
 
 use super::model::{self, Control, Layout, Row, Section, Target, BUTTON_SIZE, DETAIL_SIZE, TITLE_SIZE};
-use zsdesk_ui::theme::Palette;
+use zsdesk_ui::theme::{glyph, Palette};
 use zsdesk_windows::gfx::{Align, Canvas, Color, RectF, TextStyle};
 
 fn c(color: zsdesk_ui::theme::Color) -> Color { Color::rgba8(color.r, color.g, color.b, color.a) }
@@ -52,6 +52,8 @@ impl Paint<'_> {
         self.content();
         cv.pop_clip();
         self.scrollbar();
+        // The expanded list lives outside the scroll clip: it floats over cards.
+        if let Some(popup) = &l.popup { self.popup(popup); }
         self.footer();
     }
 
@@ -167,6 +169,21 @@ impl Paint<'_> {
                 let style = TextStyle::ui(s.s(BUTTON_SIZE)).align(Align::Center);
                 cv.text(&model_row.label, control, &style, if *enabled { c(p.text) } else { c(p.text_disabled) });
             }
+            Control::Select { open, enabled } => {
+                let row_hovered = hovered(Target::Row { group, row: index });
+                let fill = if !enabled { control_fill(self.dark).with_alpha(0.45) }
+                    else if row_hovered || *open { c(p.hover) } else { control_fill(self.dark) };
+                cv.round(control, s.s(4.0), fill);
+                cv.stroke_round(control, s.s(4.0), if *open { c(p.accent) } else { c(p.stroke) },
+                    if *open { 1.5 } else { 1.0 });
+                let label = model_row.options.get(model_row.selected).copied().unwrap_or("");
+                let text = RectF::new(control.x + s.s(12.0), control.y, (control.w - s.s(42.0)).max(0.0), control.h);
+                let style = TextStyle::ui(s.s(12.5));
+                cv.text(label, text, &style, if *enabled { c(p.text) } else { c(p.text_disabled) });
+                let chevron = RectF::new(control.right() - s.s(24.0), control.y, s.s(14.0), control.h);
+                cv.glyph(glyph::CHEVRON_DOWN, chevron, s.s(8.0),
+                    if *enabled { c(p.text_secondary) } else { c(p.text_disabled) });
+            }
             Control::Value => {
                 cv.text(&model_row.label, control, &TextStyle::ui(s.s(12.5)).align(Align::End), c(p.text));
             }
@@ -194,6 +211,33 @@ impl Paint<'_> {
             cv.stroke_round(rect, radius, if self.dark { Color::rgba8(0xFF, 0xFF, 0xFF, 0x66) } else { Color::rgba8(0, 0, 0, 0x60) }, 1.0);
             cv.round(knob_rect(rect.x + 2.0), knob / 2.0,
                 if self.dark { Color::rgba8(0xD6, 0xD6, 0xD6, 0xFF) } else { Color::rgba8(0x5A, 0x5A, 0x5A, 0xFF) });
+        }
+    }
+
+    /// Expanded drop-down: a floating card with one highlighted line per option.
+    fn popup(&self, popup: &model::SelectPopup) {
+        let cv = self.canvas;
+        let s = Scaler { dpi: self.layout.dpi };
+        let p = &self.palette;
+        let Some(row) = self.sections.get(self.section)
+            .and_then(|section| section.groups.get(popup.owner.0))
+            .and_then(|group| group.rows.get(popup.owner.1)) else { return };
+        // A soft halo separates the list from the card it covers.
+        cv.round(popup.rect.inset(-1.0, -1.5), s.s(7.0),
+            if self.dark { Color::rgba8(0, 0, 0, 0x70) } else { Color::rgba8(0, 0, 0, 0x18) });
+        cv.round(popup.rect, s.s(6.0), card_fill(self.dark));
+        cv.stroke_round(popup.rect, s.s(6.0), c(p.stroke), 1.0);
+        for (index, area) in popup.options.iter().enumerate() {
+            let item = area.inset(s.s(4.0), 0.0);
+            let hovered = self.hover == Target::Option { group: popup.owner.0, row: popup.owner.1, option: index };
+            if hovered { cv.round(item, s.s(4.0), c(p.hover)); }
+            let label = row.options.get(index).copied().unwrap_or("");
+            let text = RectF::new(item.x + s.s(10.0), item.y, (item.w - s.s(20.0) - s.s(24.0)).max(0.0), item.h);
+            cv.text(label, text, &TextStyle::ui(s.s(12.5)), c(p.text));
+            if index == row.selected {
+                let check = RectF::new(item.right() - s.s(28.0), item.y, s.s(14.0), item.h);
+                cv.glyph("\u{E73E}", check, s.s(10.0), c(p.accent));
+            }
         }
     }
 

@@ -49,7 +49,7 @@ impl WindowState {
             Ok(configuration) => configuration.preferences,
             Err(error) => { self.show_message(format!("无法读取搜索与启动设置：{error:#}")); return; }
         };
-        let main_startup = control::main_window_startup::enabled(&self.config_path);
+        let main_startup = crate::startup::enabled(&self.config_path);
         let spec = settings_menu(&preferences, main_startup.as_ref().ok().copied());
         if let Err(error) = &main_startup { self.show_message(format!("无法读取主窗口登录启动设置：{error:#}")); }
         let Some(choice) = super::input::popup(self.hwnd, &spec, Some(self.layout.settings_button)) else { return; };
@@ -73,8 +73,10 @@ impl WindowState {
         }
         match choice.as_str() {
             "main-window-login" => if let Ok(current) = main_startup {
-                match control::main_window_startup::set_enabled(&self.config_path, !current) {
-                    Ok(()) => self.show_message(if current { "主窗口登录启动已关闭" } else { "下次登录 Windows 时将打开文件管理主窗口" }.into()),
+                let next = !current;
+                match crate::startup::apply(&self.config_path, next) {
+                    Ok(()) => { self.session.ui.autostart = next; self.save();
+                        self.show_message(if next { "下次登录 Windows 时将打开文件管理主窗口" } else { "主窗口登录启动已关闭" }.into()); }
                     Err(error) => self.show_message(format!("主窗口登录启动未更改：{error:#}")),
                 }
             },

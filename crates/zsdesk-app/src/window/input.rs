@@ -181,14 +181,21 @@ impl WindowState {
             let axis=if self.layout.vertical_tabs{p.y}else{p.x};
             if !drag.moved && (axis - drag.start_axis).abs() > threshold { drag.moved = true; }
             if drag.moved {
-                let target = self.layout.tab_drag_target(p.x, p.y);
-                if let Some(target) = target.filter(|&t| t != drag.index && t < self.session.tabs.len()) {
-                    let tab = self.session.tabs.remove(drag.index);
-                    self.session.tabs.insert(target, tab);
-                    self.session.active_tab = target;
-                    drag.index = target;
-                    self.relayout();
-                    self.invalidate_rect(if self.layout.vertical_tabs { self.layout.tab_panel } else { self.layout.strip });
+                // Leaving the window turns the drag into a detach: the card
+                // follows the pointer and releasing there opens a window.
+                if self.pointer_outside(p) {
+                    self.show_detach_card(drag.index, p);
+                } else {
+                    self.hide_detach_card();
+                    let target = self.layout.tab_drag_target(p.x, p.y);
+                    if let Some(target) = target.filter(|&t| t != drag.index && t < self.session.tabs.len()) {
+                        let tab = self.session.tabs.remove(drag.index);
+                        self.session.tabs.insert(target, tab);
+                        self.session.active_tab = target;
+                        drag.index = target;
+                        self.relayout();
+                        self.invalidate_rect(if self.layout.vertical_tabs { self.layout.tab_panel } else { self.layout.strip });
+                    }
                 }
             }
             self.tab_drag = Some(drag);
@@ -225,7 +232,15 @@ impl WindowState {
         if self.splitter_drag.take().is_some() { if had_capture { let _ = unsafe { ReleaseCapture() }; } self.save(); self.invalidate(); return; }
         if let Some(drag) = self.tab_drag.take() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
-            if drag.moved { self.save(); }
+            self.hide_detach_card();
+            let outside = self.pointer_outside(p);
+            if drag.moved {
+                // Released over another file window: the tab moves there. Any
+                // other spot outside this window gives the folder its own window.
+                if outside {
+                    if unsafe { !self.merge_tab(drag.index, p) } { unsafe { self.detach_tab(drag.index, p); } }
+                } else { self.save(); }
+            }
             return;
         }
         if had_capture { let _ = unsafe { ReleaseCapture() }; }
@@ -251,6 +266,116 @@ impl WindowState {
             Hit::StatusTiles => self.set_view(menus::view_choice("large")),
             _ => {}
         }
+    }
+
+    /// True when the captured pointer has left this window's client area. A few
+    /// DIP of slack keeps the card from flickering along the frame.
+    fn pointer_outside(&self, p: POINT) -> bool {
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut client) }.is_err() { return false; }
+        let margin = zsdesk_ui::chrome::scale(6, self.dpi);
+        p.x < -margin || p.y < -margin || p.x >= client.right + margin || p.y >= client.bottom + margin
+    }
+
+    /// Removes the detach card; the drag itself keeps going.
+    pub(super) fn hide_detach_card(&mut self) {
+        if let Some(ghost) = self.drag_ghost.as_mut() { ghost.hide(); }
+    }
+
+    /// Cancels a tab drag: the card belongs to the drag and goes with it.
+    pub(super) fn cancel_tab_drag(&mut self) { self.hide_detach_card(); }
+
+    /// Follows the pointer with the card while the dragged tab is outside.
+    fn show_detach_card(&mut self, index: usize, p: POINT) {
+        let Some(title) = self.session.tabs.get(index).map(|tab| tab.current().title()) else { return };
+        let mut screen = p;
+        let _ = unsafe { ClientToScreen(self.hwnd, &mut screen) };
+        // Over another file window the release merges the two windows; the card
+        // says which one will happen.
+        let last = self.session.tabs.len() <= 1;
+        let hint = if super::tab_transfer::target(&self.config_path, screen, self.hwnd).is_some() {
+            "松开以合并到该窗口"
+        } else if last {
+            // The window must keep showing a folder: dragging its only tab
+            // somewhere else would leave an empty window behind.
+            "拖到另一个窗口以合并"
+        } else {
+            "松开以在新窗口中打开"
+        };
+        if self.drag_ghost.is_none() {
+            self.drag_ghost = super::tab_ghost::TabGhost::new(self.hwnd, self.dpi);
+        }
+        if let Some(ghost) = self.drag_ghost.as_mut() {
+            ghost.present(screen, &title, hint, self.dark, self.palette);
+        }
+    }
+
+    /// Drops the tab at `index` into its own window under the pointer, the way
+    /// a browser detaches a tab. The folder opens first, so a failure leaves
+    /// the tab where it was.
+    unsafe fn detach_tab(&mut self, index: usize, p: POINT) {
+        if self.session.tabs.len() <= 1 {
+            self.show_message("先把标签拖到另一个窗口才能合并；只有一个标签页时不能拖出新窗口".into());
+            return;
+        }
+        let Some(location) = self.session.tabs.get(index).map(|tab| tab.current().clone()) else { return };
+        // A search result tab is a query, not a folder: there is nothing to
+        // show in a new window.
+        if matches!(location, ShellLocation::Search { .. }) {
+            self.show_message("搜索结果不能拖出为新窗口".into());
+            return;
+        }
+        let mut screen = p;
+        let _ = unsafe { ClientToScreen(self.hwnd, &mut screen) };
+        crate::runtime::trace(&format!("tab-detach index={index} active={} drop={}x{} tabs={:?}", self.session.active_tab,
+            screen.x, screen.y, self.session.tabs.iter().map(|tab| tab.current().title()).collect::<Vec<_>>()));
+        unsafe { self.capture_active(); }
+        self.open_in_new_window_at(location, None, Some((screen.x, screen.y)));
+        unsafe { self.remove_left_tab(index); }
+    }
+
+    /// Hands the dragged tab to the file window under the pointer, merging the
+    /// two windows. False means there is no such window, so the caller opens a
+    /// new one instead.
+    unsafe fn merge_tab(&mut self, index: usize, p: POINT) -> bool {
+        let mut screen = p;
+        if !unsafe { ClientToScreen(self.hwnd, &mut screen) }.as_bool() { return false; }
+        let Some(target) = super::tab_transfer::target(&self.config_path, screen, self.hwnd) else { return false };
+        // The tab the user dragged is the active one; its view is captured so
+        // the tab leaves the window in the state it was shown in.
+        unsafe { self.capture_active(); }
+        let Some(tab) = self.session.tabs.get(index).cloned() else { return false };
+        // A search result is a query scoped to this window's search panel.
+        if matches!(tab.current(), ShellLocation::Search { .. }) { return false; }
+        let transfer = super::tab_transfer::Transfer { tab, at: Some((screen.x, screen.y)) };
+        if !super::tab_transfer::send(target, &transfer) { return false; }
+        crate::runtime::trace(&format!("tab-merge index={index} target={:?}", target.0));
+        unsafe { self.remove_left_tab(index); }
+        true
+    }
+
+    /// Removes a tab that now lives in another window (merged or detached) and
+    /// keeps a neighbour active. Merging the only tab away closes this window:
+    /// it would have nothing left to show.
+    unsafe fn remove_left_tab(&mut self, index: usize) {
+        let active = self.session.active_tab;
+        let was_active = active == index;
+        self.session.tabs.remove(index);
+        if self.session.tabs.is_empty() {
+            crate::runtime::trace("tab-merge source window closes");
+            // Nothing is left to show and the folder now lives in the other
+            // window. From here on the window only runs its teardown.
+            self.closing = true;
+            // Posted, not sent: this runs inside the window's own mouse-up.
+            unsafe { PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok(); }
+            return;
+        }
+        self.session.active_tab = active_after_detach(active, index, self.session.tabs.len());
+        unsafe { self.rebuild_tabs(); }
+        // The shell view still shows the folder that left when that tab was the
+        // active one; otherwise the remaining tab is already on screen.
+        if was_active { unsafe { self.navigate_current(); } }
+        self.save();
     }
 
     pub(super) fn middle_click(&mut self, p: POINT) {
@@ -350,9 +475,23 @@ impl WindowState {
             CommandId::View => unsafe { self.view_menu() },
             CommandId::More => unsafe { self.more_menu() },
             CommandId::DetailsPane => unsafe { self.execute(Command::ToggleDetails) },
+            CommandId::EmptyRecycle => unsafe { self.empty_recycle_bin() },
             CommandId::PreviewPane => unsafe { self.execute(Command::TogglePreview) },
         }
         self.focus_view();
+    }
+
+    /// Empties the Recycle Bin from the command bar. Windows asks for a
+    /// confirmation first, so a stray click cannot destroy anything.
+    unsafe fn empty_recycle_bin(&mut self) {
+        use windows::Win32::UI::Shell::SHEmptyRecycleBinW;
+        // No flags: the system keeps its confirmation, progress and sound.
+        match unsafe { SHEmptyRecycleBinW(Some(self.hwnd), PCWSTR::null(), 0) } {
+            Ok(()) => unsafe { self.execute(Command::Refresh) },
+            // 0x800704C7 = ERROR_CANCELLED: the user dismissed the confirmation.
+            Err(error) if error.code().0 == 0x8007_04C7u32 as i32 => {}
+            Err(error) => self.show_message(format!("无法清空回收站：{error}")),
+        }
     }
 
     fn screen_point(&self, x: i32, y: i32) -> POINT {
@@ -735,4 +874,28 @@ fn build_menu(spec: &MenuSpec, ids: &mut Vec<String>) -> Option<HMENU> {
         }
     }
     Some(menu)
+}
+
+/// Active tab after the tab at `removed` left the window: its right-hand
+/// neighbour takes over, and the last tab keeps the index it had.
+fn active_after_detach(active: usize, removed: usize, remaining: usize) -> usize {
+    let last = remaining.max(1) - 1;
+    if removed < active { active - 1 } else { active.min(last) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detaching_a_tab_keeps_the_neighbour_active() {
+        // A tab left of the active one: the active tab slides left with it.
+        assert_eq!(active_after_detach(2, 0, 2), 1);
+        // The active tab itself leaves: its right-hand neighbour takes over.
+        assert_eq!(active_after_detach(1, 1, 2), 1);
+        // The last tab leaves: the new last tab becomes active.
+        assert_eq!(active_after_detach(2, 2, 2), 1);
+        // A tab right of the active one: nothing moves.
+        assert_eq!(active_after_detach(0, 2, 2), 0);
+    }
 }

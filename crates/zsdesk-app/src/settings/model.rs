@@ -4,7 +4,7 @@
 //! preferences, so the dialog can be laid out and hit-tested without a window.
 
 use zsdesk_core::model::explorer::{
-    BackdropStyle, ColorScheme, ContextMenuMode, ContextMenuPreferences, ExplorerUi,
+    BackdropStyle, ColorScheme, ContextMenuMode, ContextMenuPreferences, ExplorerUi, OpenMode,
     PreviewProviderPreference,
 };
 use zsdesk_windows::gfx::RectF;
@@ -42,6 +42,9 @@ pub enum Control {
     Toggle { on: bool, enabled: bool },
     /// Radio-style segmented control; the options live in [`Row::options`].
     Segments,
+    /// Drop-down list; closed it shows the selected option, open it floats a
+    /// list over the cards below.
+    Select { open: bool, enabled: bool },
     Button { enabled: bool },
     /// Read-only text (version numbers).
     Value,
@@ -79,6 +82,16 @@ impl Row {
         Self { id, title: title.into(), detail: detail.into(), control: Control::Button { enabled: true },
             options: Vec::new(), actions: vec![id], selected: 0, label: label.into() }
     }
+    pub fn select(id: &'static str, title: &str, detail: &str, options: &[&'static str], selected: usize, actions: &[&'static str]) -> Self {
+        debug_assert_eq!(options.len(), actions.len());
+        Self { id, title: title.into(), detail: detail.into(), control: Control::Select { open: false, enabled: true },
+            options: options.to_vec(), actions: actions.to_vec(), selected: selected.min(options.len().saturating_sub(1)), label: String::new() }
+    }
+    /// Marks the drop-down as open; the dialog owns that transient state.
+    pub fn opened(mut self, open: bool) -> Self {
+        if let Control::Select { open: flag, .. } = &mut self.control { *flag = open; }
+        self
+    }
     pub fn button_locked(id: &'static str, title: &str, detail: &str, label: &str, enabled: bool) -> Self {
         Self { control: Control::Button { enabled }, ..Self::button(id, title, detail, label) }
     }
@@ -89,8 +102,8 @@ impl Row {
     /// Action id triggered by clicking the control (or one of its options).
     pub fn action(&self, option: Option<usize>) -> Option<&'static str> {
         match (&self.control, option) {
-            (Control::Segments, Some(index)) => self.actions.get(index).copied(),
-            (Control::Segments, None) => self.actions.get(self.selected).copied(),
+            (Control::Segments | Control::Select { .. }, Some(index)) => self.actions.get(index).copied(),
+            (Control::Segments | Control::Select { .. }, None) => self.actions.get(self.selected).copied(),
             (Control::Value, _) => None,
             (_, _) => self.actions.first().copied(),
         }
@@ -114,6 +127,8 @@ pub struct Snapshot<'a> {
     /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
     pub integration: u8,
     pub themed: bool,
+    /// Id of the drop-down that is currently expanded, if any.
+    pub open: Option<&'a str>,
 }
 
 fn group(title: Option<&'static str>, rows: Vec<Row>) -> Group { Group { title, rows } }
@@ -123,7 +138,12 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
     let ui = snapshot.ui;
     let mut sections = vec![
         Section { id: "general", title: "常规", icon: "\u{E80F}", groups: vec![group(None, vec![
-            Row::button("new-window", "新建窗口", "每个窗口一个标签页，新窗口会级联出现", "打开"),
+            Row::select("open-mode", "多标签的打开方式", "从其他窗口打开文件夹时，新建一个窗口或在本窗口新增标签页",
+                &["新窗口打开", "在本窗口的新增标签页打开"],
+                usize::from(ui.open_mode == OpenMode::NewTab),
+                &["open-mode-window", "open-mode-tab"]).opened(snapshot.open == Some("open-mode")),
+            Row::toggle("autostart", "开机自启", "登录 Windows 时自动打开文件管理器", ui.autostart),
+            Row::button("new-window", "新建窗口", "再开一个独立的浏览窗口，按需级联出现", "打开"),
             Row::button("quick-search", "窗口内搜索", "在地址栏右侧搜索当前文件夹（Ctrl+F）", "搜索"),
             Row::button("bookmark", "收藏当前文件夹", "把当前文件夹加入收藏栏（Ctrl+D）", "收藏"),
         ])] },
@@ -162,11 +182,6 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
                 &["系统默认", "Office 优先", "WPS 优先"], provider,
                 &["preview-provider-system", "preview-provider-office", "preview-provider-wps"]),
         ]),
-        group(Some("搜索"), vec![
-            Row::segments("search-scope", "默认搜索范围", "按 Ctrl+F 时搜索全部磁盘，或只搜索当前文件夹",
-                &["全部本地磁盘", "仅当前文件夹"], usize::from(!ui.search_all_files),
-                &["search-all-files", "search-current-folder"]),
-        ]),
     ] });
     let takeover = (snapshot.integration.min(2) as usize).min(2);
     let owned = snapshot.integration == 2;
@@ -203,6 +218,11 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
     let everything = ui.everything_executable.as_ref().map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "未选择，搜索会退回本程序自带的索引".into());
     sections.push(Section { id: "search", title: "搜索", icon: "\u{E721}", groups: vec![
+        group(Some("范围"), vec![
+            Row::segments("search-scope", "默认搜索范围", "按 Ctrl+F 时搜索全部磁盘，或只搜索当前文件夹",
+                &["全部本地磁盘", "仅当前文件夹"], usize::from(!ui.search_all_files),
+                &["search-all-files", "search-current-folder"]),
+        ]),
         group(Some("Everything"), vec![
             Row::button("search-everything-program", "已安装的 Everything", &everything, "选择"),
             Row::button("search-index-settings", "Everything 索引设置…", "在 Everything 中调整索引的磁盘与文件夹", "打开"),
@@ -256,6 +276,15 @@ pub struct RowBox {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Thumb { pub track: RectF, pub thumb: RectF }
 
+/// Expanded drop-down list. The rectangles are in window coordinates because
+/// the list floats over the cards and is not clipped by the scroll view.
+#[derive(Clone, Debug, Default)]
+pub struct SelectPopup {
+    pub owner: (usize, usize),
+    pub rect: RectF,
+    pub options: Vec<RectF>,
+}
+
 pub struct Layout {
     pub width: i32,
     pub height: i32,
@@ -272,6 +301,7 @@ pub struct Layout {
     pub scroll: f32,
     pub max_scroll: f32,
     pub scrollbar: Option<Thumb>,
+    pub popup: Option<SelectPopup>,
 }
 
 /// Text width callback: (text, size, weight) -> pixel width.
@@ -336,8 +366,39 @@ pub fn layout(width: i32, height: i32, dpi: u32, sections: &[Section], section: 
         let offset = if max_scroll > 0.0 { (scroll / max_scroll) * (track.h - thumb_h) } else { 0.0 };
         Thumb { track, thumb: RectF::new(track.x, track.y + offset, track.w, thumb_h) }
     });
+    let popup = sections.get(section).and_then(|current| {
+        select_popup(current, &groups, scroll, view, height as f32, dpi)
+    });
     Layout { width, height, dpi, header, close, title, subtitle, nav, nav_width, view, groups, content_height,
-        scroll, max_scroll, scrollbar }
+        scroll, max_scroll, scrollbar, popup }
+}
+
+/// Geometry of the expanded drop-down, if the section has one open. The list
+/// drops below its box and flips above it when the window has no room left.
+fn select_popup(current: &Section, groups: &[GroupBox], scroll: f32, view: RectF, height: f32, dpi: u32) -> Option<SelectPopup> {
+    let s = |value: f32| scale(value, dpi);
+    for (group_index, group) in groups.iter().enumerate() {
+        let Some(rows) = current.groups.get(group_index).map(|group| &group.rows) else { continue };
+        for (row_index, box_) in group.rows.iter().enumerate() {
+            let Some(row) = rows.get(row_index) else { continue };
+            if !matches!(row.control, Control::Select { open: true, .. }) || row.options.is_empty() { continue; }
+            let control = box_.control;
+            let base_y = view.y - scroll + control.y;
+            let item_h = s(32.0);
+            let pad = s(4.0);
+            let list_h = row.options.len() as f32 * item_h + pad * 2.0;
+            let mut y = base_y + control.h + s(2.0);
+            if y + list_h > height - s(6.0) {
+                y = (base_y - s(2.0) - list_h).max(s(HEADER_H) + s(40.0));
+            }
+            let rect = RectF::new(control.x, y, control.w, list_h);
+            let options = (0..row.options.len())
+                .map(|index| RectF::new(rect.x + pad, rect.y + pad + index as f32 * item_h, rect.w - pad * 2.0, item_h))
+                .collect();
+            return Some(SelectPopup { owner: (group_index, row_index), rect, options });
+        }
+    }
+    None
 }
 
 fn row_height(row: &Row) -> f32 {
@@ -368,6 +429,14 @@ fn control_boxes(row: &Row, rect: RectF, pad: f32, measure: Measure<'_>, dpi: u3
             }
             (RectF::new(right - total * scale_down, rect.y + (rect.h - h) / 2.0, total * scale_down, h), options, None)
         }
+        Control::Select { .. } => {
+            let h = s(30.0);
+            // Wide enough for the longest option plus the chevron column.
+            let text = row.options.iter().map(|option| measure(option, s(12.5), 400)).fold(0.0f32, f32::max);
+            let max = (rect.w - pad * 2.0 - s(200.0)).max(s(150.0));
+            let w = (text + s(12.0) * 2.0 + s(40.0)).max(s(168.0)).min(max);
+            (RectF::new(right - w, rect.y + (rect.h - h) / 2.0, w, h), Vec::new(), None)
+        }
         Control::Button { .. } => {
             let h = s(30.0);
             let w = (measure(&row.label, s(BUTTON_SIZE), 400) + s(34.0)).max(s(76.0));
@@ -384,6 +453,12 @@ fn control_boxes(row: &Row, rect: RectF, pad: f32, measure: Measure<'_>, dpi: u3
 impl Layout {
     /// Pointer position to the widget under it.
     pub fn hit(&self, x: f32, y: f32) -> Target {
+        // The expanded list floats over everything, so it is tested first.
+        if let Some(popup) = &self.popup {
+            if let Some(option) = popup.options.iter().position(|rect| rect.contains(x, y)) {
+                return Target::Option { group: popup.owner.0, row: popup.owner.1, option };
+            }
+        }
         if self.close.inset(-6.0, -6.0).contains(x, y) { return Target::Close; }
         if let Some(index) = self.nav.iter().position(|rect| rect.contains(x, y)) { return Target::Section(index); }
         if let Some(thumb) = self.scrollbar {
@@ -427,7 +502,7 @@ mod tests {
     }
     fn snapshot() -> ExplorerUi { ExplorerUi::default() }
     fn sections_for(ui: &ExplorerUi) -> Vec<Section> {
-        build(&Snapshot { ui, integration: 2, themed: true })
+        build(&Snapshot { ui, integration: 2, themed: true, open: None })
     }
 
     #[test]
@@ -441,9 +516,10 @@ mod tests {
                     assert!(ids.insert(row.id), "duplicate row id {}", row.id);
                     match row.control {
                         Control::Value => assert!(row.actions.is_empty()),
-                        Control::Segments => {
-                            assert_eq!(row.actions.len(), row.options.len(), "{} segments need one action each", row.id);
+                        Control::Segments | Control::Select { .. } => {
+                            assert_eq!(row.actions.len(), row.options.len(), "{} needs one action per option", row.id);
                             assert!(row.options.len() >= 2);
+                            assert!(row.selected < row.options.len(), "{} selects a missing option", row.id);
                         }
                         Control::Toggle { .. } | Control::Button { .. } => assert_eq!(row.actions.len(), 1, "{}", row.id),
                     }
@@ -454,7 +530,7 @@ mod tests {
 
     #[test]
     fn single_tab_build_has_no_tab_placement_rows_and_hides_unthemed_appearance() {
-        let mut theme_snapshot = Snapshot { ui: &ExplorerUi::default(), integration: 2, themed: false };
+        let mut theme_snapshot = Snapshot { ui: &ExplorerUi::default(), integration: 2, themed: false, open: None };
         let plain = build(&theme_snapshot);
         assert!(!plain.iter().any(|section| section.id == "appearance"));
         theme_snapshot.themed = true;
@@ -465,15 +541,51 @@ mod tests {
     }
 
     #[test]
+    fn open_mode_defaults_to_a_new_window_and_follows_the_preference() {
+        let mut ui = ExplorerUi::default();
+        let row = |ui: &ExplorerUi| {
+            build(&Snapshot { ui, integration: 2, themed: false, open: None })
+                .into_iter().flat_map(|section| section.groups).flat_map(|group| group.rows)
+                .find(|row| row.id == "open-mode").expect("open mode row")
+        };
+        let default = row(&ui);
+        assert!(matches!(default.control, Control::Select { open: false, enabled: true }));
+        assert_eq!(default.selected, 0);
+        assert_eq!(default.action(None), Some("open-mode-window"));
+        assert_eq!(default.action(Some(1)), Some("open-mode-tab"));
+        ui.open_mode = OpenMode::NewTab;
+        assert_eq!(row(&ui).selected, 1);
+        assert_eq!(row(&ui).action(None), Some("open-mode-tab"));
+    }
+
+    #[test]
+    fn an_open_select_floats_its_option_list_and_captures_the_pointer() {
+        let ui = ExplorerUi::default();
+        let sections = build(&Snapshot { ui: &ui, integration: 2, themed: false, open: Some("open-mode") });
+        let index = sections.iter().position(|section| section.id == "general").unwrap();
+        let closed = layout(940, 660, 96, &build(&Snapshot { ui: &ui, integration: 2, themed: false, open: None }), index, 0.0, &measure);
+        assert!(closed.popup.is_none());
+        let l = layout(940, 660, 96, &sections, index, 0.0, &measure);
+        let popup = l.popup.as_ref().expect("open drop-down");
+        assert_eq!(popup.owner, (0, 0));
+        assert_eq!(popup.options.len(), 2);
+        // The list hangs below its box, one row per option.
+        assert!(popup.rect.y >= l.view.y + l.groups[0].rows[0].control.y);
+        assert!(popup.options[1].y > popup.options[0].y);
+        let option = &popup.options[1];
+        assert_eq!(l.hit(option.x + 4.0, option.y + option.h / 2.0), Target::Option { group: 0, row: 0, option: 1 });
+    }
+
+    #[test]
     fn integration_rows_lock_when_takeover_is_off() {
         let ui = ExplorerUi::default();
-        let off = build(&Snapshot { ui: &ui, integration: 0, themed: false });
+        let off = build(&Snapshot { ui: &ui, integration: 0, themed: false, open: None });
         let rows: Vec<&Row> = off.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows).collect();
         let recycle = rows.iter().find(|row| row.id == "integration-recycle").expect("recycle row");
         assert!(matches!(recycle.control, Control::Toggle { enabled: false, .. }));
         let restore = rows.iter().find(|row| row.id == "integration-restore").expect("restore row");
         assert!(matches!(restore.control, Control::Button { enabled: false }));
-        let on = build(&Snapshot { ui: &ui, integration: 2, themed: false });
+        let on = build(&Snapshot { ui: &ui, integration: 2, themed: false, open: None });
         let rows: Vec<&Row> = on.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows).collect();
         assert!(matches!(rows.iter().find(|row| row.id == "integration-recycle").unwrap().control, Control::Toggle { enabled: true, .. }));
     }
@@ -484,7 +596,7 @@ mod tests {
         let sections = sections_for(&ui);
         let index = sections.iter().position(|section| section.id == "interface").unwrap();
         let l = layout(940, 660, 96, &sections, index, 0.0, &measure);
-        assert!(l.groups.len() == 3);
+        assert!(l.groups.len() == 2, "界面 keeps the layout and preview cards; search scope lives in 搜索");
         // Cards never overlap and stay inside the content column.
         for pair in l.groups.windows(2) { assert!(pair[0].rect.bottom() <= pair[1].rect.y); }
         for group in &l.groups { assert!(group.rect.right() <= l.view.right()); }

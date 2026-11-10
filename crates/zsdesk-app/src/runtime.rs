@@ -39,12 +39,27 @@ fn send(hwnd:HWND,args:Vec<OsString>)->Result<()>{
 }
 /// Product actions can reuse the host directly instead of starting a launcher.
 pub fn enqueue_local(profile:&Path,mut args:Vec<OsString>)->Result<bool>{
-    let Some((owned,window))=LOCAL.get()else{return Ok(false);};
-    if !crate::explorer_forwarder::same_path(profile,owned){return Ok(false);}
+    if let Some((owned,window))=LOCAL.get(){
+        if crate::explorer_forwarder::same_path(profile,owned){
+            if !args.iter().any(|arg|arg=="--profile-dir"){
+                args.extend(["--profile-dir".into(),profile.parent().context("缺少配置目录")?.as_os_str().to_owned()]);
+            }
+            send(HWND(*window as*mut _),args)?;return Ok(true);
+        }
+    }
+    enqueue_host(profile,args)
+}
+/// Posts a startup request to this profile's running host. A window thread that
+/// is not the host itself (or another process entirely) still reaches the host
+/// without paying for a launcher process.
+pub fn enqueue_host(profile:&Path,mut args:Vec<OsString>)->Result<bool>{
+    let Some(window)=find(profile)else{return Ok(false);};
     if !args.iter().any(|arg|arg=="--profile-dir"){
         args.extend(["--profile-dir".into(),profile.parent().context("缺少配置目录")?.as_os_str().to_owned()]);
     }
-    send(HWND(*window as*mut _),args)?;Ok(true)
+    // A host that refuses the packet is about to exit: let the caller start a
+    // launcher instead of failing the user action.
+    Ok(send(window,args).is_ok())
 }
 unsafe extern "system" fn procedure(hwnd:HWND,message:u32,wp:WPARAM,lp:LPARAM)->LRESULT{
     if message==WM_NCCREATE{
@@ -132,6 +147,7 @@ fn spawn_window_pool(id:u64,job:WindowJob,destination:isize,sender:mpsc::Sender<
     })?;
     Ok(WindowWorker{id,thread_id:None,job:Some(job_id),requests:1,ending:false,commands,thread})
 }
+pub(crate) fn tracing()->bool{std::env::var_os("ZSDESK_RUNTIME_TRACE").is_some()}
 pub(crate) fn trace(stage:&str){
     if let Some(path)=std::env::var_os("ZSDESK_RUNTIME_TRACE"){
         let path=PathBuf::from(path);if !path.is_absolute(){return;}
@@ -161,6 +177,7 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     }
     // COM's first STA must outlive the other STAs. The host pumps messages
     // until every component has released its Shell/Office interfaces.
+    crate::startup::reconcile(&profile);
     unsafe{windows::Win32::System::Ole::OleInitialize(None)}?;let _apartment=Apartment;
     let _menus=zsdesk_windows::shell::menu::SharedMenuRuntime::new();
     let (tx,rx)=mpsc::sync_channel(64);let mut ingress=Box::new(Ingress{profile:profile.clone(),tx,accepting:Cell::new(true)});

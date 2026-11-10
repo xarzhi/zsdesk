@@ -11,8 +11,11 @@ pub const WM_SHELL_NAVIGATION_FAILED: u32 = WM_APP + 0x214;
 /// flag that the receiver must reclaim with [`acknowledge_selection_changed`].
 pub const WM_SHELL_SELECTION_CHANGED: u32 = WM_APP + 0x215;
 
-/// Clears the coalescing flag carried by `WM_SHELL_SELECTION_CHANGED`.
-///
+/// A branch of the navigation tree was expanded or collapsed, so the window can
+/// remember which folders the user keeps open. Carries no payload.
+pub const WM_TREE_STATE: u32 = WM_APP + 0x216;
+
+/// Clears the coalescing flag carried by `WM_SHELL_SELECTION_CHANGED`.///
 /// # Safety
 ///
 /// `lparam` must come from a `WM_SHELL_SELECTION_CHANGED` message and be consumed once.

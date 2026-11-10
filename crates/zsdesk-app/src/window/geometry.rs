@@ -53,9 +53,33 @@ pub(super) fn cascaded_origin(previous: Option<(i32, i32)>, anchor: (i32, i32), 
     (left, top)
 }
 
+/// Origin of a window created by dropping a tab outside its source window:
+/// `grip` puts the pointer over the new window's tab strip, and the whole
+/// window stays inside the work area of the monitor under the pointer.
+pub(super) fn dropped_origin(point: (i32, i32), size: (i32, i32), grip: (i32, i32), work: RECT) -> (i32, i32) {
+    let left = point.0.saturating_sub(grip.0.max(0));
+    let top = point.1.saturating_sub(grip.1.max(0));
+    (
+        left.clamp(work.left, (work.right - size.0).max(work.left)),
+        top.clamp(work.top, (work.bottom - size.1).max(work.top)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_dropped_tab_lands_under_the_pointer_and_stays_on_the_monitor() {
+        let work = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+        // Released low on the screen: the window slides up to stay inside.
+        assert_eq!(dropped_origin((800, 500), (1180, 760), (96, 14), work), (704, 280));
+        // Released near the bottom-right corner: both edges are pushed back in.
+        assert_eq!(dropped_origin((1900, 1030), (1180, 760), (96, 14), work), (740, 280));
+        // A monitor left of the primary one keeps its negative coordinates; a
+        // window released at its right edge stays fully on that monitor.
+        let west = RECT { left: -1920, top: 0, right: 0, bottom: 1040 };
+        assert_eq!(dropped_origin((-10, 100), (800, 600), (96, 14), west), (-800, 86));
+    }
     #[test]
     fn all_edges_and_corners_resize_at_each_dpi_and_negative_origin() {
         for dpi in [96, 120, 144, 192] {

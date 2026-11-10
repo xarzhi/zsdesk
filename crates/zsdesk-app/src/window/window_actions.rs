@@ -131,6 +131,12 @@ impl WindowState {
     /// this is how "新建标签页", middle clicks and forwarded open requests are
     /// served. `selection` names an item inside `location` to select on open.
     pub(super) fn open_in_new_window(&mut self, location: ShellLocation, selection: Option<std::ffi::OsString>) {
+        self.open_in_new_window_at(location, selection, None);
+    }
+    /// [`Self::open_in_new_window`] that also places the new window at `at` (a
+    /// screen point), which is how a tab dropped outside its window lands
+    /// under the pointer.
+    pub(super) fn open_in_new_window_at(&mut self, location: ShellLocation, selection: Option<std::ffi::OsString>, at: Option<(i32, i32)>) {
         let (select, target): (bool, std::ffi::OsString) = match &location {
             ShellLocation::Path(path) => match &selection {
                 Some(name) => (true, path.join(name).into_os_string()),
@@ -140,13 +146,16 @@ impl WindowState {
             _ => (false, "--this-pc".into()),
         };
         let profile = self.config_path.parent().unwrap_or(std::path::Path::new("."));
+        let position = at.map(|(x, y)| format!("{x},{y}"));
         let mut arguments: Vec<std::ffi::OsString> = vec!["--new-window".into(), "--profile-dir".into(), profile.as_os_str().to_owned()];
         if select { arguments.push("--select".into()); }
+        if let Some(position) = &position { arguments.push("--at".into()); arguments.push(position.into()); }
         arguments.push(target.clone());
         match crate::runtime::enqueue_local(&self.config_path,arguments){Ok(true)=>return,Err(error)=>{self.show_message(error.to_string());return;},Ok(false)=>{}}
         let mut command = std::process::Command::new(match std::env::current_exe() { Ok(path)=>path, Err(error)=>{self.show_message(error.to_string());return;} });
         command.arg("--new-window").arg("--profile-dir").arg(profile);
         if select { command.arg("--select"); }
+        if let Some(position) = &position { command.arg("--at").arg(position); }
         command.arg(target);
         if let Err(error)=command.spawn() {self.show_message(format!("无法打开新窗口：{error}"));}
     }

@@ -24,7 +24,7 @@ impl WindowState {
             if let (Some(browser),Some(name))=(&self.browser,request.selection){let _=browser.select_child(&name);}
             return;
         }
-        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+        if self.session.ui.open_mode.single_tab() {
             // One tab per window: a request for another folder opens its own
             // window instead of replacing this window's folder.
             let selection=request.selection.or_else(||request.selections.first().cloned());
@@ -173,7 +173,7 @@ impl WindowState {
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}
     }
     pub(super) unsafe fn new_tab(&mut self,location:ShellLocation) {
-        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+        if self.session.ui.open_mode.single_tab() {
             // One tab per window: the location opens in a new window.
             self.open_in_new_window(location,None);
             return;
@@ -184,6 +184,32 @@ impl WindowState {
         self.session.active_tab=self.session.tabs.len()-1;
         unsafe {self.rebuild_tabs();self.navigate_current();}
     }
+    /// True when this window can take a tab dragged in from another window. A
+    /// window showing one folder takes it too and grows a tab strip: that is
+    /// how two single-tab windows merge into one.
+    pub(super) fn can_take_tab(&self)->bool { true }
+    /// Inserts a tab dragged here from another window. Its history travels with
+    /// it, so back and forward still lead where they did in the source window.
+    pub(super) unsafe fn add_transferred_tab(&mut self,transfer:super::tab_transfer::Transfer) {
+        if !self.can_take_tab(){return;}
+        unsafe {self.capture_active();}
+        let mut tab=transfer.tab;
+        tab.id=self.session.take_id();
+        // The tab is shown at this window's size; the source view state (column
+        // widths, scroll offset) would not match it.
+        tab.view=None;
+        let index=transfer.at.and_then(|(x,y)|{
+            let mut client=POINT{x,y};
+            let _=unsafe {ScreenToClient(self.hwnd,&mut client)};
+            self.layout.tab_drag_target(client.x,client.y)
+        }).unwrap_or(self.session.tabs.len()).min(self.session.tabs.len());
+        self.session.tabs.insert(index,tab);
+        self.session.active_tab=index;
+        unsafe {self.rebuild_tabs();self.navigate_current();}
+        // The pointer is still over this window; it becomes the active one like
+        // a browser tab dropped into another window would.
+        let _=unsafe {SetForegroundWindow(self.hwnd)};
+    }
     pub(super) unsafe fn select_tab(&mut self,index:usize) {
         if index>=self.session.tabs.len() || index==self.session.active_tab {return;}
         self.end_address_edit();
@@ -192,7 +218,7 @@ impl WindowState {
         unsafe {self.rebuild_tabs();self.navigate_current();}
     }
     pub(super) unsafe fn close_tab(&mut self,index:usize) {
-        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+        if self.session.ui.open_mode.single_tab() {
             // The only tab is the window.
             let _=unsafe{PostMessageW(Some(self.hwnd),WM_CLOSE,WPARAM(0),LPARAM(0))};
             return;
@@ -213,7 +239,7 @@ impl WindowState {
         self.save();
     }
     pub(super) unsafe fn reopen_tab(&mut self) {
-        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+        if self.session.ui.open_mode.single_tab() {
             if let Some(tab)=self.closed_tabs.pop() {let location=tab.current().clone();self.open_in_new_window(location,None);}
             return;
         }

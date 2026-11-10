@@ -64,6 +64,9 @@ impl WindowState {
     }
 
     pub(super) fn paint(&mut self) {
+        // A window whose last tab left for another window has nothing to show;
+        // every layer reads the active tab.
+        if self.session.tabs.is_empty() { return; }
         let (width, height) = self.client_size();
         if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.
@@ -122,15 +125,6 @@ impl WindowState {
         let active = self.session.active_tab;
         let radius = self.sf(8.0);
         let foot = self.sf(6.0);
-        if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
-            // One tab per window: the strip names the open folder and stays the
-            // window's drag area instead of showing a tab. The title starts
-            // after the application mark at the far left.
-            let right = if self.layout.settings_button.is_empty() { strip.w } else { self.layout.settings_button.x as f32 - self.sf(10.0) };
-            let left = self.layout.app_icon.right() as f32 + self.sf(8.0);
-            let title = self.session.current_location().title();
-            cv.text(&title, RectF::new(left, strip.y, (right - left).max(0.0), strip.h), &self.ui_style(), text);
-        }
         if self.layout.vertical_tabs{
             cv.fill(rf(self.layout.tab_panel),c(p.strip));
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
@@ -146,7 +140,11 @@ impl WindowState {
             if is_active {
                 if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
             } else if hovered {
-                cv.round(RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(6.0)), self.sf(6.0), c(p.hover));
+                // Hovering paints the same footprint as the selected tab: a
+                // shorter chip reads as a divider instead of a tab.
+                let hover_rect = RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(2.0));
+                if self.layout.vertical_tabs { cv.round(hover_rect, self.sf(6.0), c(p.hover)); }
+                else { cv.tab_shape(hover_rect, radius, foot, c(p.hover)); }
             } else {
                 // Separator unless the neighbour is active or hovered.
                 let next = self.layout.tabs.get(n + 1).map(|t| t.index);
@@ -311,6 +309,7 @@ impl WindowState {
                 CommandId::Paste => glyph::PASTE, CommandId::Rename => glyph::RENAME, CommandId::Share => glyph::SHARE,
                 CommandId::Delete => glyph::DELETE, CommandId::Sort => glyph::SORT, CommandId::View => glyph::VIEW,
                 CommandId::More => glyph::MORE, CommandId::DetailsPane => glyph::PROPERTIES, CommandId::PreviewPane => glyph::PREVIEW,
+                CommandId::EmptyRecycle => glyph::DELETE,
             };
             let glyph_color = if enabled && *id == CommandId::New { c(p.accent) } else { color };
             if l.compact_commands {

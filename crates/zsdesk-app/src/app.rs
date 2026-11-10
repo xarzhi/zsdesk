@@ -25,6 +25,8 @@ struct Options {
     integration_enable: bool,
     win_e: bool,
     new_window: bool,
+    /// Screen point of the drop that asked for this window (tab drag-out).
+    at: Option<(i32, i32)>,
     focus_search:bool,
     search_settings:bool,
 }
@@ -37,6 +39,10 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         if arg=="--search-settings"{opts.focus_search=true;opts.search_settings=true;continue;}
         if arg=="--integration-enable"{opts.integration_enable=true;continue;}
         if arg == "--new-window" { opts.new_window=true; continue; }
+        if arg == "--at" {
+            opts.at = Some(parse_point(&iter.next().context("缺少窗口位置")?)?);
+            continue;
+        }
         let quick = match arg.to_str() {
             Some("--quick-search") => Some(crate::quick_search::Action::Open),
             Some("--quick-search-settings") => Some(crate::quick_search::Action::Settings),
@@ -67,6 +73,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         if opts.target.replace(target).is_some() { bail!("只能指定一个文件或目录"); }
     }
     if opts.select && opts.target.is_none() { bail!("缺少定位目标"); }
+    if opts.at.is_some() && opts.target.is_none() { bail!("窗口位置需要同时给出打开目标"); }
     if opts.integration_enable&&(opts.mode!=Mode::Explorer||opts.target.is_some()||opts.select||opts.classic||opts.integration_refresh||opts.uninstall_integration||opts.routing_apply||opts.diagnostics_main.is_some()||opts.new_window||opts.win_e){bail!("启用系统集成不能与其他操作混用");}
     if opts.win_e && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.integration_refresh || opts.uninstall_integration || opts.routing_apply || opts.diagnostics_main.is_some()) {bail!("Win+E 启动不能与其他操作混用");}
     if opts.integration_refresh && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.uninstall_integration || opts.routing_apply || opts.diagnostics_main.is_some()) {bail!("集成修复不能与其他操作混用");}
@@ -79,6 +86,13 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
     }
     if opts.diagnostics_main.is_some() && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select){bail!("窗口诊断不能与其他启动模式混用");}
     Ok(opts)
+}
+
+/// `--at 1200,540`: the screen point a dragged tab was dropped on.
+fn parse_point(value: &OsString) -> Result<(i32, i32)> {
+    let text = value.to_string_lossy();
+    let (x, y) = text.split_once(',').context("窗口位置应写成 x,y")?;
+    Ok((x.trim().parse().context("窗口位置横坐标无效")?, y.trim().parse().context("窗口位置纵坐标无效")?))
 }
 
 /// Target of a `--shell-open` launch, so `main` can fall back to Explorer.
@@ -205,13 +219,28 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
         requested = Some(location);
     }
     if opts.focus_search&&crate::instance::focus_search(&config,opts.search_settings)?{return Ok(());}
-    // One tab per window: an open request never reuses a window that already
-    // shows something else, it starts a new window instead. Only the profile's
-    // first window owns the saved tab; later windows persist the shared
-    // interface preferences.
+    // A session written by a newer build, or edited by hand, must not stop the
+    // window from opening: fall back to the defaults instead of failing.
+    let loaded = if config.try_exists()? {
+        match storage::load(&config) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                crate::runtime::trace(&format!("session-load-failed {error:#}"));
+                // Keep the unreadable file for the user instead of silently
+                // overwriting it with the fresh session this launch will save.
+                let _ = std::fs::rename(&config, config.with_extension("json.invalid"));
+                None
+            }
+        }
+    } else { None };
+    // "Open in a new window" (the default) never reuses a window that already
+    // shows something else. "Open as a tab" hands the folder to the window that
+    // is already open, which adds a tab there.
+    let open_mode = loaded.as_ref().map(|session| session.ui.open_mode)
+        .unwrap_or(zsdesk_core::model::explorer::OpenMode::NewWindow);
     let (instance, additional) = if opts.new_window {
         (None, true)
-    } else if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+    } else if open_mode.single_tab() {
         let (guard, first) = crate::instance::claim(&config)?;
         (Some(guard), !first)
     } else {
@@ -221,16 +250,15 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
         }
     };
     let _instance = instance;
-    let loaded = if config.try_exists()? { Some(storage::load(&config)?) } else { None };
     let fresh = loaded.is_none() || opts.new_window || additional;
     let mut session = loaded.unwrap_or_else(storage::default_session);
     session.normalize();
     if let Some(location) = requested { activate(&mut session, location, fresh); }
-    window::run(session, config, selection, !opts.classic,opts.new_window||additional,opts.focus_search.then_some(opts.search_settings))
+    window::run(session, config, selection, !opts.classic,opts.new_window||additional,opts.focus_search.then_some(opts.search_settings),opts.at)
 }
 
 fn activate(session: &mut ExplorerSession, target: ShellLocation, fresh: bool) {
-    if zsdesk_core::model::explorer::SINGLE_TAB_WINDOWS {
+    if session.ui.open_mode.single_tab() {
         // The requested location becomes the window's only tab; a tab that
         // already shows it keeps its saved view.
         let mut tab = match session.tabs.iter().position(|tab| tab.current() == &target) {

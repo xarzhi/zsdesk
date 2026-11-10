@@ -27,7 +27,7 @@ use windows::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use zsdesk_core::model::explorer::{BackdropStyle, ContextMenuPreferences, ExplorerUi};
+use zsdesk_core::model::explorer::{BackdropStyle, ContextMenuPreferences, ExplorerUi, OpenMode};
 use zsdesk_ui::{menus, theme::{Mode, Palette}};
 use zsdesk_windows::gfx::{Gfx, Surface, TextStyle};
 
@@ -114,6 +114,9 @@ struct Dialog {
     layout: Layout,
     hover: Target,
     pressed: Target,
+    /// Row id of the drop-down the user expanded. The dialog owns this
+    /// transient state, the section list is rebuilt from the preferences.
+    open_select: Option<&'static str>,
     /// Cursor position in screen pixels and the window origin when the header is
     /// being dragged. The dialog owns the drag so it works without a caption or
     /// a thick frame.
@@ -138,7 +141,7 @@ impl Dialog {
             hwnd: HWND::default(), parent, config_path: config_path.to_path_buf(), ui,
             sections: Vec::new(), section: 0, scroll: 0.0,
             layout: model::layout(1, 1, 96, &[], 0, 0.0, &|_, _, _| 0.0),
-            hover: Target::None, pressed: Target::None, drag: None, tracking: false,
+            hover: Target::None, pressed: Target::None, open_select: None, drag: None, tracking: false,
             dark: false, active: true, dpi: 96, gfx: None, surface: None, message: None,
         };
         dialog.rebuild();
@@ -155,7 +158,8 @@ impl Dialog {
 
     fn rebuild(&mut self) {
         let integration = integration_level();
-        self.sections = model::build(&model::Snapshot { ui: &self.ui, integration, themed: crate::edition::THEMED });
+        self.sections = model::build(&model::Snapshot { ui: &self.ui, integration, themed: crate::edition::THEMED,
+            open: self.open_select });
         self.section = self.section.min(self.sections.len().saturating_sub(1));
         // A section may have lost or gained rows; keep the scroll offset valid.
         self.scroll = self.scroll.max(0.0);
@@ -233,9 +237,18 @@ impl Dialog {
 
     fn run(&mut self, action: &str) {
         match action {
+            "autostart" => {
+                let next = !self.ui.autostart;
+                return match crate::startup::apply(&self.config_path, next) {
+                    Ok(()) => { self.ui.autostart = next; self.commit(); }
+                    Err(error) => { self.message = Some(format!("开机自启未更改：{error:#}")); self.invalidate(); }
+                };
+            }
             "navigation-expand-system" => { self.ui.navigation_auto_expand = None; return self.commit(); }
             "navigation-expand-always" => { self.ui.navigation_auto_expand = Some(true); return self.commit(); }
             "navigation-expand-never" => { self.ui.navigation_auto_expand = Some(false); return self.commit(); }
+            "open-mode-window" => { self.ui.open_mode = OpenMode::NewWindow; self.open_select = None; return self.commit(); }
+            "open-mode-tab" => { self.ui.open_mode = OpenMode::NewTab; self.open_select = None; return self.commit(); }
             "appearance-solid" => { self.ui.appearance.backdrop = BackdropStyle::Solid; self.apply_frame(); return self.commit(); }
             "context-menu-defaults" => {
                 self.ui.context_menu = ContextMenuPreferences::default();
@@ -258,6 +271,23 @@ impl Dialog {
     }
 
     fn choose(&mut self, target: Target) {
+        // An expanded list swallows the next click: a pick runs the option, the
+        // box itself or anything else just folds the list away.
+        if let Some(id) = self.open_select.take() {
+            let owner = self.row_index(id);
+            let picked = match (owner, target) {
+                (Some((group, row)), Target::Option { group: g, row: r, option }) if (g, r) == (group, row) => Some((g, r, option)),
+                _ => None,
+            };
+            self.rebuild();
+            self.layout();
+            self.invalidate();
+            if let Some((group, row, option)) = picked {
+                if let Some(action) = self.row(group, row).and_then(|entry| entry.action(Some(option))) { self.run(action); }
+                return;
+            }
+            if owner == target_row(target) { return; }
+        }
         match target {
             Target::Close => { let _ = unsafe { DestroyWindow(self.hwnd) }; }
             Target::Section(index) => {
@@ -267,13 +297,25 @@ impl Dialog {
             }
             Target::Row { group, row } => {
                 let Some(entry) = self.row(group, row) else { return };
-                match entry.control {
-                    model::Control::Toggle { enabled: false, .. } => return,
-                    model::Control::Button { enabled: false } => return,
-                    model::Control::Value => return,
-                    _ => {}
+                let id = entry.id;
+                let action = entry.action(None);
+                let select = matches!(entry.control, model::Control::Select { .. });
+                let locked = match entry.control {
+                    model::Control::Toggle { enabled: false, .. } => true,
+                    model::Control::Button { enabled: false } => true,
+                    model::Control::Select { enabled: false, .. } => true,
+                    model::Control::Value => true,
+                    _ => false,
+                };
+                if locked { return; }
+                if select {
+                    self.open_select = Some(id);
+                    self.rebuild();
+                    self.layout();
+                    self.invalidate();
+                    return;
                 }
-                if let Some(action) = entry.action(None) { self.run(action); }
+                if let Some(action) = action { self.run(action); }
             }
             Target::Option { group, row, option } => {
                 let Some(entry) = self.row(group, row) else { return };
@@ -287,6 +329,13 @@ impl Dialog {
             }
             Target::None => {}
         }
+    }
+
+    /// Position of a row in the current section, by row id.
+    fn row_index(&self, id: &str) -> Option<(usize, usize)> {
+        let section = self.sections.get(self.section)?;
+        section.groups.iter().enumerate()
+            .find_map(|(group, entries)| entries.rows.iter().position(|row| row.id == id).map(|row| (group, row)))
     }
 
     fn row(&self, group: usize, row: usize) -> Option<&model::Row> {
@@ -373,7 +422,12 @@ impl Dialog {
             WM_KEYDOWN => {
                 let key = wp.0 as u32;
                 if key == VK_ESCAPE.0 as u32 {
-                    let _ = unsafe { DestroyWindow(self.hwnd) };
+                    if self.open_select.take().is_some() {
+                        // Esc folds an expanded list before it closes the dialog.
+                        self.rebuild(); self.layout(); self.invalidate();
+                    } else {
+                        let _ = unsafe { DestroyWindow(self.hwnd) };
+                    }
                 } else if key == VK_DOWN.0 as u32 {
                     self.scroll_by(model::scale(48.0, self.dpi));
                 } else if key == VK_UP.0 as u32 {
@@ -430,6 +484,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 fn x_lparam(value: isize) -> i32 { (value as i16) as i32 }
 fn y_lparam(value: isize) -> i32 { ((value >> 16) as i16) as i32 }
+/// Row coordinates behind a target, when the target is a row.
+fn target_row(target: Target) -> Option<(usize, usize)> {
+    match target { Target::Row { group, row } => Some((group, row)), _ => None }
+}
 
 /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
 fn integration_level() -> u8 {
@@ -444,11 +502,12 @@ mod tests {
     #[test]
     fn every_section_action_is_understood() {
         let ui = ExplorerUi::default();
-        let sections = model::build(&model::Snapshot { ui: &ui, integration: 2, themed: true });
+        let sections = model::build(&model::Snapshot { ui: &ui, integration: 2, themed: true, open: None });
         // Local preferences apply through the shared menu helpers, everything else
         // is forwarded to the window; both paths must consume the id.
         let local = |action: &str| {
-            if matches!(action, "navigation-expand-system" | "navigation-expand-always" | "navigation-expand-never" | "appearance-solid") { return true; }
+            if matches!(action, "autostart" | "navigation-expand-system" | "navigation-expand-always" | "navigation-expand-never"
+                | "appearance-solid" | "open-mode-window" | "open-mode-tab") { return true; }
             if action.starts_with("context-menu-") || action.starts_with("context-action-") {
                 return menus::apply_context_menu_setting(&mut ContextMenuPreferences::default(), action);
             }
