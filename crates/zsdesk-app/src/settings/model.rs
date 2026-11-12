@@ -142,7 +142,7 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
                 &["新窗口打开", "在本窗口的新增标签页打开"],
                 usize::from(ui.open_mode == OpenMode::NewTab),
                 &["open-mode-window", "open-mode-tab"]).opened(snapshot.open == Some("open-mode")),
-            Row::toggle("autostart", "开机自启", "登录 Windows 时自动打开文件管理器", ui.autostart),
+            Row::toggle("autostart", "开机自启", "登录 Windows 时在后台就绪，不弹出窗口", ui.autostart),
             Row::button("new-window", "新建窗口", "再开一个独立的浏览窗口，按需级联出现", "打开"),
             Row::button("quick-search", "窗口内搜索", "在地址栏右侧搜索当前文件夹（Ctrl+F）", "搜索"),
             Row::button("bookmark", "收藏当前文件夹", "把当前文件夹加入收藏栏（Ctrl+D）", "收藏"),

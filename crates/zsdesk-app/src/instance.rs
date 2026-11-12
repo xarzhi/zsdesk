@@ -111,21 +111,43 @@ pub fn enter(path:&Path,target:Option<&ShellLocation>,selection:Option<&std::ffi
         while let Ok(hwnd)=unsafe {FindWindowExW(None,previous,w!("ZSDesk.Native.Explorer"),None)} {
             previous=Some(hwnd);
             if unsafe {GetPropW(hwnd,PCWSTR(key.as_ptr()))}.0 as usize!=1 {continue;}
-            let bytes=serde_json::to_vec(&(target,selection.map(|s|s.to_string_lossy().into_owned())))?;
-            let data=COPYDATASTRUCT{dwData:OPEN_MAGIC,cbData:bytes.len() as u32,lpData:bytes.as_ptr() as *mut _};
-            let mut accepted=0;
-            let sent=unsafe {SendMessageTimeoutW(hwnd,WM_COPYDATA,windows::Win32::Foundation::WPARAM(0),
-                windows::Win32::Foundation::LPARAM((&data as *const COPYDATASTRUCT) as isize),
-                SMTO_ABORTIFHUNG,2500,Some(&mut accepted))};
-            if sent.0==0||accepted!=1{bail!("已打开的 ZSDesk 暂时无法接收请求");}
-            // Acceptance is final: an activation failure must not repeat the
-            // already accepted folder open through Windows Explorer.
-            let _=request_activation(hwnd);
+            send_open(hwnd,target,selection)?;
             return Ok(None);
         }
         if Instant::now()>=deadline {bail!("ZSDesk 正在启动，请稍后重试");}
         std::thread::sleep(Duration::from_millis(60));
     }
+}
+
+/// Hands the request to the window the login start built but never showed.
+/// Without a target the window is simply revealed; with one it takes the folder
+/// over, which is what keeps a silent start from leaving an invisible window
+/// behind once the user opens something.
+pub fn adopt_hidden(path:&Path,target:Option<&ShellLocation>,selection:Option<&std::ffi::OsStr>)->Result<bool>{
+    let key=property(path);
+    let mut previous=None;
+    while let Ok(hwnd)=unsafe {FindWindowExW(None,previous,w!("ZSDesk.Native.Explorer"),None)}{
+        previous=Some(hwnd);
+        if unsafe{GetPropW(hwnd,PCWSTR(key.as_ptr()))}.0 as usize!=1{continue;}
+        if unsafe{IsWindowVisible(hwnd)}.as_bool(){continue;}
+        if target.is_some(){send_open(hwnd,target,selection)?;}else{let _=request_activation(hwnd);}
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn send_open(hwnd:HWND,target:Option<&ShellLocation>,selection:Option<&std::ffi::OsStr>)->Result<()>{
+    let bytes=serde_json::to_vec(&(target,selection.map(|s|s.to_string_lossy().into_owned())))?;
+    let data=COPYDATASTRUCT{dwData:OPEN_MAGIC,cbData:bytes.len() as u32,lpData:bytes.as_ptr() as *mut _};
+    let mut accepted=0;
+    let sent=unsafe {SendMessageTimeoutW(hwnd,WM_COPYDATA,windows::Win32::Foundation::WPARAM(0),
+        windows::Win32::Foundation::LPARAM((&data as *const COPYDATASTRUCT) as isize),
+        SMTO_ABORTIFHUNG,2500,Some(&mut accepted))};
+    if sent.0==0||accepted!=1{bail!("已打开的 ZSDesk 暂时无法接收请求");}
+    // Acceptance is final: an activation failure must not repeat the
+    // already accepted folder open through Windows Explorer.
+    let _=request_activation(hwnd);
+    Ok(())
 }
 pub struct OpenRequest{pub location:ShellLocation,pub selection:Option<std::ffi::OsString>,pub selections:Vec<std::ffi::OsString>}
 

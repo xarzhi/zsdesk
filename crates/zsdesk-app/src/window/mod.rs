@@ -133,10 +133,10 @@ fn release_window_properties(hwnd:HWND){
 }
 
 pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,
-    focus_search:Option<bool>, at: Option<(i32, i32)>) -> Result<()> {
+    focus_search:Option<bool>, at: Option<(i32, i32)>, silent: bool) -> Result<()> {
     crate::runtime::trace("window-ole-init");
     unsafe { OleInitialize(None).context("OleInitialize failed")?; }
-    let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search,at) };
+    let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search,at,silent) };
     crate::runtime::trace("window-loop-return");
     unsafe { OleUninitialize(); }
     crate::runtime::trace("window-ole-uninit-return");
@@ -144,7 +144,7 @@ pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std
 }
 
 unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool,
-    secondary_window: bool, focus_search:Option<bool>, at: Option<(i32, i32)>) -> Result<()> {
+    secondary_window: bool, focus_search:Option<bool>, at: Option<(i32, i32)>, silent: bool) -> Result<()> {
     unsafe { InitCommonControlsEx(&INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_BAR_CLASSES | ICC_STANDARD_CLASSES }) }.ok()?;
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
@@ -159,6 +159,7 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     // The slot outlives the window and every callback that can reach it.
     let mut state = WindowState::new(session, config_path, selection, modern);
     state.secondary_window = secondary_window;
+    state.silent = silent;
     let slot = Box::new(RefCell::new(Some(state)));
     let (x, y, w, h) = initial_rect(placement);
     // A tab dropped outside its window opens right under the pointer; a window
@@ -184,7 +185,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     // A dropped tab is a new, free-standing window even when the window it came
     // from was maximized.
     let maximized = at.is_none() && placement.is_some_and(|p| p.maximized);
-    let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+    // A login start builds the window without showing it: the folder that
+    // triggered Win+E or an Explorer takeover arrives as an open request, and
+    // that path reveals the window through the activation protocol.
+    if !silent { let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }) }; }
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
     let mut quick_preview:Option<preview_process::PreviewProcess>=None;
@@ -384,6 +388,9 @@ struct WindowState {
     dark: bool,
     mica: bool,
     active: bool,
+    /// Built by the login start: the window exists but was never shown, so the
+    /// first folder that arrives takes it over instead of opening another one.
+    silent: bool,
     layout: ChromeLayout,
     crumbs: Vec<Crumb>,
     crumb_slots: Vec<CrumbSlot>,
@@ -448,7 +455,7 @@ impl WindowState {
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
-            palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
+            palette: Palette::light(), dark: false, mica: false, active: true, silent: false, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, drag_ghost: None,
             splitter_drag: None,

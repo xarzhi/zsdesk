@@ -14,6 +14,22 @@ impl WindowState {
         self.session.ui.navigation_auto_expand.unwrap_or_else(NamespaceTreeHost::system_auto_expand)
     }
     pub(super) unsafe fn open_requested(&mut self,request:crate::instance::OpenRequest){
+        // A login start leaves its window hidden. The first folder that arrives
+        // is what the user asked for, so this window takes it over: otherwise
+        // the copy stays invisible for the whole session and the visible window
+        // would be a second one.
+        if self.silent {
+            self.silent=false;
+            self.launch_selection=request.selection.clone();
+            self.launch_selections=request.selections.clone();
+            if self.session.ui.open_mode.single_tab() {
+                self.session.tabs.truncate(1);
+                self.session.active_tab=0;
+            }
+            unsafe {crate::instance::activate(self.hwnd);}
+            unsafe {self.navigate_to(request.location);}
+            return;
+        }
         if self.pending.is_some(){
             if self.open_requests.len()<32{self.open_requests.push_back(request);}
             return;

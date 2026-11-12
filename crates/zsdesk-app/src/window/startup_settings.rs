@@ -20,7 +20,7 @@ fn settings_menu(preferences: &QuickSearchPreferences, main_startup: Option<bool
         }).collect()),
         menus::entry("登录 Windows 时启用后台快捷键（不打开窗口）", "search-background-login", preferences.enabled, preferences.enabled && preferences.start_with_windows),
         MenuItemSpec::Separator,
-        menus::entry(if main_startup.is_some() { "登录 Windows 时打开文件管理主窗口" } else { "主窗口登录启动（无法读取状态）" },
+        menus::entry(if main_startup.is_some() { "登录 Windows 时启动文件管理器（不弹窗口）" } else { "主窗口登录启动（无法读取状态）" },
             "main-window-login", main_startup.is_some(), main_startup.unwrap_or(false)),
     ];
     items.extend([MenuItemSpec::Separator, menus::item("查看全局快捷键运行状态", "search-hotkey-status")]);
@@ -76,7 +76,7 @@ impl WindowState {
                 let next = !current;
                 match crate::startup::apply(&self.config_path, next) {
                     Ok(()) => { self.session.ui.autostart = next; self.save();
-                        self.show_message(if next { "下次登录 Windows 时将打开文件管理主窗口" } else { "主窗口登录启动已关闭" }.into()); }
+                        self.show_message(if next { "下次登录 Windows 时将静默启动，按 Win+E 或打开文件夹时才显示窗口" } else { "主窗口登录启动已关闭" }.into()); }
                     Err(error) => self.show_message(format!("主窗口登录启动未更改：{error:#}")),
                 }
             },

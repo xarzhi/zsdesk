@@ -29,6 +29,8 @@ struct Options {
     at: Option<(i32, i32)>,
     focus_search:bool,
     search_settings:bool,
+    /// Login start: build the window without showing it.
+    silent: bool,
 }
 
 fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
@@ -39,6 +41,7 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
         if arg=="--search-settings"{opts.focus_search=true;opts.search_settings=true;continue;}
         if arg=="--integration-enable"{opts.integration_enable=true;continue;}
         if arg == "--new-window" { opts.new_window=true; continue; }
+        if arg == "--silent" { opts.silent=true; continue; }
         if arg == "--at" {
             opts.at = Some(parse_point(&iter.next().context("缺少窗口位置")?)?);
             continue;
@@ -76,6 +79,12 @@ fn parse(args: impl IntoIterator<Item=OsString>) -> Result<Options> {
     if opts.at.is_some() && opts.target.is_none() { bail!("窗口位置需要同时给出打开目标"); }
     if opts.integration_enable&&(opts.mode!=Mode::Explorer||opts.target.is_some()||opts.select||opts.classic||opts.integration_refresh||opts.uninstall_integration||opts.routing_apply||opts.diagnostics_main.is_some()||opts.new_window||opts.win_e){bail!("启用系统集成不能与其他操作混用");}
     if opts.win_e && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.integration_refresh || opts.uninstall_integration || opts.routing_apply || opts.diagnostics_main.is_some()) {bail!("Win+E 启动不能与其他操作混用");}
+    // A login start only builds the window; anything that expects to see it
+    // would be swallowed, so those combinations are refused instead.
+    if opts.silent && (opts.mode != Mode::Explorer || opts.target.is_some() || opts.select || opts.win_e
+        || opts.focus_search || opts.new_window || opts.diagnostics_main.is_some()) {
+        bail!("静默启动不能与其他打开目标或后台搜索模式混用");
+    }
     if opts.integration_refresh && (opts.mode!=Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.uninstall_integration || opts.routing_apply || opts.diagnostics_main.is_some()) {bail!("集成修复不能与其他操作混用");}
     if matches!(opts.mode, Mode::QuickSearch(_)) && (opts.target.is_some() || opts.select || opts.classic) { bail!("快速搜索启动不能附带文件浏览参数"); }
     if opts.uninstall_integration && (opts.mode != Mode::Explorer || opts.target.is_some() || opts.select || opts.classic || opts.diagnostics_main.is_some()) {
@@ -238,6 +247,13 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
     // is already open, which adds a tab there.
     let open_mode = loaded.as_ref().map(|session| session.ui.open_mode)
         .unwrap_or(zsdesk_core::model::explorer::OpenMode::NewWindow);
+    // A login start leaves a window built but hidden. The next launch — the
+    // shortcut, Win+E or a folder open — reuses that window instead of adding
+    // another one, so nothing stays invisible behind the visible window.
+    if !opts.new_window && !opts.silent
+        && crate::instance::adopt_hidden(&config, requested.as_ref(), selection.as_deref())? {
+        return Ok(());
+    }
     let (instance, additional) = if opts.new_window {
         (None, true)
     } else if open_mode.single_tab() {
@@ -254,7 +270,7 @@ pub(crate) fn run_arguments(args:Vec<OsString>,in_host:bool)->Result<()> {
     let mut session = loaded.unwrap_or_else(storage::default_session);
     session.normalize();
     if let Some(location) = requested { activate(&mut session, location, fresh); }
-    window::run(session, config, selection, !opts.classic,opts.new_window||additional,opts.focus_search.then_some(opts.search_settings),opts.at)
+    window::run(session, config, selection, !opts.classic,opts.new_window||additional,opts.focus_search.then_some(opts.search_settings),opts.at,opts.silent)
 }
 
 fn activate(session: &mut ExplorerSession, target: ShellLocation, fresh: bool) {
@@ -298,6 +314,14 @@ mod tests {
         let options=parse(["--win-e"].map(OsString::from)).unwrap();
         assert!(options.win_e && options.target.is_none() && options.mode==Mode::Explorer);
         for args in [["--win-e","--background"],["--win-e","--integration-refresh"]] {assert!(parse(args.map(OsString::from)).is_err());}
+    }
+    #[test]
+    fn silent_start_only_pairs_with_a_plain_window_launch() {
+        let options=parse(["--silent"].map(OsString::from)).unwrap();
+        assert!(options.silent && options.mode==Mode::Explorer && options.target.is_none());
+        for args in [["--silent","--new-window"],["--silent","C:\\Windows"],["--silent","--win-e"],["--silent","--background"]] {
+            assert!(parse(args.map(OsString::from)).is_err(), "{args:?} must be refused");
+        }
     }
     #[test]
     fn reveal_replaces_the_only_tab_of_a_single_tab_window() {

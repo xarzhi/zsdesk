@@ -140,6 +140,15 @@ pub mod main_window_startup {
     fn command(profile: &Path, executable: &Path) -> Result<String> {
         let directory = profile.parent().context("缺少主窗口配置目录")?;
         anyhow::ensure!(executable.is_absolute() && directory.is_absolute(), "登录启动需要绝对程序路径和配置目录");
+        Ok(format!("{} --silent --profile-dir {}", quote_argument(&executable.to_string_lossy()),
+            quote_argument(&directory.to_string_lossy())))
+    }
+
+    /// The command older builds registered: it opened the window at login.
+    /// Recognising it lets a new build upgrade its own entry in place.
+    fn previous_command(profile: &Path, executable: &Path) -> Result<String> {
+        let directory = profile.parent().context("缺少主窗口配置目录")?;
+        anyhow::ensure!(executable.is_absolute() && directory.is_absolute(), "登录启动需要绝对程序路径和配置目录");
         Ok(format!("{} --profile-dir {}", quote_argument(&executable.to_string_lossy()),
             quote_argument(&directory.to_string_lossy())))
     }
@@ -151,16 +160,28 @@ pub mod main_window_startup {
     }
 
     pub fn set_enabled(profile: &Path, enabled: bool) -> Result<()> {
-        let expected = command(profile, &std::env::current_exe()?)?;
-        set_autostart(&value_name(profile), &expected, enabled)?;
+        let executable = std::env::current_exe()?;
+        let expected = command(profile, &executable)?;
+        let previous = previous_command(profile, &executable)?;
+        let name = value_name(profile);
+        // An entry written before the login start went silent is ours, only
+        // outdated: retire it first so it never wins over the new command.
+        let outdated = autostart_command(&name)?.as_deref()
+            .is_some_and(|current| !autostart_owned(current, &expected) && autostart_owned(current, &previous));
+        if outdated {
+            set_autostart(&name, &previous, false)?;
+            if !enabled { return Ok(()); }
+        }
+        set_autostart(&name, &expected, enabled)?;
         Ok(())
     }
 
     pub(super) fn uninstall_owned(profile: &Path, executable: &Path) -> Result<()> {
-        let expected = command(profile, executable)?;
         let name = value_name(profile);
-        if autostart_command(&name)?.as_deref().is_some_and(|current| autostart_owned(current, &expected)) {
-            set_autostart(&name, &expected, false)?;
+        for owned in [command(profile, executable)?, previous_command(profile, executable)?] {
+            if autostart_command(&name)?.as_deref().is_some_and(|current| autostart_owned(current, &owned)) {
+                set_autostart(&name, &owned, false)?;
+            }
         }
         Ok(())
     }
@@ -170,11 +191,14 @@ pub mod main_window_startup {
         use super::*;
 
         #[test]
-        fn login_command_binds_executable_and_profile_without_background_mode() {
+        fn login_command_binds_executable_and_profile_and_starts_silently() {
             let profile = Path::new(r"C:\Profiles\中文 Main\explorer-session.json");
             let executable = Path::new(r"C:\Program Files\ZSDesk\ZSDesk.exe");
             let own = command(profile, executable).unwrap();
-            assert_eq!(own, r#""C:\Program Files\ZSDesk\ZSDesk.exe" --profile-dir "C:\Profiles\中文 Main""#);
+            assert_eq!(own, r#""C:\Program Files\ZSDesk\ZSDesk.exe" --silent --profile-dir "C:\Profiles\中文 Main""#);
+            let previous = previous_command(profile, executable).unwrap();
+            assert_eq!(previous, r#""C:\Program Files\ZSDesk\ZSDesk.exe" --profile-dir "C:\Profiles\中文 Main""#);
+            assert!(!autostart_owned(&previous, &own));
             for other in [command(Path::new(r"C:\Profiles\Other\explorer-session.json"), executable).unwrap(),
                 command(profile, Path::new(r"C:\Other\ZSDesk.exe")).unwrap(), format!("{own} --background")] {
                 assert!(!autostart_owned(&other, &own));
