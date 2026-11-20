@@ -12,7 +12,7 @@ extern "C" {
     fn zs_menu_diagnostics(output: *mut MenuDiagnostics);
 }
 use windows::{
-    core::{implement, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, HRESULT},
+    core::{implement, w, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, HRESULT},
     Win32::{
         Foundation::{HWND, LPARAM, RECT, WPARAM, PROPERTYKEY},
         System::{
@@ -31,7 +31,7 @@ use windows::{
                 EP_Commands, EP_DetailsPane, EP_PreviewPane, EP_Ribbon,
                 EPS_DEFAULT_ON, EPS_DEFAULT_OFF, EPS_FORCE, EPS_DONTCARE,
             },
-            WindowsAndMessaging::PostMessageW,
+            WindowsAndMessaging::{FindWindowExW, GetParent, PostMessageW, ShowWindow, SW_HIDE, SW_SHOW},
         },
     },
 };
@@ -605,6 +605,46 @@ impl ExplorerBrowserHost {
         if let Ok(view) = unsafe { self.current_view() } {
             let _ = unsafe { view.UIActivate(windows::Win32::UI::Shell::SVUIA_ACTIVATE_FOCUS.0 as u32) };
         }
+    }
+    /// Hides or shows the Shell view. A self-drawn list keeps the view alive as
+    /// the selection model, but its pixels must not cover the painted rows.
+    ///
+    /// The view's own window is not enough: ExplorerBrowser puts a host window
+    /// (with its scroll bars and column header) between the owner and the view,
+    /// and the host keeps painting after the view is hidden. The outermost child
+    /// of the owner is hidden instead.
+    pub fn set_visible(&self, visible: bool) {
+        let command = if visible { SW_SHOW } else { SW_HIDE };
+        /* The host is what has to go: the view window alone leaves the host's
+           scroll bars and column header painted over the list. */
+        if let Ok(host) = unsafe { FindWindowExW(Some(HWND(self.owner as *mut _)), None, w!("ExplorerBrowserControl"), None) } {
+            let _ = unsafe { ShowWindow(host, command) };
+        }
+        let Ok(view) = (unsafe { self.current_view() }) else { return };
+        let Ok(window) = (unsafe { view.GetWindow() }) else { return };
+        let mut target = window;
+        for _ in 0..8 {
+            let Ok(parent) = (unsafe { GetParent(target) }) else { break };
+            if parent.0.is_null() || parent.0 as isize == self.owner { break; }
+            target = parent;
+        }
+        let _ = unsafe { ShowWindow(target, command) };
+    }
+    /// Display names of the selected items, in view order.
+    pub fn selected_names(&self) -> Vec<String> {
+        use windows::Win32::UI::Shell::{IShellItemArray, SIGDN_NORMALDISPLAY, SVGIO_SELECTION};
+        let Ok(view) = (unsafe { self.current_view() }) else { return Vec::new() };
+        let Ok(folder): windows::core::Result<IFolderView2> = view.cast() else { return Vec::new() };
+        let Ok(items): windows::core::Result<IShellItemArray> = (unsafe { folder.Items(SVGIO_SELECTION) }) else { return Vec::new() };
+        let count = unsafe { items.GetCount() }.unwrap_or(0);
+        let mut names = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let Ok(item) = (unsafe { items.GetItemAt(index) }) else { continue };
+            if let Ok(name) = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) } {
+                names.push(unsafe { super::take(name) });
+            }
+        }
+        names
     }
 }
 

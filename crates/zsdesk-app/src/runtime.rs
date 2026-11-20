@@ -152,7 +152,11 @@ pub(crate) fn trace(stage:&str){
     if let Some(path)=std::env::var_os("ZSDESK_RUNTIME_TRACE"){
         let path=PathBuf::from(path);if !path.is_absolute(){return;}
         if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(path){
-            use std::io::Write;let _=writeln!(file,"{} {} {stage}",std::process::id(),unsafe{windows::Win32::System::Threading::GetCurrentThreadId()});
+            use std::io::Write;
+            // Milliseconds since boot: one clock shared by every process of a
+            // launch, so a handoff between them can be timed from the log.
+            let ms=unsafe{windows::Win32::System::SystemInformation::GetTickCount64()};
+            let _=writeln!(file,"{ms} {} {} {stage}",std::process::id(),unsafe{windows::Win32::System::Threading::GetCurrentThreadId()});
         }
     }
 }

@@ -96,13 +96,25 @@ pub fn transparency_available() -> bool {
     enabled != 0
 }
 
-/// Uses supported DWM materials; unsupported or accessibility modes remain opaque.
+/// Whether this system can composite a Windows 11 material: 22H2 or newer with
+/// the transparency switch on. High contrast always wins over both.
+pub fn material_available() -> bool {
+    os_build() >= 22621 && !high_contrast() && transparency_available()
+}
+
+/// Uses supported DWM materials; unsupported or accessibility modes remain
+/// opaque. Returns whether the window now shows a system material, which is
+/// also when its client area may keep pixels transparent.
 pub fn set_backdrop(hwnd: HWND, style: zsdesk_core::model::explorer::BackdropStyle) -> bool {
     use zsdesk_core::model::explorer::BackdropStyle;
+    // DWMSBT_NONE / DWMSBT_MAINWINDOW (Mica) / DWMSBT_TRANSIENTWINDOW (Acrylic).
     if os_build() < 22621 || hwnd.0.is_null() { return false; }
-    let value = if !transparency_available() { 1i32 } else { match style {
-        BackdropStyle::Solid => 1, BackdropStyle::System | BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3,
-    }};
+    let wanted = match style {
+        BackdropStyle::Classic => 1,
+        BackdropStyle::System | BackdropStyle::Mica => 2,
+        BackdropStyle::Acrylic => 3,
+    };
+    let value = if material_available() { wanted } else { 1 };
     let mut current = 0i32;
     if unsafe { DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&mut current as *mut i32).cast(), 4) }.is_ok() && current == value {
         return value != 1;

@@ -102,6 +102,16 @@ impl Palette {
         palette
     }
 
+    /// A tint that sits on top of a material instead of hiding it: a little
+    /// black, never a white plate. Chrome fields use it so the wallpaper keeps
+    /// showing through their background; black is also what keeps white text
+    /// on a dark theme readable over a bright picture.
+    /// `alpha` is 0..=1.
+    pub fn veil(&self, alpha: f32) -> Color {
+        let value = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Color::rgba(0, 0, 0, value)
+    }
+
     /// Resolves a ZSUI semantic role.
     pub const fn role(&self, role: ColorRole) -> Color {
         match role {
@@ -214,6 +224,8 @@ pub mod glyph {
     pub const MORE: &str = ZsIcon::More.windows_fluent_glyph();
     pub const MENU: &str = "\u{E700}";
     pub const SETTINGS: &str = "\u{E713}";
+    /// Colour mode: opens light / dark / follow Windows.
+    pub const THEME: &str = "\u{E790}";
     pub const STAR: &str = "\u{E734}";
     pub const STAR_FILLED: &str = "\u{E735}";
     pub const DETAILS_VIEW: &str = "\u{E8FD}";

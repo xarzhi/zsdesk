@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod file_transfer;
+pub mod folder_items;
 mod events;
 mod explorer_browser;
 pub mod icons;

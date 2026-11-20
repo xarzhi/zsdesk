@@ -187,6 +187,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "navigation-auto-expand" => ui.navigation_auto_expand = Some(!ui.navigation_auto_expand.unwrap_or(false)),
         "navigation-expand-system" => ui.navigation_auto_expand = None,
         "interface-bookmarks" => ui.show_bookmarks = !ui.show_bookmarks,
+        "interface-custom-view" => ui.custom_view = !ui.custom_view,
         "tab-placement-top"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Top,
         "tab-placement-left"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Left,
         "tab-placement-right"=>ui.tab_placement=zsdesk_core::model::explorer::TabPlacement::Right,
@@ -255,9 +256,10 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice: 
 pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
     menu(vec![
         entry("亚克力", "appearance-acrylic", true, preferences.backdrop == BackdropStyle::Acrylic),
-        entry("Mica", "appearance-mica", true, preferences.backdrop == BackdropStyle::Mica),
-        entry("纯色浅色", "appearance-light", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Light),
-        entry("纯色深色", "appearance-dark", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Dark),
+        entry("云母", "appearance-mica", true, preferences.backdrop == BackdropStyle::Mica),
+        entry("经典", "appearance-classic", true, preferences.backdrop == BackdropStyle::Classic),
+        entry("纯色浅色", "appearance-light", true, preferences.backdrop == BackdropStyle::Classic && preferences.color_scheme == ColorScheme::Light),
+        entry("纯色深色", "appearance-dark", true, preferences.backdrop == BackdropStyle::Classic && preferences.color_scheme == ColorScheme::Dark),
         entry("跟随系统", "appearance-system", true, *preferences == AppearancePreferences::default()),
         MenuItemSpec::Separator,
         submenu("配色", vec![entry("系统", "appearance-color-system", true, preferences.color_scheme == ColorScheme::System),
@@ -266,12 +268,24 @@ pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
     ])
 }
 
+/// The colour mode switch behind the title-bar button. The three choices are
+/// exclusive, so the current one carries the check mark.
+pub fn theme_menu(preferences: &AppearancePreferences) -> MenuSpec {
+    menu(vec![
+        entry("跟随系统", "appearance-color-system", true, preferences.color_scheme == ColorScheme::System),
+        entry("浅色", "appearance-color-light", true, preferences.color_scheme == ColorScheme::Light),
+        entry("深色", "appearance-color-dark", true, preferences.color_scheme == ColorScheme::Dark),
+    ])
+}
+
 pub fn apply_appearance(preferences: &mut AppearancePreferences, choice: &str) -> bool {
     match choice {
         "appearance-acrylic" => preferences.backdrop = BackdropStyle::Acrylic,
         "appearance-mica" => preferences.backdrop = BackdropStyle::Mica,
-        "appearance-light" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Light; }
-        "appearance-dark" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Dark; }
+        // Older menus and profiles used `appearance-solid` for the same look.
+        "appearance-classic" | "appearance-solid" => preferences.backdrop = BackdropStyle::Classic,
+        "appearance-light" => { preferences.backdrop = BackdropStyle::Classic; preferences.color_scheme = ColorScheme::Light; }
+        "appearance-dark" => { preferences.backdrop = BackdropStyle::Classic; preferences.color_scheme = ColorScheme::Dark; }
         "appearance-system" => *preferences = AppearancePreferences::default(),
         "appearance-color-system" => preferences.color_scheme = ColorScheme::System,
         "appearance-color-light" => preferences.color_scheme = ColorScheme::Light,

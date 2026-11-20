@@ -7,6 +7,7 @@ mod commands;
 mod edition;
 mod storage;
 mod window;
+mod wallpaper;
 mod settings;
 mod instance;
 mod reveal;

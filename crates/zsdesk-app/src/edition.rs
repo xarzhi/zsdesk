@@ -5,7 +5,10 @@
 //! | 标准版 | （无） |
 //! | 网络版 | `network`：FTP、SFTP/SSH、SMB 地址与网络驱动器 |
 //! | 全量版 | `network`（默认） |
-//! | 主题版 | `network` + `themed`：可选的窗口材质与颜色模式 |
+//! | 主题版 | `network` + `themed`：独立的安装目录、启动标识和配置目录 |
+//!
+//! Window material, wallpaper and the colour mode belong to every edition.
+//! `themed` only decides which profile an installation uses.
 
 pub const NETWORK: bool = cfg!(feature = "network");
 pub const THEMED: bool = cfg!(feature = "themed");

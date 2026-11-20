@@ -25,6 +25,12 @@ pub fn item_pidl(item: &IShellItem) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Resolves a parsing name ("C:////dir", "shell:Downloads", "::{CLSID}") into an item.
+pub fn item_from_parsing_name(name: &str) -> Result<IShellItem> {
+    let text: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    unsafe { windows::Win32::UI::Shell::SHCreateItemFromParsingName(windows::core::PCWSTR(text.as_ptr()), None) }
+}
+
 pub fn item_from_pidl(pidl: &[u8]) -> Result<IShellItem> {
     unsafe { SHCreateItemFromIDList(pidl.as_ptr().cast()) }
 }

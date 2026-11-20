@@ -88,8 +88,8 @@ impl WindowState {
         let line = self.edit_line_height();
         let pad = self.s(8);
         let r = LayoutRect::new(rect.x + pad, rect.y + (rect.height - line) / 2, rect.width.max(self.s(140)) - pad * 2, line);
+        self.place_edit(self.rename_hwnd, r);
         unsafe {
-            move_control(self.rename_hwnd, r);
             SendMessageW(self.rename_hwnd, WM_SETFONT, Some(WPARAM(self.font.0 as usize)), Some(LPARAM(1)));
             if !SetWindowSubclass(self.rename_hwnd, Some(edit_proc), ID_BOOKMARK_RENAME, self.hwnd.0 as usize).as_bool() { self.cancel_rename(); return; }
             SendMessageW(self.rename_hwnd, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));

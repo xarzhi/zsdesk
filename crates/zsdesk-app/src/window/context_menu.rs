@@ -76,7 +76,11 @@ pub(super) fn poll(owner:HWND){
     if !current(owner,generation){return;}
     match result{
         None=>{ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});},
-        Some(Ok(MenuOutcome::Rename)) if valid=>{if let Ok(folder)=session.view.cast::<IFolderView2>(){let _=unsafe{folder.DoRename()};}},
+        Some(Ok(MenuOutcome::Rename)) if valid=>{
+            // A painted list owns the editor; the hidden Shell view would put it
+            // somewhere nobody can see.
+            post(owner,WM_ACTION,ACTION_VIEW_RENAME,0);
+        },
         Some(Ok(MenuOutcome::Open|MenuOutcome::Explore)) if valid=>{
             if !open_folder(owner,&session.pidls){
                 let mut point=POINT::default();let _=unsafe{GetCursorPos(&mut point)};

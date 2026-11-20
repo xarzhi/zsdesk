@@ -13,8 +13,8 @@ impl AppearancePolicy {
     pub fn new(style: BackdropStyle) -> Self { let result = Self(Arc::new(AtomicU8::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicIsize::new(0))); result.set(style); result }
     pub fn search_keys(&self, enabled: bool) { self.1.store(enabled, Ordering::Release); }
     pub fn foreground(&self) -> bool { let root = self.2.load(Ordering::Acquire); root != 0 && unsafe { GetForegroundWindow() }.0 as isize == root }
-    pub fn set(&self, style: BackdropStyle) { self.0.store(match style { BackdropStyle::System => 0, BackdropStyle::Solid => 1, BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3 }, Ordering::Release); }
-    fn style(&self) -> BackdropStyle { match self.0.load(Ordering::Acquire) { 1 => BackdropStyle::Solid, 2 => BackdropStyle::Mica, 3 => BackdropStyle::Acrylic, _ => BackdropStyle::System } }
+    pub fn set(&self, style: BackdropStyle) { self.0.store(match style { BackdropStyle::System => 0, BackdropStyle::Classic => 1, BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3 }, Ordering::Release); }
+    fn style(&self) -> BackdropStyle { match self.0.load(Ordering::Acquire) { 1 => BackdropStyle::Classic, 2 => BackdropStyle::Mica, 3 => BackdropStyle::Acrylic, _ => BackdropStyle::System } }
 }
 
 pub fn hooks(wake: UiInvalidationHandle, appearance: AppearancePolicy, search_keys: bool) -> WindowsWindowHooks {
@@ -44,7 +44,7 @@ impl NativeMessageFilter for UtilityFilter {
             let style = self.appearance.style();
             let mut current = 0i32;
             let _ = unsafe { DwmGetWindowAttribute(root, DWMWA_SYSTEMBACKDROP_TYPE, (&mut current as *mut i32).cast(), 4) };
-            let wanted = match style { BackdropStyle::Solid => 1, BackdropStyle::Acrylic => 3, _ => 2 };
+            let wanted = match style { BackdropStyle::Classic => 1, BackdropStyle::Acrylic => 3, _ => 2 };
             if current != wanted { zsdesk_windows::theme::set_backdrop(root, style); }
         }
         if !self.appearance.1.load(Ordering::Acquire) || message.message != WM_KEYDOWN || composing(window) { return false; }

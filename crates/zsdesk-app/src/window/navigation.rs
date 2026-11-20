@@ -231,6 +231,9 @@ impl WindowState {
             self.refresh_status();
             if completed_request{if let ShellLocation::Search{query,..}=&current{self.start_fast_search(query);}}
             self.relayout();self.position_children();
+            // The self-drawn list follows the shown folder, and the Shell view
+            // behind it has to stay hidden or its own rows paint over ours.
+            self.sync_file_view();
         }
         if let Some(request)=self.queued.take() {unsafe {self.request_navigation(request);}}
         else if let Some(request)=self.open_requests.pop_front(){unsafe {self.open_requested(request);}}

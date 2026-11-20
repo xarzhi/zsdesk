@@ -313,7 +313,7 @@ pub fn folder_for_path(path: &Path) -> Result<IShellFolder> {
 pub fn user_desktop() -> Option<PathBuf> { known_folder(&FOLDERID_Desktop) }
 pub fn public_desktop() -> Option<PathBuf> { known_folder(&FOLDERID_PublicDesktop) }
 
-fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
+pub(crate) fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()? };
     Some(PathBuf::from(unsafe { crate::shell::take(path) }))
 }

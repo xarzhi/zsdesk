@@ -301,9 +301,23 @@ pub enum SearchBackendPreference { Auto, NativeNtfs, DirectoryScan, #[default] E
 #[serde(rename_all = "snake_case")]
 pub enum ColorScheme { #[default] System, Light, Dark }
 
+/// Window background material.
+///
+/// `Classic` is painted entirely by ZSDesk and works everywhere. `Mica` and
+/// `Acrylic` are Windows 11 22H2+ DWM backdrops and fall back to `Classic`
+/// when the system cannot composite them.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum BackdropStyle { #[default] System, Solid, Mica, Acrylic }
+pub enum BackdropStyle {
+    /// Older profiles stored "system" for "whatever the system offers".
+    System,
+    /// Opaque, painted by ZSDesk.
+    #[serde(alias = "solid")]
+    Classic,
+    Mica,
+    #[default]
+    Acrylic,
+}
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all="snake_case")]
@@ -313,9 +327,46 @@ pub enum TabPlacement { #[default] Top, Left, Right }
 #[serde(rename_all = "snake_case")]
 pub enum PreviewProviderPreference { #[default] System, Office, Wps }
 
+/// Wallpaper drawn behind the whole window.
+///
+/// The picture is loaded once, scaled to cover the window, blurred and dimmed
+/// by the amounts below, then drawn at `opacity`. With a DWM material behind
+/// it the desktop still shows through the translucent parts.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct WallpaperPreferences {
+    /// Absolute path of the picture; `None` paints no wallpaper.
+    pub path: Option<PathBuf>,
+    /// 0..=100 — how much of the picture covers the material.
+    pub opacity: u8,
+    /// 0..=100 — blur radius relative to the window.
+    pub blur: u8,
+    /// 0..=100 — how far the picture is pushed towards black.
+    pub dim: u8,
+}
+
+impl Default for WallpaperPreferences {
+    fn default() -> Self { Self { path: None, opacity: 78, blur: 32, dim: 24 } }
+}
+
+impl WallpaperPreferences {
+    /// Clamps every value so a hand-edited profile cannot overflow the painter.
+    pub fn normalized(mut self) -> Self {
+        self.opacity = self.opacity.min(100);
+        self.blur = self.blur.min(100);
+        self.dim = self.dim.min(100);
+        self
+    }
+    pub fn visible(&self) -> bool { self.path.is_some() && self.opacity > 0 }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
-pub struct AppearancePreferences { pub color_scheme: ColorScheme, pub backdrop: BackdropStyle }
+pub struct AppearancePreferences {
+    pub color_scheme: ColorScheme,
+    pub backdrop: BackdropStyle,
+    pub wallpaper: WallpaperPreferences,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -360,6 +411,9 @@ pub struct ExplorerUi {
     /// reconciled with this switch on every launch.
     pub autostart: bool,
     pub appearance: AppearancePreferences,
+    /// Draws the file list instead of hosting the Shell view, so the material
+    /// and the wallpaper show through the whole window.
+    pub custom_view: bool,
     pub window: Option<WindowPlacement>,
 }
 
@@ -375,6 +429,7 @@ impl Default for ExplorerUi {
             navigation_auto_expand: None, open_mode: OpenMode::default(), tree_expanded: Vec::new(),
             autostart: true,
             appearance: AppearancePreferences::default(),
+            custom_view: true,
             window: None }
     }
 }

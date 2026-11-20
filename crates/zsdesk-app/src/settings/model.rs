@@ -34,6 +34,8 @@ pub enum Target {
     Section(usize),
     Row { group: usize, row: usize },
     Option { group: usize, row: usize, option: usize },
+    /// Drag handle of a 0..=100 slider.
+    Slider { group: usize, row: usize },
     Scrollbar,
 }
 
@@ -48,6 +50,8 @@ pub enum Control {
     Button { enabled: bool },
     /// Read-only text (version numbers).
     Value,
+    /// 0..=100 slider; dragging the row's control changes it.
+    Slider { value: u8 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +99,10 @@ impl Row {
     pub fn button_locked(id: &'static str, title: &str, detail: &str, label: &str, enabled: bool) -> Self {
         Self { control: Control::Button { enabled }, ..Self::button(id, title, detail, label) }
     }
+    pub fn slider(id: &'static str, title: &str, detail: &str, value: u8) -> Self {
+        Self { id, title: title.into(), detail: detail.into(), control: Control::Slider { value: value.min(100) },
+            options: Vec::new(), actions: vec![id], selected: 0, label: String::new() }
+    }
     pub fn value(id: &'static str, title: &str, value: &str) -> Self {
         Self { id, title: title.into(), detail: String::new(), control: Control::Value,
             options: Vec::new(), actions: Vec::new(), selected: 0, label: value.into() }
@@ -105,6 +113,7 @@ impl Row {
             (Control::Segments | Control::Select { .. }, Some(index)) => self.actions.get(index).copied(),
             (Control::Segments | Control::Select { .. }, None) => self.actions.get(self.selected).copied(),
             (Control::Value, _) => None,
+            (Control::Slider { .. }, _) => self.actions.first().copied(),
             (_, _) => self.actions.first().copied(),
         }
     }
@@ -126,12 +135,20 @@ pub struct Snapshot<'a> {
     pub ui: &'a ExplorerUi,
     /// 0 = 不接管, 1 = 右键菜单, 2 = 默认打开.
     pub integration: u8,
-    pub themed: bool,
     /// Id of the drop-down that is currently expanded, if any.
     pub open: Option<&'a str>,
 }
 
 fn group(title: Option<&'static str>, rows: Vec<Row>) -> Group { Group { title, rows } }
+
+/// Explains the three materials, or why two of them cannot show here.
+fn material_hint() -> &'static str {
+    if zsdesk_windows::theme::material_available() {
+        "亚克力在模糊上叠噪点，云母只透出桌面色调，经典完全由本程序绘制"
+    } else {
+        "当前系统不支持亚克力与云母（需 Windows 11 22H2 及以后并开启透明效果），按经典显示"
+    }
+}
 
 /// Builds every section for the current state.
 pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
@@ -148,21 +165,37 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
             Row::button("bookmark", "收藏当前文件夹", "把当前文件夹加入收藏栏（Ctrl+D）", "收藏"),
         ])] },
     ];
-    if snapshot.themed {
-        let appearance = &ui.appearance;
-        let scheme = match appearance.color_scheme { ColorScheme::System => 0, ColorScheme::Light => 1, ColorScheme::Dark => 2 };
-        let material = match appearance.backdrop {
-            BackdropStyle::Acrylic => 0, BackdropStyle::Mica => 1, BackdropStyle::Solid => 2, BackdropStyle::System => 1,
-        };
-        sections.push(Section { id: "appearance", title: "外观", icon: "\u{E790}", groups: vec![group(Some("主题"), vec![
-            Row::segments("appearance-scheme", "颜色模式", "跟随 Windows 设置，或固定为浅色／深色",
-                &["跟随系统", "浅色", "深色"], scheme,
-                &["appearance-color-system", "appearance-color-light", "appearance-color-dark"]),
-            Row::segments("appearance-material", "窗口材质", "亚克力与 Mica 需要 Windows 11 22H2 及以后版本",
-                &["亚克力", "Mica", "纯色"], material,
-                &["appearance-acrylic", "appearance-mica", "appearance-solid"]),
-        ])] });
-    }
+    // The colour mode, the material and the wallpaper belong to every edition:
+    // the colour mode is a saved preference, not a build-time choice.
+    let appearance = &ui.appearance;
+    let material = match appearance.backdrop {
+        BackdropStyle::Acrylic => 0, BackdropStyle::Classic => 2, _ => 1,
+    };
+    let mut theme_rows = Vec::new();
+    let scheme = match appearance.color_scheme { ColorScheme::System => 0, ColorScheme::Light => 1, ColorScheme::Dark => 2 };
+    theme_rows.push(Row::segments("appearance-scheme", "颜色模式", "跟随 Windows 设置，或固定为浅色／深色",
+        &["跟随系统", "浅色", "深色"], scheme,
+        &["appearance-color-system", "appearance-color-light", "appearance-color-dark"]));
+    theme_rows.push(Row::segments("appearance-material", "窗口材质", material_hint(),
+        &["亚克力", "云母", "经典"], material,
+        &["appearance-acrylic", "appearance-mica", "appearance-classic"]));
+    let wallpaper = appearance.wallpaper.clone().normalized();
+    let label = match &wallpaper.path {
+        Some(path) => path.file_name().map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        None => "未选择壁纸".to_string(),
+    };
+    sections.push(Section { id: "appearance", title: "外观", icon: "\u{E790}", groups: vec![
+        group(Some("材质"), theme_rows),
+        group(Some("壁纸"), vec![
+            Row::button("wallpaper-choose", "壁纸图片", &label, "选择…"),
+            Row::button("wallpaper-desktop", "使用当前桌面壁纸", "读取 Windows 正在使用的桌面图片", "使用"),
+            Row::slider("wallpaper-opacity", "不透明度", "壁纸覆盖材质的程度，0 等于只用材质", wallpaper.opacity),
+            Row::slider("wallpaper-blur", "模糊", "越大越接近磨砂玻璃", wallpaper.blur),
+            Row::slider("wallpaper-dim", "暗度", "压暗壁纸，让文字更清楚", wallpaper.dim),
+            Row::button("wallpaper-clear", "移除壁纸", "恢复只显示材质背景", "移除"),
+        ]),
+    ] });
     let expand = match ui.navigation_auto_expand { None => 0, Some(true) => 1, Some(false) => 2 };
     let provider = match ui.preview_provider {
         PreviewProviderPreference::System => 0, PreviewProviderPreference::Office => 1, PreviewProviderPreference::Wps => 2 };
@@ -174,6 +207,8 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
                 &["navigation-expand-system", "navigation-expand-always", "navigation-expand-never"]),
             Row::toggle("interface-bookmarks", "收藏栏", "在地址栏下方显示收藏的文件夹", ui.show_bookmarks),
             Row::toggle("command-bar-visible", "命令栏", "显示新建、剪切、复制等常用命令", ui.command_bar.visible),
+            Row::toggle("interface-custom-view", "自绘文件列表与导航树",
+                "由本程序绘制文件列表和左侧导航树，材质与壁纸可以铺满整窗；关闭后回退到系统控件", ui.custom_view),
         ]),
         group(Some("预览"), vec![
             Row::toggle("space-preview", "空格快速预览", "选中文件后按空格键预览内容", ui.space_preview),
@@ -271,6 +306,8 @@ pub struct RowBox {
     pub control: RectF,
     pub options: Vec<RectF>,
     pub label: Option<RectF>,
+    /// Sliders own the whole control box; every other row only reacts to a click.
+    pub slider: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -348,7 +385,7 @@ pub fn layout(width: i32, height: i32, dpi: u32, sections: &[Section], section: 
                 let row_h = s(row_height(row));
                 let rect = RectF::new(content_left, row_y, content_width, row_h);
                 let (control, options, label) = control_boxes(row, rect, s(ROW_PAD_X), measure, dpi);
-                rows.push(RowBox { rect, control, options, label });
+                rows.push(RowBox { rect, control, options, label, slider: matches!(row.control, Control::Slider { .. }) });
                 row_y += row_h;
             }
             let card = RectF::new(content_left, card_top, content_width, (row_y - card_top).max(1.0));
@@ -442,6 +479,11 @@ fn control_boxes(row: &Row, rect: RectF, pad: f32, measure: Measure<'_>, dpi: u3
             let w = (measure(&row.label, s(BUTTON_SIZE), 400) + s(34.0)).max(s(76.0));
             (RectF::new(right - w, rect.y + (rect.h - h) / 2.0, w, h), Vec::new(), None)
         }
+        Control::Slider { .. } => {
+            let h = s(26.0);
+            let w = (rect.w * 0.42).clamp(s(170.0), s(320.0));
+            (RectF::new(right - w, rect.y + (rect.h - h) / 2.0, w, h), Vec::new(), None)
+        }
         Control::Value => {
             let h = rect.h;
             let w = (measure(&row.label, s(12.0), 400) + s(8.0)).max(s(40.0)).min((rect.w * 0.5).max(s(40.0)));
@@ -474,6 +516,10 @@ impl Layout {
                 if let Some(option) = row.options.iter().position(|rect| rect.contains(x, local_y)) {
                     return Target::Option { group: group_index, row: row_index, option };
                 }
+                if row.slider
+                    && row.control.inset(-scale(4.0, self.dpi), -scale(6.0, self.dpi)).contains(x, local_y) {
+                    return Target::Slider { group: group_index, row: row_index };
+                }
                 if row.control.contains(x, local_y) || row.rect.contains(x, local_y) {
                     return Target::Row { group: group_index, row: row_index };
                 }
@@ -502,7 +548,7 @@ mod tests {
     }
     fn snapshot() -> ExplorerUi { ExplorerUi::default() }
     fn sections_for(ui: &ExplorerUi) -> Vec<Section> {
-        build(&Snapshot { ui, integration: 2, themed: true, open: None })
+        build(&Snapshot { ui, integration: 2, open: None })
     }
 
     #[test]
@@ -521,7 +567,9 @@ mod tests {
                             assert!(row.options.len() >= 2);
                             assert!(row.selected < row.options.len(), "{} selects a missing option", row.id);
                         }
-                        Control::Toggle { .. } | Control::Button { .. } => assert_eq!(row.actions.len(), 1, "{}", row.id),
+                        Control::Toggle { .. } | Control::Button { .. } | Control::Slider { .. } => {
+                            assert_eq!(row.actions.len(), 1, "{}", row.id)
+                        }
                     }
                 }
             }
@@ -529,22 +577,56 @@ mod tests {
     }
 
     #[test]
-    fn single_tab_build_has_no_tab_placement_rows_and_hides_unthemed_appearance() {
-        let mut theme_snapshot = Snapshot { ui: &ExplorerUi::default(), integration: 2, themed: false, open: None };
-        let plain = build(&theme_snapshot);
-        assert!(!plain.iter().any(|section| section.id == "appearance"));
-        theme_snapshot.themed = true;
-        let themed = build(&theme_snapshot);
-        assert!(themed.iter().any(|section| section.id == "appearance"));
-        assert!(!themed.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows)
+    fn the_appearance_group_offers_the_colour_mode_the_material_and_the_wallpaper() {
+        let sections = build(&Snapshot { ui: &ExplorerUi::default(), integration: 2, open: None });
+        let row = |id: &str| sections.iter().flat_map(|section| &section.groups)
+            .flat_map(|group| &group.rows).find(|row| row.id == id).cloned();
+        let material = row("appearance-material").expect("material in every edition");
+        assert_eq!(material.options, ["亚克力", "云母", "经典"]);
+        assert_eq!(material.action(Some(0)), Some("appearance-acrylic"));
+        assert_eq!(material.action(Some(1)), Some("appearance-mica"));
+        assert_eq!(material.action(Some(2)), Some("appearance-classic"));
+        assert_eq!(material.selected, 0, "亚克力 is the default material");
+        // The colour mode is a preference every build exposes, so the dialog
+        // never has to hide a row depending on how it was compiled.
+        let scheme = row("appearance-scheme").expect("colour mode in every edition");
+        assert_eq!(scheme.options, ["跟随系统", "浅色", "深色"]);
+        assert_eq!(scheme.action(Some(0)), Some("appearance-color-system"));
+        assert_eq!(scheme.action(Some(1)), Some("appearance-color-light"));
+        assert_eq!(scheme.action(Some(2)), Some("appearance-color-dark"));
+        assert_eq!(scheme.selected, 0, "跟随系统 is the default");
+        // The wallpaper is offered next to the material, with its three sliders.
+        for id in ["wallpaper-choose", "wallpaper-opacity", "wallpaper-blur", "wallpaper-dim", "wallpaper-clear"] {
+            assert!(row(id).is_some(), "{id} is missing");
+        }
+        assert!(!sections.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows)
             .any(|row| row.id.contains("tab-placement")), "single-tab windows have no tab bar to place");
+    }
+
+    #[test]
+    fn sliders_report_the_saved_wallpaper_values() {
+        let mut ui = ExplorerUi::default();
+        ui.appearance.wallpaper.opacity = 40;
+        ui.appearance.wallpaper.blur = 90;
+        ui.appearance.wallpaper.dim = 5;
+        let rows = build(&Snapshot { ui: &ui, integration: 2, open: None })
+            .into_iter().flat_map(|section| section.groups).flat_map(|group| group.rows).collect::<Vec<_>>();
+        let value = |id: &str| match rows.iter().find(|row| row.id == id).map(|row| row.control.clone()) {
+            Some(Control::Slider { value }) => value, other => panic!("{id} is not a slider: {other:?}"),
+        };
+        assert_eq!(value("wallpaper-opacity"), 40);
+        assert_eq!(value("wallpaper-blur"), 90);
+        assert_eq!(value("wallpaper-dim"), 5);
+        // A hand-edited profile cannot push the painter out of range.
+        let wild = zsdesk_core::model::explorer::WallpaperPreferences { path: None, opacity: 200, blur: 200, dim: 200 }.normalized();
+        assert_eq!((wild.opacity, wild.blur, wild.dim), (100, 100, 100));
     }
 
     #[test]
     fn open_mode_defaults_to_a_new_window_and_follows_the_preference() {
         let mut ui = ExplorerUi::default();
         let row = |ui: &ExplorerUi| {
-            build(&Snapshot { ui, integration: 2, themed: false, open: None })
+            build(&Snapshot { ui, integration: 2, open: None })
                 .into_iter().flat_map(|section| section.groups).flat_map(|group| group.rows)
                 .find(|row| row.id == "open-mode").expect("open mode row")
         };
@@ -561,9 +643,9 @@ mod tests {
     #[test]
     fn an_open_select_floats_its_option_list_and_captures_the_pointer() {
         let ui = ExplorerUi::default();
-        let sections = build(&Snapshot { ui: &ui, integration: 2, themed: false, open: Some("open-mode") });
+        let sections = build(&Snapshot { ui: &ui, integration: 2, open: Some("open-mode") });
         let index = sections.iter().position(|section| section.id == "general").unwrap();
-        let closed = layout(940, 660, 96, &build(&Snapshot { ui: &ui, integration: 2, themed: false, open: None }), index, 0.0, &measure);
+        let closed = layout(940, 660, 96, &build(&Snapshot { ui: &ui, integration: 2, open: None }), index, 0.0, &measure);
         assert!(closed.popup.is_none());
         let l = layout(940, 660, 96, &sections, index, 0.0, &measure);
         let popup = l.popup.as_ref().expect("open drop-down");
@@ -579,13 +661,13 @@ mod tests {
     #[test]
     fn integration_rows_lock_when_takeover_is_off() {
         let ui = ExplorerUi::default();
-        let off = build(&Snapshot { ui: &ui, integration: 0, themed: false, open: None });
+        let off = build(&Snapshot { ui: &ui, integration: 0, open: None });
         let rows: Vec<&Row> = off.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows).collect();
         let recycle = rows.iter().find(|row| row.id == "integration-recycle").expect("recycle row");
         assert!(matches!(recycle.control, Control::Toggle { enabled: false, .. }));
         let restore = rows.iter().find(|row| row.id == "integration-restore").expect("restore row");
         assert!(matches!(restore.control, Control::Button { enabled: false }));
-        let on = build(&Snapshot { ui: &ui, integration: 2, themed: false, open: None });
+        let on = build(&Snapshot { ui: &ui, integration: 2, open: None });
         let rows: Vec<&Row> = on.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows).collect();
         assert!(matches!(rows.iter().find(|row| row.id == "integration-recycle").unwrap().control, Control::Toggle { enabled: true, .. }));
     }
@@ -595,7 +677,9 @@ mod tests {
         let ui = snapshot();
         let sections = sections_for(&ui);
         let index = sections.iter().position(|section| section.id == "interface").unwrap();
-        let l = layout(940, 660, 96, &sections, index, 0.0, &measure);
+        // Tall enough that both cards fit without scrolling, so every control
+        // is inside the view rectangle the hit test clips against.
+        let l = layout(940, 1080, 96, &sections, index, 0.0, &measure);
         assert!(l.groups.len() == 2, "界面 keeps the layout and preview cards; search scope lives in 搜索");
         // Cards never overlap and stay inside the content column.
         for pair in l.groups.windows(2) { assert!(pair[0].rect.bottom() <= pair[1].rect.y); }

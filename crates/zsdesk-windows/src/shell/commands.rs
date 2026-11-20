@@ -7,7 +7,7 @@ use windows::{
         Foundation::{HWND, POINT, PROPERTYKEY},
         UI::Shell::{
             IFolderView2, IShellItem, IShellItem2, IShellItemArray, SORTCOLUMN, SORT_ASCENDING, SORT_DESCENDING, SVGIO_ALLVIEW,
-            SVGIO_SELECTION, SVSI_SELECT, SVSI_DESELECT, FWF_CHECKSELECT, FOLDERFLAGS, SHGetSetSettings, SHELLSTATEA,
+            SVGIO_SELECTION, SVSI_SELECT, SVSI_DESELECT, SVSI_DESELECTOTHERS, FWF_CHECKSELECT, FOLDERFLAGS, SHGetSetSettings, SHELLSTATEA,
             SSF_SHOWALLOBJECTS, SSF_SHOWEXTENSIONS, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH,
         },
     },
@@ -108,6 +108,12 @@ impl ExplorerBrowserHost {
         let count = unsafe { view.ItemCount(SVGIO_ALLVIEW) }.unwrap_or(0);
         let flag = if select { SVSI_SELECT.0 } else { SVSI_DESELECT.0 } as u32;
         for i in 0..count.min(100_000) { let _ = unsafe { view.SelectItem(i, flag) }; }
+    }
+
+    /// Drops every selection, leaving the view with no focused item.
+    pub fn clear_selection(&self) -> Result<()> {
+        let view = self.folder_view()?;
+        unsafe { view.SelectItem(-1, SVSI_DESELECTOTHERS.0 as u32) }
     }
 
     pub fn invert_selection(&self) -> Result<()> {

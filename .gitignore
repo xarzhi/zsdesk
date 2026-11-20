@@ -1,5 +1,6 @@
 # Build output
 /target/
+/build/
 *.json.tmp
 
 # Per-user state is never part of source or release payloads.
@@ -14,8 +15,9 @@
 /clients.ini
 /package.ini
 
-# Release binaries are produced by scripts/package.ps1; notes and manifests stay tracked.
+# Release binaries are produced by package.ps1 / scripts/package.ps1; notes and manifests stay tracked.
 /releases/**/*.exe
 /releases/**/*.dll
 /releases/**/*.zip
 /releases/**/*.lnk
+

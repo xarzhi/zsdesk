@@ -104,8 +104,13 @@ pub struct ChromeInput<'a> {
     /// Search is active; show the close action beside the fixed native edit.
     pub search_panel_open: bool,
     pub command_bar: &'a CommandBarPreferences,
-    /// Own status bar; the hosted Shell view normally draws the native one.
+    /// Own status bar: item count, selection and messages. A window always
+    /// shows one, so nothing moves when a message comes or goes.
     pub status_bar: bool,
+    /// The hosted view reports its mode, so the status bar offers the two
+    /// "details" / "large icons" buttons. A drawn list that is always a details
+    /// view leaves them out instead of showing buttons that change nothing.
+    pub view_toggles: bool,
     /// Measured chip widths in pixels (icon + text + padding).
     pub bookmark_widths: &'a [i32],
     /// The folder on screen is the Recycle Bin, so emptying it is on offer.
@@ -222,6 +227,8 @@ pub struct ChromeLayout {
     pub new_tab: Rect,
     pub tab_list: Rect,
     pub settings_button: Rect,
+    /// Colour mode switch, left of the gear: light, dark or follow Windows.
+    pub theme_button: Rect,
     pub nav_row: Rect,
     pub back: Rect,
     pub forward: Rect,
@@ -257,6 +264,7 @@ pub enum Hit {
     TabClose(usize),
     NewTab,
     TabList,
+    Theme,
     Settings,
     Back,
     Forward,
@@ -305,14 +313,20 @@ impl ChromeLayout {
         let right_edge = caption_left.max(0);
         if right_edge >= button {
             layout.settings_button = Rect::clamped(right_edge - button, button_y, button, button_h);
-            if !input.single_tab && layout.settings_button.x >= button + s(2) {
-                layout.tab_list = Rect::clamped(layout.settings_button.x - s(2) - button, button_y, button, button_h);
+            // The colour mode switch sits immediately left of the gear.
+            if layout.settings_button.x >= button + s(2) {
+                layout.theme_button = Rect::clamped(layout.settings_button.x - s(2) - button, button_y, button, button_h);
+            }
+            if !input.single_tab && layout.theme_button.x >= button + s(2) {
+                layout.tab_list = Rect::clamped(layout.theme_button.x - s(2) - button, button_y, button, button_h);
             }
         }
         if !input.single_tab {
             let drag_space = s(40);
             let tabs_left = content_left;
-            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x } else { layout.settings_button.x };
+            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x }
+                else if !layout.theme_button.is_empty() { layout.theme_button.x }
+                else { layout.settings_button.x };
             let tabs_right = (utility_left - drag_space - button - s(4)).max(tabs_left);
             let available = tabs_right - tabs_left;
             let count = input.tab_count.max(1) as i32;
@@ -334,11 +348,10 @@ impl ChromeLayout {
             // One folder per window still gets a tab: it is the handle that
             // drags the folder into another window. The strip to its right
             // keeps moving the window.
-            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x } else if !layout.settings_button.is_empty() {
-                layout.settings_button.x
-            } else {
-                width - s(8)
-            };
+            let utility_left = if !layout.tab_list.is_empty() { layout.tab_list.x }
+                else if !layout.theme_button.is_empty() { layout.theme_button.x }
+                else if !layout.settings_button.is_empty() { layout.settings_button.x }
+                else { width - s(8) };
             let tabs_right = (utility_left - button - s(4)).max(content_left);
             let available = tabs_right - content_left;
             let natural = (available / 2).clamp(s(TAB_MIN_W), s(TAB_MAX_W)).min(available.max(0));
@@ -454,8 +467,13 @@ impl ChromeLayout {
         let status_y = (height - status_h).max(layout.top);
         layout.status = Rect::clamped(0, status_y, width, height - status_y);
         let toggle = Rect::clamped(0, status_y + (status_h - s(22)) / 2, s(28), s(22));
-        layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
-        layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+        if input.view_toggles && !toggle.is_empty() {
+            layout.status_tiles = Rect { x: width - s(8) - toggle.width, ..toggle };
+            layout.status_details = Rect { x: layout.status_tiles.x - s(2) - toggle.width, ..toggle };
+        } else {
+            layout.status_tiles = Rect::default();
+            layout.status_details = Rect::default();
+        }
         let content_h = (status_y - layout.top).max(0);
         if input.show_tree && width > s(MIN_TREE_W) * 2 {
             let tree_w = input.tree_width.clamp(s(MIN_TREE_W), (width / 2).max(s(MIN_TREE_W)));
@@ -502,6 +520,7 @@ impl ChromeLayout {
             }
             if self.new_tab.contains(x, y) { return Hit::NewTab; }
             if self.tab_list.contains(x, y) { return Hit::TabList; }
+            if self.theme_button.contains(x, y) { return Hit::Theme; }
             if self.settings_button.contains(x, y) { return Hit::Settings; }
             return if self.strip.contains(x,y){Hit::Caption}else{Hit::None};
         }
@@ -603,7 +622,7 @@ mod tests {
     fn input(width: i32, tabs: usize, active: usize, dpi: u32) -> ChromeInput<'static> {
         ChromeInput { tab_placement:zsdesk_core::model::explorer::TabPlacement::Top, width, height: 800, dpi, caption_width: scale(138, dpi), caption_button: None,
             tab_count: tabs, active_tab: active, single_tab: false, show_tree: true, tree_width: scale(220, dpi), show_bookmarks: true,
-            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, bookmark_widths: &[], search_panel_open: false, recycle_bin: false }
+            command_bar: &DEFAULT_COMMAND_BAR, status_bar: true, view_toggles: true, bookmark_widths: &[], search_panel_open: false, recycle_bin: false }
     }
 
     #[test]
@@ -805,15 +824,18 @@ mod tests {
             let l = ChromeLayout::new(&ChromeInput { caption_button: Some(caption), ..input(1600, 2, 0, dpi) });
             assert_eq!(l.new_tab.y, l.tabs[0].rect.y);
             assert_eq!(l.new_tab.height, l.tabs[0].rect.height);
-            for rect in [l.tab_list, l.settings_button] {
+            for rect in [l.tab_list, l.theme_button, l.settings_button] {
                 assert_eq!(rect.y, caption.y);
                 assert_eq!(rect.height, caption.height);
                 assert_eq!(rect.y * 2 + rect.height, caption.y * 2 + caption.height);
                 assert!(rect.right() <= caption.x);
             }
             assert_eq!(l.settings_button.right(), caption.x, "the gear sits flush against the system buttons");
-            assert!(l.tab_list.right() < l.settings_button.x, "the tab list keeps its own slot");
+            assert!(l.theme_button.right() < l.settings_button.x, "the colour mode sits left of the gear");
+            assert!(l.tab_list.right() < l.theme_button.x, "the tab list keeps its own slot");
             assert_eq!(l.strip.height, caption.y * 2 + caption.height, "the bar ends where the button band is centred");
+            assert_eq!(l.hit(l.theme_button.x + 2, l.theme_button.y + 2), Hit::Theme);
+            assert_eq!(l.hit(l.settings_button.x + 2, l.settings_button.y + 2), Hit::Settings);
         }
     }
 

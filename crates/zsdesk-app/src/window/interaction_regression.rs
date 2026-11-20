@@ -185,7 +185,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     {let _borrow=slot.borrow_mut();unsafe{SendMessageW(hwnd,WM_SETTINGCHANGE,Some(WPARAM(SPI_SETHIGHCONTRAST.0 as usize)),Some(LPARAM(0)));}}
     unsafe{PostMessageW(Some(hwnd),WM_NULL,WPARAM(0),LPARAM(0))?;}pump(40);
     ensure!(rectangle(hwnd)?==normal,"theme notifications changed window geometry");
-    ensure!(native_caption(hwnd)==slot.borrow().as_ref().unwrap().mica,"theme notification left mismatched caption input/paint mode");
+    ensure!(native_caption(hwnd)==slot.borrow().as_ref().unwrap().material,"theme notification left mismatched caption input/paint mode");
     for (w,h) in [(900,600),(1240,820),(1080,720)]{
         unsafe{SetWindowPos(hwnd,None,140,120,w,h,SWP_NOACTIVATE|SWP_NOZORDER)?;SendMessageW(hwnd,WM_EXITSIZEMOVE,None,None);}pump(150);
         let state=slot.borrow();let state=state.as_ref().unwrap();let view=state.browser.as_ref().unwrap().view_window().context("view HWND")?;
@@ -249,16 +249,16 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
     key(hwnd,acc.0,VK_W,true,false)?;pump(200);ensure!(slot.borrow().as_ref().unwrap().session.tabs.len()==1,"Ctrl+W tab");
     key(hwnd,acc.0,VK_T,true,true)?;pump(200);ensure!(slot.borrow().as_ref().unwrap().session.tabs.len()==2,"Ctrl+Shift+T reopen");
     let mut materials=Vec::new();
-    if crate::edition::THEMED{
+    {
         use zsdesk_core::model::explorer::{BackdropStyle,ColorScheme};
-        for (backdrop,scheme) in [(BackdropStyle::Solid,ColorScheme::Light),(BackdropStyle::Solid,ColorScheme::Dark),(BackdropStyle::Mica,ColorScheme::System),(BackdropStyle::Acrylic,ColorScheme::System)]{
+        for (backdrop,scheme) in [(BackdropStyle::Classic,ColorScheme::Light),(BackdropStyle::Classic,ColorScheme::Dark),(BackdropStyle::Mica,ColorScheme::System),(BackdropStyle::Acrylic,ColorScheme::System)]{
             {let mut state=slot.borrow_mut();let state=state.as_mut().unwrap();state.session.ui.appearance.backdrop=backdrop;state.session.ui.appearance.color_scheme=scheme;state.apply_theme();state.theme_children();unsafe{state.resize();}}
             pump(80);let mut actual=0i32;
             let available=unsafe{windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(hwnd,windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,(&mut actual as*mut i32).cast(),4)}.is_ok();
             if available{
-                let expected=if !theme::transparency_available()||backdrop==BackdropStyle::Solid{1}else if backdrop==BackdropStyle::Acrylic{3}else{2};
+                let expected=if !theme::transparency_available()||backdrop==BackdropStyle::Classic{1}else if backdrop==BackdropStyle::Acrylic{3}else{2};
                 ensure!(actual==expected,"DWM did not apply requested material: {backdrop:?} {actual}");
-            }else{ensure!(!slot.borrow().as_ref().unwrap().mica,"unsupported system did not fall back to solid");}
+            }else{ensure!(!slot.borrow().as_ref().unwrap().material,"unsupported system did not fall back to solid");}
             materials.push(serde_json::json!({"backdrop":backdrop,"color":scheme,"dwm_supported":available,"dwm_value":actual}));
         }
     }

@@ -13,8 +13,11 @@ impl WindowState {
             ACTION_COMMIT_ADDRESS => unsafe { self.commit_address() },
             ACTION_CANCEL_ADDRESS => { self.end_address_edit(); self.focus_view(); }
             ACTION_END_ADDRESS_EDIT => if unsafe { GetFocus() } != self.address_edit { self.end_address_edit(); },
-            ACTION_COMMIT_RENAME => unsafe { self.commit_bookmark_rename() },
-            ACTION_CANCEL_RENAME => unsafe { self.cancel_rename() },
+            ACTION_COMMIT_RENAME => unsafe { if !self.commit_view_rename() { self.commit_bookmark_rename() } },
+            ACTION_CANCEL_RENAME => unsafe { if !self.cancel_view_rename() { self.cancel_rename() } },
+            ACTION_VIEW_RENAME => unsafe { if let Some(index) = self.file_view.focus() { self.begin_view_rename(index) } },
+            ACTION_VIEW_COMMIT => unsafe { self.commit_view_rename(); },
+            ACTION_VIEW_CANCEL => unsafe { self.cancel_view_rename(); },
             ACTION_SEARCH => unsafe { self.search() },
             ACTION_SEARCH_PAGE => unsafe { self.request_integrated_search(false) },
             ACTION_CLOSE_SEARCH => unsafe { self.close_integrated_search() },
@@ -24,7 +27,12 @@ impl WindowState {
         }
     }
 
-    pub(super) fn focus_view(&self) { if let Some(browser) = &self.browser { unsafe { browser.focus(); } } }
+    pub(super) fn focus_view(&self) {
+        // The Shell view is hidden while ZSDesk paints the list: focus belongs
+        // to the window itself, which then routes the keys.
+        if self.custom_view { let _ = unsafe { SetFocus(Some(self.hwnd)) }; return; }
+        if let Some(browser) = &self.browser { unsafe { browser.focus(); } }
+    }
 
     unsafe fn execute(&mut self, command: Command) {
         match command {
@@ -70,10 +78,14 @@ impl WindowState {
     }
 
     pub(super) fn shell_result(&mut self, result: Option<windows::core::Result<()>>) {
+        let ran = result.is_some();
         if let Some(Err(error)) = result {
             // ERROR_CANCELLED / no selection are not failures worth reporting.
             if ![0x800704C7u32, 0x80004005, 0x80070490].contains(&(error.code().0 as u32)) { self.show_message(format!("操作失败：{}", error.message())); }
         }
+        // A verb changed the folder (copy, delete, new folder…): re-read it so
+        // the painted rows match the Shell view again.
+        if ran { self.reload_file_view(); }
         self.refresh_status();
     }
 
@@ -98,7 +110,7 @@ impl WindowState {
         Some(match hit {
             Hit::None | Hit::Splitter => return None,
             Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab if self.layout.vertical_tabs=>self.layout.tab_panel,
-            Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::Settings => self.layout.strip,
+            Hit::Caption | Hit::Tab(_) | Hit::TabClose(_) | Hit::NewTab | Hit::TabList | Hit::Theme | Hit::Settings => self.layout.strip,
             Hit::Search if self.search_panel.open => self.layout.search,
             Hit::SearchPanel(_) => self.layout.search,
             Hit::Back | Hit::Forward | Hit::Up | Hit::Refresh | Hit::Address | Hit::Search => self.layout.nav_row,
@@ -116,6 +128,11 @@ impl WindowState {
             Hit::TabClose(i) => ("关闭标签页 (Ctrl+W)".into(), self.layout.tabs.iter().find(|t| t.index == i).map(|t| t.close).unwrap_or_default()),
             Hit::NewTab => ("新建标签页 (Ctrl+T)".into(), self.layout.new_tab),
             Hit::TabList => (format!("所有标签页（{} 个）", self.session.tabs.len()), self.layout.tab_list),
+            Hit::Theme => (format!("主题：{}", match self.session.ui.appearance.color_scheme {
+                zsdesk_core::model::explorer::ColorScheme::System => "跟随系统",
+                zsdesk_core::model::explorer::ColorScheme::Light => "浅色",
+                zsdesk_core::model::explorer::ColorScheme::Dark => "深色",
+            }), self.layout.theme_button),
             Hit::Settings => ("设置".into(), self.layout.settings_button),
             Hit::Back => ("后退 (Alt+左箭头)".into(), self.layout.back),
             Hit::Forward => ("前进 (Alt+右箭头)".into(), self.layout.forward),
@@ -166,6 +183,10 @@ impl WindowState {
             let mut track = TRACKMOUSEEVENT { cbSize: size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut track) }.is_ok();
         }
+        if self.drag_edit_selection(p) { return; }
+        // The scrollbar thumb follows the pointer even outside the pane, which
+        // is what makes a long list draggable at all.
+        if self.view_drag_bar(p) { return; }
         if let Some((start_x, start_w)) = self.splitter_drag {
             let width = (start_w + p.x - start_x).max(self.s(zsdesk_ui::chrome::MIN_TREE_W));
             let dip = (width as i64 * 96 / self.dpi as i64) as i32;
@@ -201,12 +222,43 @@ impl WindowState {
             self.tab_drag = Some(drag);
             return;
         }
+        self.tree_hover(p);
+        if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
+            self.set_hover(Hit::None, None);
+            return;
+        }
+        if self.view_hover(p) { self.set_hover(Hit::None, None); return; }
         let hit = self.layout.hit(p.x, p.y);
         let crumb = if hit == Hit::Address { self.crumb_at(p.x, p.y) } else { None };
         self.set_hover(hit, crumb);
     }
 
     pub(super) fn mouse_down(&mut self, p: POINT) {
+        // Self-drawn fields: the native control paints nothing, so the caret has
+        // to be placed here. A click on an unfocused search box still selects
+        // everything, the way the panel has always opened.
+        if let Some(edit) = self.visible_edit_at(p) {
+            if edit == self.search_edit && unsafe { GetFocus() } != edit {
+                unsafe { self.open_integrated_search() };
+                self.edit_drag = Some(edit.0 as isize);
+                return;
+            }
+            let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 };
+            if self.focus_edit_at(p, shift) { return; }
+        }
+        if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
+            self.end_address_edit();
+            self.tree_click(p);
+            return;
+        }
+        if self.custom_view && self.view_hit(p).is_some() {
+            // Clicking the list takes the focus off the address box first.
+            self.end_address_edit();
+            let _ = unsafe { SetFocus(Some(self.hwnd)) };
+            let (control, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
+            self.view_click(p, control, shift);
+            return;
+        }
         let hit = self.layout.hit(p.x, p.y);
         if hit != Hit::Address { self.end_address_edit(); }
         self.pressed = Some(hit);
@@ -229,6 +281,14 @@ impl WindowState {
     pub(super) fn mouse_up(&mut self, p: POINT) {
         let pressed = self.pressed.take();
         let had_capture = unsafe { GetCapture() } == self.hwnd;
+        if self.end_edit_drag() {
+            if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            return;
+        }
+        if self.end_view_drag_bar() {
+            if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            return;
+        }
         if self.splitter_drag.take().is_some() { if had_capture { let _ = unsafe { ReleaseCapture() }; } self.save(); self.invalidate(); return; }
         if let Some(drag) = self.tab_drag.take() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
@@ -252,6 +312,7 @@ impl WindowState {
             Hit::TabClose(i) => unsafe { self.close_tab(i) },
             Hit::NewTab => unsafe { self.new_tab(ShellLocation::ThisPc) },
             Hit::TabList => unsafe { self.tab_list_menu() },
+            Hit::Theme => self.theme_menu(),
             Hit::Settings => self.open_settings(),
             Hit::Back => unsafe { self.execute(Command::Back) },
             Hit::Forward => unsafe { self.execute(Command::Forward) },
@@ -391,6 +452,14 @@ impl WindowState {
     }
 
     pub(super) fn right_click(&mut self, p: POINT) {
+        if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
+            // The tree has no verbs of its own; leave the system menu closed.
+            return;
+        }
+        if self.custom_view && self.view_hit(p).is_some() {
+            unsafe { self.view_context_menu(p); }
+            return;
+        }
         match self.layout.hit(p.x, p.y) {
             Hit::Tab(i) | Hit::TabClose(i) => unsafe { self.tab_menu(i) },
             Hit::Bookmark(i) => unsafe { self.bookmark_menu(i) },
@@ -464,7 +533,14 @@ impl WindowState {
             CommandId::Cut => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "cut", false)); self.shell_result(r); }
             CommandId::Copy => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "copy", false)); self.shell_result(r); }
             CommandId::Paste => { let r = self.browser.as_ref().map(|b| b.invoke_background(hwnd, "paste")); self.shell_result(r); }
-            CommandId::Rename => { let r = self.browser.as_ref().map(|b| b.rename_selection()); self.shell_result(r); }
+            CommandId::Rename => {
+                if self.custom_view {
+                    if let Some(index) = self.file_view.focus() { unsafe { self.begin_view_rename(index); } }
+                } else {
+                    let r = self.browser.as_ref().map(|b| b.rename_selection());
+                    self.shell_result(r);
+                }
+            }
             CommandId::Share => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "Windows.ModernShare", false)); self.shell_result(r); }
             CommandId::Delete => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "delete", shift)); self.shell_result(r); }
             CommandId::Sort => unsafe {
@@ -750,6 +826,23 @@ impl WindowState {
         } else {
             self.show_message("回收站接管未生效：请在“设置 → 系统集成”中重新选择“默认打开文件夹、磁盘和此电脑”".into());
         }
+    }
+
+    /// Title-bar colour mode switch: light, dark or follow Windows.
+    fn theme_menu(&mut self) {
+        let spec = menus::theme_menu(&self.session.ui.appearance);
+        let Some(choice) = popup(self.hwnd, &spec, Some(self.layout.theme_button)) else { return };
+        if !menus::apply_appearance(&mut self.session.ui.appearance, &choice) { return; }
+        // Everything that reads the palette — panes, chrome, DWM frame, Shell
+        // controls — is redrawn from one place.
+        self.refresh_system_theme();
+        self.save();
+        let mode = match self.session.ui.appearance.color_scheme {
+            zsdesk_core::model::explorer::ColorScheme::System => "主题：跟随系统",
+            zsdesk_core::model::explorer::ColorScheme::Light => "主题：浅色",
+            zsdesk_core::model::explorer::ColorScheme::Dark => "主题：深色",
+        };
+        self.show_message(mode.into());
     }
 
     unsafe fn tab_list_menu(&mut self) {

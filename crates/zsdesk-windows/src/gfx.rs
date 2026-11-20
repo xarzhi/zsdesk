@@ -293,6 +293,63 @@ impl Gfx {
         let _ = unsafe { source.GetSize(&mut w, &mut h) };
         (w, h)
     }
+
+    /// Decodes a picture, scales it to cover `width`×`height`, blurs it and
+    /// pushes it towards black. The result is premultiplied BGRA, ready for
+    /// [`Gfx::upload`].
+    ///
+    /// Blurring happens on the CPU after a WIC downscale because the render
+    /// target is a plain `ID2D1DCRenderTarget`, which cannot host D2D effects.
+    ///
+    /// Returns the picture together with its mean luminance (0..=1, BT.709
+    /// weights). The caller uses it to decide how much of a readability scrim
+    /// the picture needs instead of always washing it out.
+    pub fn wallpaper(&self, path: &std::path::Path, width: i32, height: i32, blur: u8, dim: u8) -> Option<(IWICBitmapSource, f32)> {
+        use windows::Win32::Graphics::Imaging::{IWICBitmapScaler, WICBitmapInterpolationModeFant};
+        let (width, height) = (width.max(1), height.max(1));
+        let factory = self.imaging_factory()?;
+        let name = wide(&path.to_string_lossy());
+        let decoder = unsafe {
+            factory.CreateDecoderFromFilename(PCWSTR(name.as_ptr()), None,
+                windows::Win32::Foundation::GENERIC_READ, windows::Win32::Graphics::Imaging::WICDecodeMetadataCacheOnLoad)
+        }.ok()?;
+        let frame = unsafe { decoder.GetFrame(0) }.ok()?;
+        let source = self.convert(&frame.cast().ok()?)?;
+        let (sw, sh) = Self::wic_size(&source);
+        if sw == 0 || sh == 0 { return None; }
+        // Cover fit: the shorter axis is cropped, never letterboxed.
+        let factor = (width as f32 / sw as f32).max(height as f32 / sh as f32);
+        let (cover_w, cover_h) = ((sw as f32 * factor).ceil() as i32, (sh as f32 * factor).ceil() as i32);
+        let (cover_w, cover_h) = (cover_w.max(width), cover_h.max(height));
+        let scaler: IWICBitmapScaler = unsafe { factory.CreateBitmapScaler().ok()? };
+        unsafe { scaler.Initialize(&source, cover_w as u32, cover_h as u32, WICBitmapInterpolationModeFant).ok()? };
+        let scaled: IWICBitmapSource = unsafe {
+            factory.CreateBitmapFromSource(Some(&scaler.cast().ok()?), windows::Win32::Graphics::Imaging::WICBitmapCacheOnLoad)
+        }.ok()?.cast().ok()?;
+        let stride = (cover_w * 4) as u32;
+        let mut pixels = vec![0u8; stride as usize * cover_h as usize];
+        unsafe { scaled.CopyPixels(std::ptr::null(), stride, &mut pixels) }.ok()?;
+        let mut canvas = vec![0u8; width as usize * height as usize * 4];
+        let (left, top) = (((cover_w - width) / 2) as usize, ((cover_h - height) / 2) as usize);
+        let row_bytes = width as usize * 4;
+        for row in 0..height as usize {
+            let start = ((top + row) * cover_w as usize + left) * 4;
+            canvas[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(&pixels[start..start + row_bytes]);
+        }
+        let radius = blur_radius(blur, width, height);
+        if radius > 0 { box_blur(&mut canvas, width as usize, height as usize, radius); }
+        if dim > 0 { dim_pixels(&mut canvas, dim); }
+        // Mean luminance of what is actually drawn: the blur keeps it and the
+        // dim already applied has lowered it, both of which matter.
+        let mut total = 0.0f64;
+        for pixel in canvas.chunks_exact(4) {
+            total += 0.0722 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.2126 * f64::from(pixel[2]);
+        }
+        let mean = (total / (canvas.len() as f64 / 4.0) / 255.0) as f32;
+        let bitmap = unsafe { factory.CreateBitmapFromMemory(width as u32, height as u32, &GUID_WICPixelFormat32bppPBGRA,
+            stride_of(width), &canvas) }.ok()?;
+        Some((bitmap.cast().ok()?, mean))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +495,61 @@ pub fn system_ui_font(hwnd: Option<HWND>) -> (String, f32) {
 
 fn wide(text: &str) -> Vec<u16> { text.encode_utf16().chain(Some(0)).collect() }
 fn utf16(text: &str) -> Vec<u16> { text.encode_utf16().collect() }
+
+fn stride_of(width: i32) -> u32 { (width.max(1) * 4) as u32 }
+
+/// Blur radius in pixels for a 0..=100 setting: a sixth of the shorter side is
+/// already a heavily frosted picture.
+fn blur_radius(blur: u8, width: i32, height: i32) -> i32 {
+    let shortest = width.min(height).max(1) as f32;
+    ((blur.min(100) as f32 / 100.0) * shortest * 0.06).round() as i32
+}
+
+/// Three box passes approximate a Gaussian; premultiplied BGRA blurs correctly
+/// because colour and alpha are filtered together.
+fn box_blur(pixels: &mut [u8], width: usize, height: usize, radius: i32) {
+    if width == 0 || height == 0 || radius <= 0 { return; }
+    let radius = radius as usize;
+    let mut scratch = vec![0u8; pixels.len()];
+    for _ in 0..3 {
+        blur_axis(pixels, &mut scratch, width, height, radius, true);
+        blur_axis(&scratch, pixels, width, height, radius, false);
+    }
+}
+
+fn blur_axis(source: &[u8], target: &mut [u8], width: usize, height: usize, radius: usize, horizontal: bool) {
+    let (lines, length) = if horizontal { (height, width) } else { (width, height) };
+    if length == 0 || lines == 0 { return; }
+    for line in 0..lines {
+        let at = |index: usize| -> usize {
+            if horizontal { (line * width + index) * 4 } else { (index * width + line) * 4 }
+        };
+        let mut sums = [0u32; 4];
+        let window = radius * 2 + 1;
+        for offset in 0..window {
+            let index = offset.saturating_sub(radius).min(length - 1);
+            let base = at(index);
+            for channel in 0..4 { sums[channel] += source[base + channel] as u32; }
+        }
+        for index in 0..length {
+            let out = at(index);
+            for channel in 0..4 { target[out + channel] = (sums[channel] / window as u32) as u8; }
+            let leaving = at(index.saturating_sub(radius));
+            let entering_index = (index + radius + 1).min(length - 1);
+            let entering = at(entering_index);
+            for channel in 0..4 {
+                sums[channel] = sums[channel] + source[entering + channel] as u32 - source[leaving + channel] as u32;
+            }
+        }
+    }
+}
+
+fn dim_pixels(pixels: &mut [u8], dim: u8) {
+    let factor = 1.0 - (dim.min(100) as f32 / 100.0) * 0.85;
+    for pixel in pixels.chunks_exact_mut(4) {
+        for channel in 0..3 { pixel[channel] = (pixel[channel] as f32 * factor) as u8; }
+    }
+}
 
 #[cfg(test)]
 mod tests {

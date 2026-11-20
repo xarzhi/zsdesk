@@ -136,10 +136,8 @@ impl WindowState {
         let card = rect(layout.card);
         let outer = RectF::new(self.layout.nav_row.x as f32, self.layout.command_row.bottom() as f32,
             self.layout.nav_row.width as f32, (self.layout.top - self.layout.command_row.bottom()).max(0) as f32);
-        if crate::edition::THEMED && self.mica {
-            cv.clear_rect(outer);
-            cv.fill(outer, color(self.palette.layer).with_alpha(0.18));
-        } else { cv.fill(outer, color(self.palette.layer)); }
+        if self.material { cv.fill(outer, color(self.palette.veil(0.06))); }
+        else { cv.fill(outer, color(self.palette.layer)); }
         // Opaque body and input keep small text legible on every backdrop.
         cv.round(RectF::new(card.x, card.y + self.sf(2.0), card.w, card.h), radius,
             Color::rgba8(0, 0, 0, if self.dark { 32 } else { 12 }));

@@ -22,6 +22,11 @@ mod wps_preview;
 mod preview_handlers;
 mod hover_preview;
 mod paint;
+mod file_view;
+mod list_loader;
+mod custom_view;
+mod nav_tree;
+mod edits;
 mod global_search;
 mod search_panel;
 mod integrated_search;
@@ -46,7 +51,7 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, mem::size_of, path::PathB
 use anyhow::{Context, Result};
 use windows::{core::{PCWSTR, PWSTR}, Win32::{
     Foundation::{COLORREF, HWND, HINSTANCE, LPARAM, LRESULT, WPARAM, POINT, RECT},
-    Graphics::{Dwm::DwmDefWindowProc, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint,
+    Graphics::{Dwm::{DwmDefWindowProc, DwmSetWindowAttribute, DWMWA_CLOAK}, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint,
         InvalidateRect, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
         MonitorFromRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL}},
     System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_LINK, DROPEFFECT_NONE}},
@@ -66,6 +71,7 @@ use navigation::NavigationRequest;
 pub(super) const ID_ADDRESS: usize = 1001;
 pub(super) const ID_BOOKMARK_RENAME: usize = 1002;
 pub(super) const ID_SEARCH: usize = 1007;
+pub(super) const ID_VIEW_RENAME: usize = 1008;
 pub(super) const ACTION_SEARCH: usize = 2109;
 pub(super) const ACTION_COMMIT_ADDRESS: usize = 2101;
 pub(super) const ACTION_CANCEL_ADDRESS: usize = 2102;
@@ -73,6 +79,9 @@ pub(super) const ACTION_COMMIT_RENAME: usize = 2103;
 pub(super) const ACTION_CANCEL_RENAME: usize = 2104;
 pub(super) const ACTION_END_ADDRESS_EDIT: usize = 2110;
 pub(super) const ACTION_FOCUS_VIEW: usize = 2111;
+pub(super) const ACTION_VIEW_RENAME: usize = 2115;
+pub(super) const ACTION_VIEW_COMMIT: usize = 2116;
+pub(super) const ACTION_VIEW_CANCEL: usize = 2117;
 pub(super) const ACTION_SEARCH_SETTINGS:usize=2112;
 pub(super) const ACTION_SEARCH_PAGE:usize=2113;
 pub(super) const ACTION_CLOSE_SEARCH:usize=2114;
@@ -137,12 +146,10 @@ fn release_window_properties(hwnd:HWND){
 
 pub fn run(session: ExplorerSession, config_path: PathBuf, selection: Option<std::ffi::OsString>, modern: bool, secondary_window: bool,
     focus_search:Option<bool>, at: Option<(i32, i32)>, silent: bool) -> Result<()> {
-    crate::runtime::trace("window-ole-init");
     unsafe { OleInitialize(None).context("OleInitialize failed")?; }
     let result = unsafe { run_inner(session, config_path, selection, modern, secondary_window,focus_search,at,silent) };
     crate::runtime::trace("window-loop-return");
     unsafe { OleUninitialize(); }
-    crate::runtime::trace("window-ole-uninit-return");
     result
 }
 
@@ -152,6 +159,10 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     let instance = HINSTANCE(unsafe { GetModuleHandleW(None)? }.0);
     let class = wide("ZSDesk.Native.Explorer");
     let wc = WNDCLASSW {
+        // Without CS_DBLCLKS the window never receives WM_LBUTTONDBLCLK: the
+        // Shell view used to handle double clicks itself, the self-drawn list
+        // cannot, so the window has to ask the system for the message.
+        style: CS_DBLCLKS,
         lpfnWndProc: Some(window_proc), hInstance: instance,
         hIcon: unsafe { LoadIconW(Some(instance), PCWSTR(101usize as *const u16))? },
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW)? }, hbrBackground: HBRUSH::default(),
@@ -191,7 +202,22 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
     // A login start builds the window without showing it: the folder that
     // triggered Win+E or an Explorer takeover arrives as an open request, and
     // that path reveals the window through the activation protocol.
-    if !silent { let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }) }; }
+    if !silent {
+        // An extended frame leaves the client area to DWM, which fills it with
+        // the plain glass colour until the application paints — a full white
+        // rectangle on a light theme. Showing first and painting after is
+        // exactly that flash, so the window is shown *cloaked*: DWM keeps it
+        // off screen while the first frame is drawn into its real surface, and
+        // only then is the cloak lifted.
+        let cloak = 1i32;
+        unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak as *const i32 as *const _, 4) };
+        let _ = unsafe { ShowWindow(hwnd, if maximized { SW_SHOWMAXIMIZED } else { SW_SHOW }) };
+        // Visible now, so `WM_PAINT` is delivered for real; this runs it
+        // synchronously, before the cloak comes off.
+        let _ = unsafe { windows::Win32::Graphics::Gdi::UpdateWindow(hwnd) };
+        let cloak = 0i32;
+        unsafe { DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak as *const i32 as *const _, 4) };
+    }
     if let Some(settings)=focus_search{post(hwnd,WM_ACTION,if settings{ACTION_SEARCH_SETTINGS}else{Command::FocusSearch.id()as usize},0);}
     let mut msg = MSG::default();
     let mut quick_preview:Option<preview_process::PreviewProcess>=None;
@@ -242,6 +268,14 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         }
         let modifiers = keyboard::Modifiers { control: unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0,
             shift: unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0, alt: unsafe { GetKeyState(VK_MENU.0 as i32) } < 0 };
+        if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) && !editing {
+            // The self-drawn list handles its own arrows, page keys and Enter;
+            // everything else falls through to the Shell view.
+            let handled = slot.try_borrow_mut().ok().and_then(|mut slot| slot.as_mut()
+                .map(|state| if state.tree_focus { state.tree_key(msg.wParam.0 as u16, modifiers.shift) }
+                    else { state.view_key(msg.wParam.0 as u16, modifiers.shift, modifiers.control) })).unwrap_or(false);
+            if handled { continue; }
+        }
         if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             if let Some(action) = keyboard::resolve(msg.wParam.0 as u16, modifiers, true, editing) {
                 let view = slot.try_borrow().ok().and_then(|s| s.as_ref().and_then(|s| s.keyboard_view(&msg, true)));
@@ -389,7 +423,38 @@ struct WindowState {
     surface: Option<Surface>,
     palette: Palette,
     dark: bool,
-    mica: bool,
+    /// A DWM material is composited behind the window: pixels may be transparent.
+    material: bool,
+    wallpaper: crate::wallpaper::WallpaperLayer,
+    /// The list is painted by ZSDesk and the Shell view is only its model.
+    file_view: file_view::FileView,
+    /// The navigation tree is painted by ZSDesk as well, for the same reason.
+    nav_tree: nav_tree::NavTree,
+    /// Keyboard focus last landed on the tree instead of the file list.
+    tree_focus: bool,
+    custom_view: bool,
+    /// In-place rename editor over a painted row.
+    view_rename: HWND,
+    view_rename_index: Option<usize>,
+    /// Row of the previous click and when it happened: a second click inside
+    /// the double-click time opens it, even when the window never receives a
+    /// `WM_LBUTTONDBLCLK` (slow pointer, remote session, synthetic input).
+    last_click: Option<(usize, std::time::Instant)>,
+    /// EDIT whose selection is being dragged out with the pointer.
+    edit_drag: Option<isize>,
+    /// Horizontal scroll per self-drawn text field, keyed by window handle.
+    edit_scroll: HashMap<isize, f32>,
+    /// Caret blink phase and whether the blink timer is armed.
+    caret_on: bool,
+    caret_timer: bool,
+    /// Placeholder of the search box, drawn by hand instead of by the EDIT.
+    search_cue: String,
+    /// Text areas of the EDITs, kept so the drawn text does not depend on the
+    /// shrunk control rectangles.
+    search_area: LayoutRect,
+    address_area: LayoutRect,
+    view_rename_area: LayoutRect,
+    rename_area: LayoutRect,
     active: bool,
     /// Built by the login start: the window exists but was never shown, so the
     /// first folder that arrives takes it over instead of opening another one.
@@ -413,6 +478,8 @@ struct WindowState {
     app_icon: Option<paint::IconEntry>,
     view_status: ViewStatus,
     view_mode: (i32, i32),
+    /// Worker that enumerates the folder the drawn list shows.
+    list_loader: list_loader::ListLoader,
     bookmark_widths: Vec<i32>,
     drop_registration: Option<DropRegistration>,
     drop_zones: Rc<Cell<DropZones>>,
@@ -460,11 +527,15 @@ impl WindowState {
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
-            palette: Palette::light(), dark: false, mica: false, active: true, silent: false, layout: ChromeLayout::default(),
+            palette: Palette::light(), dark: false, material: false, wallpaper: crate::wallpaper::WallpaperLayer::default(),
+            file_view: file_view::FileView::default(), custom_view: false, view_rename: HWND::default(), view_rename_index: None, last_click: None,
+            edit_drag: None, edit_scroll: HashMap::new(), caret_on: true, caret_timer: false, search_cue: String::new(), search_area: LayoutRect::default(), address_area: LayoutRect::default(), view_rename_area: LayoutRect::default(), rename_area: LayoutRect::default(),
+            nav_tree: nav_tree::NavTree::default(), tree_focus: false,
+            active: true, silent: false, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, drag_ghost: None,
             splitter_drag: None,
-            icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),
+            icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(), list_loader: Default::default(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
             launch_selection, launch_selections:Vec::new(), reveal:None, open_requests: Default::default(), search_scope: None, search_result: None,
@@ -483,6 +554,7 @@ impl WindowState {
         let stage = |name: &str| if crate::runtime::tracing() { crate::runtime::trace(&format!("window-create {name} {}ms", started.elapsed().as_millis())) };
         self.hwnd = hwnd;
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        self.list_loader.attach(hwnd);
         listary::initialize(hwnd)?;
         stage("listary");
         context_menu::install();
@@ -611,7 +683,7 @@ impl WindowState {
             // strip to show, so the single-tab chrome is only for one folder.
             single_tab: self.session.ui.open_mode.single_tab() && self.session.tabs.len() <= 1,
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.open_mode.single_tab()||self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks, status_bar: !self.status.is_empty() || self.search_progress.is_some(), bookmark_widths: &self.bookmark_widths,
+            show_bookmarks: self.session.ui.show_bookmarks, status_bar: true, view_toggles: !self.custom_view, bookmark_widths: &self.bookmark_widths,
             recycle_bin: self.current_location().is_recycle_bin(),
         };
         let mut layout=ChromeLayout::new(&input);
@@ -626,28 +698,33 @@ impl WindowState {
         }
         self.layout_crumbs();
         self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel });
-        let frame_height=if crate::edition::THEMED && self.mica {self.layout.browser.y}else{self.layout.strip.height};
+        // A material covers the whole client area; the classic look only needs
+        // the frame over the caption strip for the real caption buttons.
+        let frame_height = if self.material { height } else { self.layout.strip.height };
         theme::extend_frame(self.hwnd, if self.fullscreen_restore.is_some() { 0 } else { frame_height });
     }
 
     fn position_children(&mut self) {
         if let Some(browser) = &self.browser { unsafe { browser.resize(win_rect(self.layout.browser)); } }
         if let Some(tree) = &self.tree {
-            let visible = self.session.ui.show_tree && !self.layout.tree.is_empty();
+            // With the self-drawn mode the tree is only a size placeholder: its
+            // pixels belong to `nav_tree`, and the native control must not paint
+            // over them.
+            let visible = self.session.ui.show_tree && !self.layout.tree.is_empty() && !self.session.ui.custom_view;
             if visible { unsafe { tree.resize(win_rect(self.layout.tree)); } }
             tree.set_visible(visible);
         }
         let line = self.edit_line_height();
         let field = self.layout.search;
         let pad = self.s(10);
-        unsafe { move_control(self.search_edit, LayoutRect::new(field.x + pad, field.y + (field.height - line) / 2, (field.width - pad - self.s(34)).max(0), line)); }
+        self.place_edit(self.search_edit, LayoutRect::new(field.x + pad, field.y + (field.height - line) / 2, (field.width - pad - self.s(34)).max(0), line));
         let address = self.layout.address;
-        unsafe { move_control(self.address_edit, LayoutRect::new(address.x + pad, address.y + (address.height - line) / 2, (address.width - pad * 2).max(0), line)); }
+        self.place_edit(self.address_edit, LayoutRect::new(address.x + pad, address.y + (address.height - line) / 2, (address.width - pad * 2).max(0), line));
         let _ = unsafe { ShowWindow(self.address_edit, if self.address_editing { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
         if let (Some(index), false) = (self.rename_index, self.rename_hwnd.0.is_null()) {
             if let Some(r) = self.layout.bookmarks.get(index) {
                 let pad = self.s(8);
-                unsafe { move_control(self.rename_hwnd, LayoutRect::new(r.x + pad, r.y + (r.height - line) / 2, r.width.max(self.s(140)) - pad * 2, line)); }
+                self.place_edit(self.rename_hwnd, LayoutRect::new(r.x + pad, r.y + (r.height - line) / 2, r.width.max(self.s(140)) - pad * 2, line));
             }
         }
         self.invalidate();
@@ -690,23 +767,30 @@ impl WindowState {
 
     /// Follows the system app mode for the chrome, DWM frame and Shell controls.
     fn apply_theme(&mut self) {
-        let prefs=if crate::edition::THEMED {self.session.ui.appearance.clone()}
-            else {zsdesk_core::model::explorer::AppearancePreferences::default()};
-        self.dark = theme::configure_color_scheme(prefs.color_scheme);
+        // The colour mode is a user preference, not an edition: every build can
+        // switch between light, dark and the Windows setting.
+        let prefs = &self.session.ui.appearance;
+        let scheme = prefs.color_scheme;
+        self.dark = theme::configure_color_scheme(scheme);
         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
         theme::set_dark_frame(self.hwnd, self.dark);
         theme::round_corners(self.hwnd, false);
         theme::round_corners(self.tooltip, true);
-        self.mica = theme::set_backdrop(self.hwnd, prefs.backdrop);
+        self.material = theme::set_backdrop(self.hwnd, prefs.backdrop);
         unsafe {
-            if self.mica { let _=SetPropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
+            if self.material { let _=SetPropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
             else { let _=RemovePropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption")); }
         }
         let (normal, focused, text) = (colorref(self.palette.input), colorref(self.palette.input_focused), colorref(self.palette.text));
         let _=replace_edit_colors(self.hwnd,normal,focused,text);
-        let cue = wide(&format!("搜索 {}", self.current_location().title()));
+        self.search_cue = format!("搜索 {}", self.current_location().title());
+        let cue = wide(&self.search_cue);
         unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); }
-        for edit in [self.address_edit, self.search_edit] { theme::theme_control(edit, self.dark); }
+        for control in [self.address_edit, self.search_edit, self.rename_hwnd, self.view_rename, self.tooltip] {
+            theme::theme_control(control, self.dark);
+        }
+        // The material decides whether the native fields may paint at all.
+        self.sync_edit_regions();
     }
 
     /// The settings dialog edits the saved preferences on its own; this pulls
@@ -741,6 +825,7 @@ impl WindowState {
         if old.open_mode != ui.open_mode && ui.open_mode.single_tab() {
             self.session.retain_active_tab();
         }
+        if old.custom_view != ui.custom_view { self.sync_file_view(); }
         self.crumbs_for = None;
         self.measure_bookmarks();
         self.relayout();
@@ -795,8 +880,17 @@ impl WindowState {
     }
 
     fn refresh_status(&mut self) {
-        let status = self.browser.as_ref().map(|b| b.status()).unwrap_or_default();
-        let mode = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
+        // The drawn list is the folder on screen: its count is known as soon as
+        // the listing lands, while the Shell view behind it lags a navigation
+        // by its own enumeration. The list is always a details view.
+        let (status, mode) = if self.custom_view {
+            (ViewStatus { items: self.file_view.items.len(), selected: self.file_view.selection.len(),
+                selected_bytes: self.file_view.selected_bytes() },
+             (4, self.view_mode.1))
+        } else {
+            (self.browser.as_ref().map(|b| b.status()).unwrap_or_default(),
+             self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0)))
+        };
         if status != self.view_status || mode != self.view_mode {
             let selection_changed = (status.selected > 0) != (self.view_status.selected > 0);
             self.view_status = status;
@@ -1252,8 +1346,14 @@ impl WindowState {
                 let dc = unsafe { BeginPaint(self.hwnd, &mut ps) };
                 self.paint();
                 if let Some(surface) = &self.surface {
+                    // The first paint happens while the window is still
+                    // cloaked; its update rectangle can come back empty, in
+                    // which case the whole surface is blitted.
                     let r = ps.rcPaint;
-                    let _ = unsafe { BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, Some(surface.dc), r.left, r.top, SRCCOPY) };
+                    let (x, y, w, h) = if r.right > r.left && r.bottom > r.top {
+                        (r.left, r.top, r.right - r.left, r.bottom - r.top)
+                    } else { (0, 0, surface.width, surface.height) };
+                    let _ = unsafe { BitBlt(dc, x, y, w, h, Some(surface.dc), x, y, SRCCOPY) };
                 }
                 let _ = unsafe { EndPaint(self.hwnd, &ps) };
             }
@@ -1273,6 +1373,7 @@ impl WindowState {
                 if activation == WA_ACTIVE {
                     let target = self.last_focus;
                     if self.owns_live_focus(target) { let _ = unsafe { SetFocus(Some(target)) }; }
+                    else if self.custom_view { let _ = unsafe { SetFocus(Some(self.hwnd)) }; }
                     else if let Some(b) = &self.browser { unsafe { b.focus(); } }
                 }
                 return Some(LRESULT(0));
@@ -1284,6 +1385,7 @@ impl WindowState {
             }
             WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => self.refresh_system_theme(),
             WM_TIMER => {
+                if wp.0 == edits::TIMER_CARET { self.tick_caret(); }
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
                 if wp.0 == TIMER_STATUS { self.refresh_status();self.poll_search_settings(); }
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
@@ -1304,25 +1406,66 @@ impl WindowState {
                 }
                 if wp.0 == TIMER_REVEAL { self.poll_reveal(); }
             }
+            WM_MOUSEWHEEL if self.custom_view || self.custom_tree() => {
+                // Wheel coordinates are screen pixels for this message.
+                let mut p = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
+                let _ = unsafe { ScreenToClient(self.hwnd, &mut p) };
+                let delta = ((wp.0 >> 16) as i16) as f32;
+                if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
+                    self.tree_scroll(-delta / 120.0 * self.nav_tree.row_height() * 3.0);
+                    return Some(LRESULT(0));
+                }
+                if self.view_wheel(p) {
+                    self.view_scroll(-delta / 120.0);
+                    return Some(LRESULT(0));
+                }
+                return None;
+            }
             WM_MOUSEMOVE => self.mouse_move(point(), wp.0),
             WM_MOUSELEAVE => {
                 self.tracking_mouse = false;
                 if self.tab_drag.is_none() && self.splitter_drag.is_none() { self.set_hover(Hit::None, None); }
+                if self.nav_tree.hover().is_some() {
+                    self.nav_tree.set_hover(None);
+                    self.invalidate_rect(self.layout.tree);
+                }
+                // The lane highlight and the row hover both follow the pointer,
+                // so leaving the window clears them even mid-drag.
+                if self.file_view.set_hover(None) | self.file_view.set_bar_hot(false) {
+                    self.invalidate_rect(self.layout.browser);
+                }
             }
             WM_LBUTTONDOWN => self.mouse_down(point()),
             WM_LBUTTONUP => self.mouse_up(point()),
-            WM_LBUTTONDBLCLK => self.mouse_down(point()),
+            WM_LBUTTONDBLCLK => {
+                let p = point();
+                if self.select_edit_at(p) {
+                    // Selecting the value of a self-drawn field; nothing else.
+                } else if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
+                    // Double-clicking a tree row folds it out, like Explorer.
+                    if let nav_tree::NavHit::Row(index) | nav_tree::NavHit::Chevron(index) = self.tree_hit(p) {
+                        self.nav_tree.toggle(index);
+                        self.invalidate_rect(self.layout.tree);
+                    }
+                } else if !unsafe { self.view_double_click(p) } { self.mouse_down(p); }
+            }
             WM_MBUTTONUP => self.middle_click(point()),
             WM_RBUTTONUP => self.right_click(point()),
             WM_CANCELMODE => {
                 self.cancel_tab_drag();
                 self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
+                self.end_edit_drag();
+                self.end_view_drag_bar();
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
                 self.set_hover(Hit::None, None); self.invalidate();
             }
             WM_CAPTURECHANGED => {
                 self.cancel_tab_drag();
-                self.tab_drag = None; self.splitter_drag = None; self.pressed = None; self.invalidate();
+                self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
+                self.end_edit_drag();
+                // A menu or another window taking the capture ends the thumb drag.
+                self.end_view_drag_bar();
+                self.invalidate();
             }
             WM_SETCURSOR => {
                 if (lp.0 & 0xFFFF) as u32 == HTCLIENT {
@@ -1348,12 +1491,23 @@ impl WindowState {
                 let code = (wp.0 >> 16) as u32;
                 if lp.0 != 0 {
                     // Notifications from native EDIT children.
+                    if code == EN_SETFOCUS {
+                        self.caret_on = true;
+                        unsafe { SetTimer(Some(self.hwnd), edits::TIMER_CARET, edits::CARET_INTERVAL, None); }
+                        self.invalidate();
+                    }
+                    if code == EN_KILLFOCUS {
+                        self.caret_on = false;
+                        let _ = unsafe { KillTimer(Some(self.hwnd), edits::TIMER_CARET) };
+                        self.invalidate();
+                    }
                     if (id == ID_ADDRESS || id == ID_SEARCH) && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
                         self.invalidate_rect(self.layout.nav_row);
                         if id==ID_SEARCH && code==EN_SETFOCUS && !self.search_panel.open { post(self.hwnd,WM_ACTION,Command::FocusSearch.id() as usize,0); }
                         if id == ID_ADDRESS && code == EN_KILLFOCUS { post(self.hwnd, WM_ACTION, ACTION_END_ADDRESS_EDIT, 0); }
                     }
                     if id == ID_BOOKMARK_RENAME && code == EN_KILLFOCUS { post(self.hwnd, WM_ACTION, ACTION_COMMIT_RENAME, 0); }
+                    if id == ID_VIEW_RENAME && code == EN_KILLFOCUS { post(self.hwnd, WM_ACTION, ACTION_VIEW_COMMIT, 0); }
                     // Search as you type, after a short pause (like Windows 11).
                     if id == ID_SEARCH && code == EN_CHANGE && unsafe { GetFocus() } == self.search_edit {
                         unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 250, None); }
@@ -1367,7 +1521,11 @@ impl WindowState {
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_NAVIGATION_FAILED => unsafe { self.navigation_failed() },
-            WM_SHELL_SELECTION_CHANGED => { unsafe { acknowledge_selection_changed(lp.0); } self.refresh_status(); }
+            WM_SHELL_SELECTION_CHANGED => {
+                unsafe { acknowledge_selection_changed(lp.0); }
+                self.adopt_shell_selection();
+                self.refresh_status();
+            }
             WM_TREE_NAVIGATE => if lp.0 != 0 {
                 let location = unsafe { *Box::from_raw(lp.0 as *mut ShellLocation) };
                 if wp.0 != 0 { unsafe { self.new_tab(location); } } else { unsafe { self.navigate_from_tree(location); } }
@@ -1389,6 +1547,7 @@ impl WindowState {
                 unsafe { SetTimer(Some(self.hwnd), TIMER_TREE_STATE, 500, None); }
             }
             WM_FAST_SEARCH => self.poll_fast_search(),
+            list_loader::WM_VIEW_LISTED => self.apply_listed_folders(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
             message if message>=0xC000&&message==zsdesk_windows::shell::file_transfer::result_message()=>{
@@ -1408,7 +1567,10 @@ impl WindowState {
                     return Some(LRESULT(1));
                 }
             }
-            WM_DESTROY => { crate::runtime::trace("window-destroy");unsafe { self.destroy(); PostQuitMessage(0); }crate::runtime::trace("window-quit-posted"); }
+            WM_DESTROY => {
+                if !self.view_rename.0.is_null() { let _ = unsafe { DestroyWindow(self.view_rename) }; }
+                unsafe { self.destroy(); PostQuitMessage(0); }
+            }
             _ => return None,
         }
         Some(LRESULT(0))

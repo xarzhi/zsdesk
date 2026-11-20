@@ -27,7 +27,7 @@ use windows::Win32::{
         WindowsAndMessaging::*,
     },
 };
-use zsdesk_core::model::explorer::{BackdropStyle, ContextMenuPreferences, ExplorerUi, OpenMode};
+use zsdesk_core::model::explorer::{ContextMenuPreferences, ExplorerUi, OpenMode};
 use zsdesk_ui::{menus, theme::{Mode, Palette}};
 use zsdesk_windows::gfx::{Gfx, Surface, TextStyle};
 
@@ -124,6 +124,11 @@ struct Dialog {
     tracking: bool,
     dark: bool,
     active: bool,
+    /// The dialog itself shows a DWM material behind its translucent fill.
+    material: bool,
+    wallpaper: crate::wallpaper::WallpaperLayer,
+    /// Slider row being dragged with the pointer.
+    slider: Option<(usize, usize)>,
     dpi: u32,
     gfx: Option<Gfx>,
     surface: Option<Surface>,
@@ -132,17 +137,14 @@ struct Dialog {
 
 impl Dialog {
     fn new(parent: HWND, config_path: &Path) -> anyhow::Result<Self> {
-        let mut ui = crate::storage::load(config_path).map(|session| session.ui).unwrap_or_default();
-        if !crate::edition::THEMED {
-            // Only the themed edition honours the material preferences.
-            ui.appearance = Default::default();
-        }
+        let ui = crate::storage::load(config_path).map(|session| session.ui).unwrap_or_default();
         let mut dialog = Self {
             hwnd: HWND::default(), parent, config_path: config_path.to_path_buf(), ui,
             sections: Vec::new(), section: 0, scroll: 0.0,
             layout: model::layout(1, 1, 96, &[], 0, 0.0, &|_, _, _| 0.0),
             hover: Target::None, pressed: Target::None, open_select: None, drag: None, tracking: false,
-            dark: false, active: true, dpi: 96, gfx: None, surface: None, message: None,
+            dark: false, active: true, material: false, wallpaper: crate::wallpaper::WallpaperLayer::default(),
+            slider: None, dpi: 96, gfx: None, surface: None, message: None,
         };
         dialog.rebuild();
         Ok(dialog)
@@ -158,7 +160,7 @@ impl Dialog {
 
     fn rebuild(&mut self) {
         let integration = integration_level();
-        self.sections = model::build(&model::Snapshot { ui: &self.ui, integration, themed: crate::edition::THEMED,
+        self.sections = model::build(&model::Snapshot { ui: &self.ui, integration,
             open: self.open_select });
         self.section = self.section.min(self.sections.len().saturating_sub(1));
         // A section may have lost or gained rows; keep the scroll offset valid.
@@ -168,11 +170,17 @@ impl Dialog {
     fn apply_frame(&mut self) {
         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(self.hwnd));
         if self.gfx.is_none() { self.gfx = Gfx::new(&family).ok(); }
-        let appearance = if crate::edition::THEMED { self.ui.appearance.clone() } else { Default::default() };
-        self.dark = zsdesk_windows::theme::configure_color_scheme(appearance.color_scheme);
+        let appearance = &self.ui.appearance;
+        let scheme = appearance.color_scheme;
+        self.dark = zsdesk_windows::theme::configure_color_scheme(scheme);
         zsdesk_windows::theme::set_dark_frame(self.hwnd, self.dark);
         zsdesk_windows::theme::round_corners(self.hwnd, false);
-        zsdesk_windows::theme::set_backdrop(self.hwnd, appearance.backdrop);
+        // The dialog previews the material itself: the DWM frame covers the
+        // whole client area so it shows through the translucent fill.
+        self.material = zsdesk_windows::theme::set_backdrop(self.hwnd, appearance.backdrop);
+        let (_, height) = self.client_size();
+        zsdesk_windows::theme::extend_frame(self.hwnd, if self.material { height } else { 0 });
+        self.wallpaper.invalidate();
     }
 
     fn palette(&self) -> Palette { Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light }) }
@@ -197,6 +205,8 @@ impl Dialog {
         let (width, height) = self.client_size();
         let Some(gfx) = self.gfx.as_ref() else { return };
         if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
+        let prefs = self.ui.appearance.wallpaper.clone().normalized();
+        let layer = self.wallpaper.prepare(gfx, width, height, &prefs);
         let measure = |text: &str, size: f32, weight: u16| gfx.measure(text, &TextStyle::ui(size).weight(weight), 4096.0).0;
         self.layout = model::layout(width, height, self.dpi, &self.sections, self.section, self.scroll, &measure);
         self.scroll = self.layout.scroll;
@@ -206,6 +216,7 @@ impl Dialog {
             paint::Paint {
                 canvas, layout: &self.layout, sections: &self.sections, section: self.section,
                 palette, dark: self.dark, active: self.active, hover: self.hover, scroll: self.scroll,
+                material: self.material, wallpaper: layer.as_ref(),
                 message: self.message.as_deref(),
             }.draw();
         });
@@ -249,9 +260,29 @@ impl Dialog {
             "navigation-expand-never" => { self.ui.navigation_auto_expand = Some(false); return self.commit(); }
             "open-mode-window" => { self.ui.open_mode = OpenMode::NewWindow; self.open_select = None; return self.commit(); }
             "open-mode-tab" => { self.ui.open_mode = OpenMode::NewTab; self.open_select = None; return self.commit(); }
-            "appearance-solid" => { self.ui.appearance.backdrop = BackdropStyle::Solid; self.apply_frame(); return self.commit(); }
             "context-menu-defaults" => {
                 self.ui.context_menu = ContextMenuPreferences::default();
+                return self.commit();
+            }
+            _ => {}
+        }
+        match action {
+            "wallpaper-choose" => {
+                return match choose_wallpaper(self.hwnd) {
+                    Ok(Some(path)) => { self.ui.appearance.wallpaper.path = Some(path); self.apply_frame(); self.commit(); }
+                    Ok(None) => {}
+                    Err(error) => { self.message = Some(format!("壁纸未更改：{error}")); self.invalidate(); }
+                };
+            }
+            "wallpaper-desktop" => {
+                return match desktop_wallpaper() {
+                    Some(path) => { self.ui.appearance.wallpaper.path = Some(path); self.apply_frame(); self.commit(); }
+                    None => { self.message = Some("没有找到 Windows 正在使用的桌面壁纸".into()); self.invalidate(); }
+                };
+            }
+            "wallpaper-clear" => {
+                self.ui.appearance.wallpaper.path = None;
+                self.apply_frame();
                 return self.commit();
             }
             _ => {}
@@ -268,6 +299,35 @@ impl Dialog {
         let mut ui = self.ui.clone();
         if menus::apply_interface_setting(&mut ui, action) { self.ui = ui; return self.commit(); }
         self.delegate(action);
+    }
+
+    /// Value a pointer position inside a slider row maps to.
+    fn slider_value(&self, group: usize, row: usize, x: f32) -> Option<(&'static str, u8)> {
+        let entry = self.row(group, row)?;
+        let rect = self.layout.groups.get(group)?.rows.get(row)?.control;
+        let value_width = model::scale(38.0, self.dpi);
+        let track_x = rect.x + value_width + model::scale(10.0, self.dpi);
+        let track_w = (rect.right() - track_x).max(1.0);
+        let fraction = ((x - track_x) / track_w).clamp(0.0, 1.0);
+        Some((entry.id, (fraction * 100.0).round() as u8))
+    }
+
+    /// Applies a slider value to the preferences without saving every pixel of
+    /// the drag; `commit` persists it once the pointer is released.
+    fn drag_slider(&mut self, group: usize, row: usize, x: f32) {
+        let Some((id, value)) = self.slider_value(group, row, x) else { return };
+        let wallpaper = &mut self.ui.appearance.wallpaper;
+        match id {
+            "wallpaper-opacity" => wallpaper.opacity = value,
+            "wallpaper-blur" => wallpaper.blur = value,
+            "wallpaper-dim" => wallpaper.dim = value,
+            _ => return,
+        }
+        self.rebuild();
+        self.layout();
+        self.invalidate();
+        // The file-manager window repaints with the new value immediately.
+        unsafe { PostMessageW(Some(self.parent), WM_SETTINGS_CHANGED, WPARAM(0), LPARAM(0)).ok(); }
     }
 
     fn choose(&mut self, target: Target) {
@@ -304,7 +364,7 @@ impl Dialog {
                     model::Control::Toggle { enabled: false, .. } => true,
                     model::Control::Button { enabled: false } => true,
                     model::Control::Select { enabled: false, .. } => true,
-                    model::Control::Value => true,
+                    model::Control::Value | model::Control::Slider { .. } => true,
                     _ => false,
                 };
                 if locked { return; }
@@ -327,7 +387,8 @@ impl Dialog {
                 self.layout();
                 self.invalidate();
             }
-            Target::None => {}
+            // Sliders are driven by the pointer capture, not by a click.
+            Target::Slider { .. } | Target::None => {}
         }
     }
 
@@ -388,6 +449,10 @@ impl Dialog {
                     self.tracking = unsafe { TrackMouseEvent(&mut track) }.is_ok();
                 }
                 let point = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
+                if let Some((group, row)) = self.slider {
+                    self.drag_slider(group, row, point.x as f32);
+                    return Some(LRESULT(0));
+                }
                 let target = self.layout.hit(point.x as f32, point.y as f32);
                 self.set_hover(target);
             }
@@ -405,16 +470,22 @@ impl Dialog {
                 }
                 self.pressed = self.layout.hit(point.x as f32, point.y as f32);
                 let _ = unsafe { SetCapture(self.hwnd) };
+                if let Target::Slider { group, row } = self.pressed {
+                    self.slider = Some((group, row));
+                    self.drag_slider(group, row, point.x as f32);
+                    return Some(LRESULT(0));
+                }
             }
             WM_LBUTTONUP => {
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
+                if self.slider.take().is_some() { self.commit(); return Some(LRESULT(0)); }
                 if self.drag.take().is_some() { return Some(LRESULT(0)); }
                 let pressed = std::mem::replace(&mut self.pressed, Target::None);
                 let point = POINT { x: x_lparam(lp.0), y: y_lparam(lp.0) };
                 let target = self.layout.hit(point.x as f32, point.y as f32);
                 if pressed == target && target != Target::None { self.choose(target); }
             }
-            WM_CAPTURECHANGED => { self.pressed = Target::None; self.drag = None; }
+            WM_CAPTURECHANGED => { self.pressed = Target::None; self.drag = None; self.slider = None; }
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) as i16) as f32;
                 self.scroll_by(-delta / 120.0 * model::scale(64.0, self.dpi));
@@ -482,6 +553,48 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     if handled { result } else { unsafe { DefWindowProcW(hwnd, msg, wp, lp) } }
 }
 
+/// Asks for a picture to use as the wallpaper.
+fn choose_wallpaper(owner: HWND) -> anyhow::Result<Option<PathBuf>> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{Common::COMDLG_FILTERSPEC, FileOpenDialog, IFileOpenDialog,
+        FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, SIGDN_FILESYSPATH};
+    let dialog: IFileOpenDialog = unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)? };
+    unsafe {
+        dialog.SetTitle(windows::core::w!("选择壁纸"))?;
+        dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+            pszName: windows::core::w!("图片"),
+            pszSpec: windows::core::w!("*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp;*.tif;*.tiff"),
+        }])?;
+        dialog.SetOptions(dialog.GetOptions()? | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST)?;
+    }
+    if let Err(error) = unsafe { dialog.Show(Some(owner)) } {
+        // The user closing the picker is not an error worth reporting.
+        if error.code().0 as u32 == 0x800704c7 { return Ok(None); }
+        return Err(error.into());
+    }
+    let item = unsafe { dialog.GetResult()? };
+    let value = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH)? };
+    let path = unsafe { value.to_string() }.map(PathBuf::from);
+    unsafe { CoTaskMemFree(Some(value.0.cast())); }
+    Ok(Some(path?))
+}
+
+/// The picture Windows itself is showing on the desktop.
+fn desktop_wallpaper() -> Option<PathBuf> {
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    let mut buffer = [0u16; 1024];
+    let mut size = (buffer.len() * 2) as u32;
+    let ok = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, windows::core::w!("Control Panel\\Desktop"), windows::core::w!("WallPaper"),
+            RRF_RT_REG_SZ, None, Some(buffer.as_mut_ptr().cast()), Some(&mut size))
+    };
+    if ok.is_err() { return None; }
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(0);
+    if end == 0 { return None; }
+    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..end]));
+    path.exists().then_some(path)
+}
+
 fn x_lparam(value: isize) -> i32 { (value as i16) as i32 }
 fn y_lparam(value: isize) -> i32 { ((value >> 16) as i16) as i32 }
 /// Row coordinates behind a target, when the target is a row.
@@ -502,7 +615,7 @@ mod tests {
     #[test]
     fn every_section_action_is_understood() {
         let ui = ExplorerUi::default();
-        let sections = model::build(&model::Snapshot { ui: &ui, integration: 2, themed: true, open: None });
+        let sections = model::build(&model::Snapshot { ui: &ui, integration: 2, open: None });
         // Local preferences apply through the shared menu helpers, everything else
         // is forwarded to the window; both paths must consume the id.
         let local = |action: &str| {

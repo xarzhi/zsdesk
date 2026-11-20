@@ -2,6 +2,7 @@
 
 use super::model::{self, Control, Layout, Row, Section, Target, BUTTON_SIZE, DETAIL_SIZE, TITLE_SIZE};
 use zsdesk_ui::theme::{glyph, Palette};
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use zsdesk_windows::gfx::{Align, Canvas, Color, RectF, TextStyle};
 
 fn c(color: zsdesk_ui::theme::Color) -> Color { Color::rgba8(color.r, color.g, color.b, color.a) }
@@ -33,6 +34,10 @@ pub struct Paint<'a> {
     pub active: bool,
     pub hover: Target,
     pub scroll: f32,
+    /// A DWM material shows behind the dialog: keep the surface translucent.
+    pub material: bool,
+    /// Wallpaper layer, already decoded for the dialog size.
+    pub wallpaper: Option<&'a (ID2D1Bitmap, f32)>,
     pub message: Option<&'a str>,
 }
 
@@ -43,7 +48,12 @@ impl Paint<'_> {
         let s = Scaler { dpi: l.dpi };
         let p = &self.palette;
         let (width, height) = (l.width as f32, l.height as f32);
-        cv.fill(RectF::new(0.0, 0.0, width, height), dialog_fill(self.dark));
+        let full = RectF::new(0.0, 0.0, width, height);
+        // Transparent pixels expose the DWM material; the wallpaper and the
+        // translucent fill keep the cards and text readable on any desktop.
+        if self.material { cv.clear_rect(full); } else { cv.fill(full, dialog_fill(self.dark)); }
+        if let Some((bitmap, opacity)) = self.wallpaper { cv.image(bitmap, full, *opacity); }
+        if self.material { cv.fill(full, dialog_fill(self.dark).with_alpha(0.62)); }
         // Hairline keeps the popup readable on light and dark wallpapers alike.
         cv.stroke_round(RectF::new(0.5, 0.5, width - 1.0, height - 1.0), s.s(10.0), c(p.stroke), 1.0);
         self.header();
@@ -110,7 +120,8 @@ impl Paint<'_> {
                 cv.text(label, RectF::new(title.x, offset + title.y, title.w, title.h), &style, c(p.text_secondary));
             }
             let card = RectF::new(group.rect.x, offset + group.rect.y, group.rect.w, group.rect.h);
-            cv.round(card, s.s(8.0), card_fill(self.dark));
+            let fill = if self.material { card_fill(self.dark).with_alpha(0.74) } else { card_fill(self.dark) };
+            cv.round(card, s.s(8.0), fill);
             cv.stroke_round(card, s.s(8.0), c(p.stroke), 1.0);
             for (row_index, box_) in group.rows.iter().enumerate() {
                 let Some(model_row) = model_group.rows.get(row_index) else { continue };
@@ -187,7 +198,28 @@ impl Paint<'_> {
             Control::Value => {
                 cv.text(&model_row.label, control, &TextStyle::ui(s.s(12.5)).align(Align::End), c(p.text));
             }
+            Control::Slider { value } => self.slider(control, *value),
         }
+    }
+
+    /// Windows 11 slider: value on the left, a 4px track and a round thumb.
+    fn slider(&self, rect: RectF, value: u8) {
+        let cv = self.canvas;
+        let s = Scaler { dpi: self.layout.dpi };
+        let p = &self.palette;
+        let value_width = s.s(38.0);
+        cv.text(&format!("{value}%"), RectF::new(rect.x, rect.y, value_width, rect.h),
+            &TextStyle::ui(s.s(12.0)).align(Align::End), c(p.text_secondary));
+        let track = RectF::new(rect.x + value_width + s.s(10.0), rect.y + (rect.h - s.s(4.0)) / 2.0,
+            (rect.w - value_width - s.s(10.0)).max(1.0), s.s(4.0));
+        cv.round(track, s.s(2.0), track_off(self.dark));
+        let fraction = value.min(100) as f32 / 100.0;
+        if fraction > 0.0 {
+            cv.round(RectF::new(track.x, track.y, (track.w * fraction).max(s.s(4.0)), track.h), s.s(2.0), c(p.accent));
+        }
+        let knob = s.s(14.0);
+        let x = (track.x + track.w * fraction - knob / 2.0).clamp(track.x - knob / 2.0, track.right() - knob / 2.0);
+        cv.round(RectF::new(x, rect.y + (rect.h - knob) / 2.0, knob, knob), knob / 2.0, c(p.accent));
     }
 
     fn toggle(&self, rect: RectF, on: bool, enabled: bool) {

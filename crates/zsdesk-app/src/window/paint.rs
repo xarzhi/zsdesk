@@ -4,13 +4,13 @@ use zsdesk_ui::{chrome::{format_size, CommandId}, theme::glyph};
 use zsdesk_windows::{gfx::{Align, Canvas, Color, RectF, TextStyle}, shell::{icons, pidl}};
 
 /// Shell icon converted once to WIC and uploaded per render-target generation.
-pub(super) struct IconEntry { wic: Option<IWICBitmapSource>, bitmap: Option<(u64, ID2D1Bitmap)> }
+pub(super) struct IconEntry { pub(super) wic: Option<IWICBitmapSource>, pub(super) bitmap: Option<(u64, ID2D1Bitmap)> }
 
 pub(super) fn c(color: zsdesk_ui::theme::Color) -> Color { Color::rgba8(color.r, color.g, color.b, color.a) }
 fn rf(r: LayoutRect) -> RectF { RectF::new(r.x as f32, r.y as f32, r.width as f32, r.height as f32) }
 
 pub(super) const UI_TEXT: f32 = 12.0;
-const ICON_DIP: i32 = 16;
+pub(super) const ICON_DIP: i32 = 16;
 
 fn pixel_aligned_icon(rect: RectF) -> RectF {
     RectF::new(rect.x.round(), rect.y.round(), rect.w.round().max(1.0), rect.h.round().max(1.0))
@@ -69,6 +69,14 @@ impl WindowState {
         if self.session.tabs.is_empty() { return; }
         let (width, height) = self.client_size();
         if Surface::ensure(&mut self.surface, width, height).is_none() { return; }
+        // Decoding and blurring the wallpaper needs `&mut self`, so it happens
+        // before the drawing closure borrows the state.
+        let layer = self.prepare_wallpaper(width, height);
+        let view_icons = self.prepare_view_icons();
+        let (tree_first, tree_icons) = self.prepare_tree_icons();
+        // Native EDITs paint no glyphs in material mode; their text is drawn
+        // with D2D after the backdrop, so it has to be collected first.
+        let edits = self.prepare_edits();
         // Collect icons first: uploading needs `&mut self`, drawing only `&self`.
         let tab_icons: Vec<Option<ID2D1Bitmap>> = self.layout.tabs.clone().iter()
             .map(|slot| { let l = self.session.tabs[slot.index].current().clone(); self.icon_for(&l) }).collect();
@@ -79,13 +87,15 @@ impl WindowState {
         let mark = self.app_mark();
         let (Some(gfx), Some(surface)) = (self.gfx.as_ref(), self.surface.as_ref()) else { return };
         let result = gfx.draw(surface, |cv| {
+            self.paint_backdrop(cv, width, height, layer.as_ref());
             self.paint_strip(cv, &tab_icons, mark.as_ref());
             self.paint_nav(cv, address_icon.as_ref());
             self.paint_commands(cv);
             self.paint_bookmarks(cv, &bookmark_icons);
             self.paint_search_panel(cv);
-            self.paint_content(cv);
+            self.paint_content(cv, &view_icons, tree_first, &tree_icons);
             self.paint_status(cv);
+            self.paint_edits(cv, &edits);
         });
         if result.is_err() {
             self.icons.values_mut().for_each(|e| e.bitmap = None);
@@ -100,33 +110,94 @@ impl WindowState {
         else if self.hover == hit { cv.round(rf(rect), radius, c(p.hover)); }
     }
 
+    /// Decodes (or reuses) the wallpaper for this window size.
+    fn prepare_wallpaper(&mut self, width: i32, height: i32) -> Option<(ID2D1Bitmap, f32)> {
+        let gfx = self.gfx.as_ref()?;
+        let prefs = self.session.ui.appearance.wallpaper.clone().normalized();
+        self.wallpaper.prepare(gfx, width, height, &prefs)
+    }
+
+    /// True when the material is actually composited: fullscreen windows have no
+    /// extended frame, so their transparent pixels would turn black.
+    fn material_visible(&self) -> bool { self.material && self.fullscreen_restore.is_none() }
+
+    /// Fills the window behind every other layer: the DWM material either shows
+    /// through (transparent clear) or an opaque base covers an unsupported
+    /// system, and the wallpaper sits on top of both.
+    fn paint_backdrop(&self, cv: &Canvas, width: i32, height: i32, layer: Option<&(ID2D1Bitmap, f32)>) {
+        let full = RectF::new(0.0, 0.0, width as f32, height as f32);
+        if !self.material_visible() {
+            // No composited material: the window has to paint itself opaque,
+            // otherwise the extended frame would show through as black.
+            cv.fill(full, c(self.palette.content));
+            crate::wallpaper::paint(cv, full, layer);
+            return;
+        }
+        // Transparent pixels let the DWM material (acrylic / mica) through.
+        cv.clear_rect(full);
+        crate::wallpaper::paint(cv, full, layer);
+        let Some((_, opacity)) = layer else {
+            // No picture: the material already supplies a base, so the tint
+            // stays thin and the acrylic keeps its depth.
+            cv.fill(full, c(self.palette.layer).with_alpha(if self.dark { 0.32 } else { 0.20 }));
+            return;
+        };
+        // Readability scrim. A picture behind text needs help, but a fixed
+        // wash over it was what made even a fully opaque wallpaper look milky.
+        // How much help it needs is read from the picture itself: a bright one
+        // is drawn as it is, a dark one is lifted only as far as the text
+        // requires. The scrim follows the theme, so the text keeps its contrast
+        // against the side the theme puts it on.
+        let behind = if self.dark { 0.12 } else { 0.90 };
+        let effective = self.wallpaper.mean() * *opacity + behind * (1.0 - *opacity);
+        // 0.42 is about 9:1 contrast for black text and 0.20 about 4.2:1 for
+        // white, so the scrim only has to reach the point where the text is
+        // comfortably legible instead of flattening the picture.
+        let target = if self.dark { 0.20 } else { 0.42 };
+        let scrim = if self.dark {
+            if effective > target { (1.0 - target / effective.max(0.001)).clamp(0.0, 0.72) } else { 0.0 }
+        } else if effective < target {
+            ((target - effective) / (1.0 - effective).max(0.001)).clamp(0.0, 0.72)
+        } else { 0.0 };
+        if scrim > 0.002 {
+            let tone = if self.dark { Color::rgba8(0, 0, 0, 255) } else { Color::rgba8(255, 255, 255, 255) };
+            cv.fill(full, tone.with_alpha(scrim));
+        }
+    }
+
+    /// A chrome strip: the material and wallpaper show through when a material
+    /// is composited, otherwise the strip is painted solid.
     fn paint_chrome_layer(&self, cv: &Canvas, rect: RectF) {
-        if crate::edition::THEMED && self.mica {
-            cv.clear_rect(rect);
-            cv.fill(rect, c(self.palette.layer).with_alpha(0.18));
-        } else { cv.fill(rect, c(self.palette.layer)); }
+        if self.material_visible() { cv.fill(rect, c(self.palette.veil(0.06))); }
+        else { cv.fill(rect, c(self.palette.layer)); }
     }
 
     fn paint_strip(&self, cv: &Canvas, icons: &[Option<ID2D1Bitmap>], mark: Option<&ID2D1Bitmap>) {
         let p = &self.palette;
         let strip = rf(self.layout.strip);
-        // With a system material, transparent pixels expose the DWM backdrop; otherwise use the
-        // Windows 11 tab-strip tint. DWM draws the caption buttons above either.
-        cv.clear_rect(strip);
-        // Fullscreen has no extended DWM frame: transparent pixels otherwise
-        // become black and hide the dark caption glyphs.
-        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
+        // With a material the strip keeps the wallpaper visible; fullscreen has
+        // no extended DWM frame, so transparent pixels would turn black there.
+        if !self.material_visible() || window_actions::fullscreen(self.hwnd) {
+            cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) });
+        } else {
+            // Over a material the strip is a translucent veil, not a slab: a
+            // white band here is what made the top of the window look washed.
+            cv.fill(strip, c(p.veil(0.05)));
+        }
         // Application mark: far left of the title bar, above the strip tint.
         if let Some(bitmap) = mark {
             let rect = rf(self.layout.app_icon);
             if rect.w > 0.0 { cv.image(bitmap, pixel_aligned_icon(rect), 1.0); }
         }
         let text = if self.active { c(p.text) } else { c(p.text_secondary) };
+        // Tab footprints: the selected one is a translucent veil so the
+        // wallpaper shows through instead of a white chip.
+        let (chip, hover_fill) = if self.material_visible() { (c(p.veil(0.09)), c(p.veil(0.05))) } else { (c(p.layer), c(p.hover)) };
         let active = self.session.active_tab;
         let radius = self.sf(8.0);
         let foot = self.sf(6.0);
         if self.layout.vertical_tabs{
-            cv.fill(rf(self.layout.tab_panel),c(p.strip));
+            cv.fill(rf(self.layout.tab_panel), if self.material_visible() { c(p.veil(0.05)) } else { c(p.strip) });
             let edge = if self.layout.nav_row.x > 0 { self.layout.tab_panel.right() as f32 - 0.5 } else { self.layout.tab_panel.x as f32 + 0.5 };
             cv.line(edge, self.layout.tab_panel.y as f32, edge, self.layout.tab_panel.bottom() as f32, c(p.divider), 1.0);
             let title=self.session.current_location().title();
@@ -138,13 +209,13 @@ impl WindowState {
             let is_active = slot.index == active;
             let hovered = matches!(self.hover, Hit::Tab(i) | Hit::TabClose(i) if i == slot.index);
             if is_active {
-                if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),c(p.layer));}else{cv.tab_shape(r, radius, foot, c(p.layer));}
+                if self.layout.vertical_tabs{cv.round(r,self.sf(6.0),chip);}else{cv.tab_shape(r, radius, foot, chip);}
             } else if hovered {
                 // Hovering paints the same footprint as the selected tab: a
                 // shorter chip reads as a divider instead of a tab.
                 let hover_rect = RectF::new(r.x + self.sf(2.0), r.y + self.sf(2.0), r.w - self.sf(4.0), r.h - self.sf(2.0));
-                if self.layout.vertical_tabs { cv.round(hover_rect, self.sf(6.0), c(p.hover)); }
-                else { cv.tab_shape(hover_rect, radius, foot, c(p.hover)); }
+                if self.layout.vertical_tabs { cv.round(hover_rect, self.sf(6.0), hover_fill); }
+                else { cv.tab_shape(hover_rect, radius, foot, hover_fill); }
             } else {
                 // Separator unless the neighbour is active or hovered.
                 let next = self.layout.tabs.get(n + 1).map(|t| t.index);
@@ -187,11 +258,27 @@ impl WindowState {
             cv.stroke_round(badge, self.sf(3.0), text, self.sf(1.2).max(1.0));
             cv.text(&label, badge, &TextStyle::ui(self.sf(if label.len()>4{9.0}else{11.0})).weight(600).align(Align::Center), text);
         }
+        if !self.layout.theme_button.is_empty() {
+            self.button_fill(cv, self.layout.theme_button, Hit::Theme, self.sf(4.0));
+            // The glyph itself carries the answer: a sun for light, a moon for
+            // dark and the neutral swatch while the system decides. The tooltip
+            // names the mode, the menu behind it changes it.
+            let icon = match (self.session.ui.appearance.color_scheme, self.dark) {
+                (zsdesk_core::model::explorer::ColorScheme::System, _) => glyph::THEME,
+                (_, true) => "\u{E708}",
+                _ => "\u{E706}",
+            };
+            cv.glyph(icon, rf(self.layout.theme_button), self.sf(14.0), text);
+        }
         if !self.layout.settings_button.is_empty() {
             self.button_fill(cv, self.layout.settings_button, Hit::Settings, self.sf(4.0));
             cv.glyph(glyph::SETTINGS, rf(self.layout.settings_button), self.sf(14.0), text);
         }
-        if !native_caption(self.hwnd) { self.paint_caption_buttons(cv, text); }
+        // A window with the frame extended over its whole client area no longer
+        // has a caption band for DWM to paint into, so the buttons are drawn
+        // here in both modes; `ZSDesk.NativeCaption` still lets DWM handle Snap
+        // Layouts and the caption hit tests.
+        self.paint_caption_buttons(cv, text);
     }
 
     /// Windows 11 caption buttons drawn over the opaque strip (DWM still hit-tests them).
@@ -268,9 +355,20 @@ impl WindowState {
     fn text_box(&self, cv: &Canvas, r: RectF, focused: bool, hovered: bool) {
         let p = &self.palette;
         let radius = self.sf(4.0);
-        let fill = if focused { c(p.input_focused) } else if hovered && p.mode == Mode::Light { Color::rgba8(0xF9, 0xF9, 0xF9, 0xFF) } else { c(p.input) };
+        // Over a material the field is a translucent veil rather than a white
+        // plate: a solid field punched a hole in the wallpaper.
+        let fill = if self.material_visible() {
+            c(p.veil(if focused { 0.11 } else if hovered { 0.09 } else { 0.07 }))
+        } else if focused { c(p.input_focused) }
+        else if hovered && p.mode == Mode::Light { Color::rgba8(0xF9, 0xF9, 0xF9, 0xFF) }
+        else { c(p.input) };
         cv.round(r, radius, fill);
-        cv.stroke_round(r, radius, c(p.input_border), 1.0);
+        let border = if self.material_visible() {
+            // A dark theme needs a light hairline: a black one disappears into
+            // a picture that is already dark.
+            if self.dark { Color::rgba8(0xFF, 0xFF, 0xFF, 0x26) } else { c(p.veil(0.16)) }
+        } else { c(p.input_border) };
+        cv.stroke_round(r, radius, border, 1.0);
         cv.push_clip(RectF::new(r.x, r.bottom() - radius, r.w, radius));
         if focused {
             cv.push_clip(RectF::new(r.x, r.bottom() - self.sf(2.0), r.w, self.sf(2.0)));
@@ -362,13 +460,23 @@ impl WindowState {
         }
     }
 
-    fn paint_content(&self, cv: &Canvas) {
+    fn paint_content(&self, cv: &Canvas, view_icons: &[Option<ID2D1Bitmap>], tree_first: usize,
+        tree_icons: &[Option<ID2D1Bitmap>]) {
         let p = &self.palette;
         let l = &self.layout;
         cv.line(l.nav_row.x as f32, l.top as f32 - 0.5, l.nav_row.right() as f32, l.top as f32 - 0.5, c(p.divider), 1.0);
         // Visible only around the native children (splitter, empty tree area while loading).
         let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
-        cv.fill(rf(content), c(p.content));
+        // The panes carry the material themselves; only the gaps between them
+        // need a fill, and with a material they stay transparent.
+        if !self.material_visible() { cv.fill(rf(content), c(p.content)); }
+        if self.custom_tree() {
+            self.nav_tree.paint(cv, self.tree_rect(), p, self.material_visible(), tree_icons, tree_first);
+        }
+        if self.custom_view {
+            // Rows are painted over the material/wallpaper, never over a fill.
+            self.file_view.paint(cv, self.view_rect(), self.dpi, p, view_icons);
+        }
         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
@@ -378,19 +486,17 @@ impl WindowState {
     fn paint_status(&self, cv: &Canvas) {
         let p = &self.palette;
         let l = &self.layout;
-        if l.status.is_empty() {
-            // Transient messages sit at the right end of the command bar.
-            if self.status.is_empty() || l.command_row.is_empty() { return; }
-            let row = rf(l.command_row);
-            let panes = [CommandId::PreviewPane, CommandId::DetailsPane];
-            let left = l.commands.iter().filter(|(id, _)| !panes.contains(id)).map(|(_, r)| r.right()).max().unwrap_or(0) as f32 + self.sf(16.0);
-            let right = l.commands.iter().filter(|(id, _)| panes.contains(id)).map(|(_, r)| r.x).min().map_or(row.right() - self.sf(12.0), |x| x as f32 - self.sf(12.0));
-            cv.text(&self.status, RectF::new(left, row.y, (right - left).max(0.0), row.h), &self.ui_style().align(Align::End), c(p.danger));
-            return;
-        }
+        // The bar is always laid out, so a message never moves the pane.
+        if l.status.is_empty() { return; }
         let r = rf(l.status);
-        cv.fill(r, c(p.content));
-        let mut text = format!("{} 个项目", self.view_status.items);
+        if self.material_visible() { cv.fill(r, c(p.veil(0.05))); } else { cv.fill(r, c(p.content)); }
+        // The drawn list knows its own rows; a folder that is still being
+        // enumerated says so instead of claiming to be empty.
+        let mut text = if self.custom_view && !self.file_view.loaded {
+            "正在读取…".to_string()
+        } else {
+            format!("{} 个项目", self.view_status.items)
+        };
         if self.view_status.selected > 0 {
             text.push_str(&format!("    选中 {} 个项目", self.view_status.selected));
             if let Some(bytes) = self.view_status.selected_bytes { text.push_str(&format!("  {}", format_size(bytes))); }
@@ -401,11 +507,15 @@ impl WindowState {
         cv.text(&text, RectF::new(left, r.y, w + 2.0, r.h), &style, c(p.text_secondary));
         if !self.status.is_empty() || self.search_progress.is_some() {
             let x = left + w + self.sf(24.0);
+            // The message runs up to the mode buttons, or to the end of the bar
+            // when the drawn list leaves them out.
+            let right = if l.status_details.is_empty() { r.right() - self.sf(12.0) } else { l.status_details.x as f32 - self.sf(8.0) };
             let text=if self.status.is_empty(){self.search_progress.as_deref().unwrap_or("")}else{&self.status};
-            cv.text(text, RectF::new(x, r.y, (l.status_details.x as f32 - x - self.sf(8.0)).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
+            cv.text(text, RectF::new(x, r.y, (right - x).max(0.0), r.h), &style, c(if self.status.is_empty(){p.text_secondary}else{p.danger}));
         }
         let (mode, _) = self.view_mode;
         for (rect, hit, g, on) in [(l.status_details, Hit::StatusDetails, glyph::DETAILS_VIEW, mode == 4), (l.status_tiles, Hit::StatusTiles, glyph::TILES_VIEW, mode == 1)] {
+            if rect.is_empty() { continue; }
             if on { cv.round(rf(rect), self.sf(4.0), c(p.pressed)); cv.round(RectF::new(rect.x as f32 + self.sf(9.0), rect.bottom() as f32 - self.sf(3.0), rect.width as f32 - self.sf(18.0), self.sf(2.0)), self.sf(1.0), c(p.accent)); }
             self.button_fill(cv, rect, hit, self.sf(4.0));
             cv.glyph(g, rf(rect), self.sf(12.0), c(p.text));

@@ -1,0 +1,358 @@
+//! Self-drawn text for the native EDIT fields.
+//!
+//! A DWM backdrop extended over the whole client area makes the window composite
+//! by pixel alpha. GDI — which every EDIT control uses — writes colour without
+//! alpha, so glyphs drawn by a native text field end up transparent and read as
+//! pale coloured ghosts in front of the material.
+//!
+//! The EDIT stays the input model: it keeps its position, focus, keyboard, IME,
+//! clipboard and undo behaviour. Only its window region is emptied, so it paints
+//! nothing, and the text, selection, caret and IME composition are drawn here
+//! with Direct2D, on top of the backdrop that the window itself painted.
+
+use super::*;
+use zsdesk_windows::gfx::{Canvas, RectF, TextStyle};
+
+/// Width given to DirectWrite when measuring a single line: large enough for
+/// any field, small enough to keep its layout arithmetic exact.
+const MAX_MEASURE: f32 = 8192.0;
+
+/// Caret blink interval in milliseconds, close to the system default.
+pub(super) const CARET_INTERVAL: u32 = 530;
+pub(super) const TIMER_CARET: usize = 12;
+
+/// Everything one visible text field needs at paint time. Collected before the
+/// drawing closure runs, because measuring and scrolling need `&mut self`.
+pub(super) struct EditPaint {
+    rect: RectF,
+    text: String,
+    cue: String,
+    composition: String,
+    selection: (usize, usize),
+    /// Width of the text before the selection start / end, caret and composition.
+    sel_from: f32,
+    sel_to: f32,
+    caret: f32,
+    composition_width: f32,
+    text_width: f32,
+    scroll: f32,
+    focused: bool,
+}
+
+impl WindowState {
+    /// Text fields this window owns.
+    fn edit_fields(&self) -> [HWND; 4] {
+        [self.search_edit, self.address_edit, self.view_rename, self.rename_hwnd]
+    }
+
+    /// Text area of `edit`, as the layout last placed it. The control itself is
+    /// shrunk while a material is on, so its window rectangle is not the answer.
+    fn edit_area(&self, edit: HWND) -> Option<LayoutRect> {
+        let area = if edit == self.search_edit { self.search_area }
+            else if edit == self.address_edit { self.address_area }
+            else if edit == self.view_rename { self.view_rename_area }
+            else if !self.rename_hwnd.0.is_null() && edit == self.rename_hwnd { self.rename_area }
+            else { return None };
+        if area.is_empty() { None } else { Some(area) }
+    }
+
+    /// Records where a field's text belongs and places the control there.
+    ///
+    /// Under a material the control is then squeezed to a single pixel: it keeps
+    /// its position, focus, keyboard, IME context and clipboard, but cannot paint
+    /// GDI pixels that DWM would compose with a zero alpha — those read as pale
+    /// coloured ghosts — because the text is drawn by `paint_edits` instead.
+    pub(super) fn place_edit(&mut self, edit: HWND, area: LayoutRect) {
+        if edit.0.is_null() { return; }
+        if edit == self.search_edit { self.search_area = area; }
+        else if edit == self.address_edit { self.address_area = area; }
+        else if edit == self.view_rename { self.view_rename_area = area; }
+        else if edit == self.rename_hwnd { self.rename_area = area; }
+        else { return; }
+        unsafe { move_control(edit, area); }
+        self.sync_edit_regions();
+    }
+
+    /// Applies the material rule to every text field: shrunk when DWM composites
+    /// the window by pixel alpha, restored to its real size when it does not.
+    pub(super) fn sync_edit_regions(&self) {
+        for edit in self.edit_fields() {
+            if edit.0.is_null() { continue; }
+            unsafe {
+                if self.material {
+                    let _ = SetWindowPos(edit, None, 0, 0, 1, 1, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                } else if let Some(area) = self.edit_area(edit) {
+                    move_control(edit, area);
+                }
+            }
+        }
+    }
+
+    /// Rectangle a field's text is drawn into, in canvas pixels.
+    fn edit_rect(&self, edit: HWND) -> Option<RectF> {
+        let area = self.edit_area(edit)?;
+        Some(RectF::new(area.x as f32, area.y as f32, area.width as f32, area.height as f32))
+    }
+
+    pub(super) fn visible_edit_at(&self, p: POINT) -> Option<HWND> {
+        if !self.material { return None; }
+        for edit in self.edit_fields() {
+            if edit.0.is_null() || !unsafe { IsWindowVisible(edit) }.as_bool() { continue; }
+            if self.edit_rect(edit).is_some_and(|rect| rect.contains(p.x as f32, p.y as f32)) { return Some(edit); }
+        }
+        None
+    }
+
+    /// A click landed on a self-drawn field: place the caret, focus the control
+    /// and remember it for a drag selection.
+    pub(super) fn focus_edit_at(&mut self, p: POINT, shift: bool) -> bool {
+        let Some(edit) = self.visible_edit_at(p) else { return false };
+        let index = self.edit_index_at(edit, p);
+        let (start, _) = edit_selection(edit);
+        let anchor = if shift { start } else { index };
+        let _ = unsafe { SetFocus(Some(edit)) };
+        unsafe { SendMessageW(edit, EM_SETSEL, Some(WPARAM(anchor)), Some(LPARAM(index as isize))); }
+        self.edit_drag = Some(edit.0 as isize);
+        self.caret_on = true;
+        let _ = unsafe { SetCapture(self.hwnd) };
+        self.invalidate();
+        true
+    }
+
+    /// Extends the selection to the pointer while a field is being dragged.
+    pub(super) fn drag_edit_selection(&mut self, p: POINT) -> bool {
+        let Some(handle) = self.edit_drag else { return false };
+        let edit = HWND(handle as *mut _);
+        let index = self.edit_index_at(edit, p);
+        let (start, _) = edit_selection(edit);
+        unsafe { SendMessageW(edit, EM_SETSEL, Some(WPARAM(start)), Some(LPARAM(index as isize))); }
+        self.invalidate();
+        true
+    }
+
+    pub(super) fn end_edit_drag(&mut self) -> bool {
+        self.edit_drag.take().is_some()
+    }
+
+    /// Double click inside a field selects the whole value, like an EDIT does.
+    pub(super) fn select_edit_at(&mut self, p: POINT) -> bool {
+        let Some(edit) = self.visible_edit_at(p) else { return false };
+        let _ = unsafe { SetFocus(Some(edit)) };
+        unsafe { SendMessageW(edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1))); }
+        self.caret_on = true;
+        self.invalidate();
+        true
+    }
+
+    /// Character index under a client point, measured with the same DirectWrite
+    /// style the text is drawn with. The EDIT itself cannot answer this: it was
+    /// shrunk to a pixel and scrolled its own (invisible) text to keep the caret
+    /// in that pixel, so `EM_CHARFROMPOS` would be off by the scroll amount.
+    fn edit_index_at(&self, edit: HWND, p: POINT) -> usize {
+        let Some(area) = self.edit_area(edit) else { return 0 };
+        let text = edit_text(edit);
+        let style = self.text_style();
+        let scroll = self.edit_scroll.get(&(edit.0 as isize)).copied().unwrap_or(0.0);
+        self.index_at(&text, &style, (p.x - area.x) as f32 + scroll)
+    }
+
+    /// Character index closest to `x` pixels into `text`.
+    fn index_at(&self, text: &str, style: &TextStyle, x: f32) -> usize {
+        if x <= 0.0 { return 0; }
+        let mut bounds = Vec::with_capacity(8);
+        let mut units = 0;
+        for character in text.chars() { bounds.push(units); units += character.len_utf16(); }
+        bounds.push(units);
+        let (mut low, mut high) = (0, bounds.len() - 1);
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            if self.text_width(prefix_units(text, bounds[mid]), style) <= x { low = mid } else { high = mid - 1; }
+        }
+        // Snap to whichever side of the glyph the pointer is closer to.
+        if low + 1 < bounds.len() {
+            let here = self.text_width(prefix_units(text, bounds[low]), style);
+            let next = self.text_width(prefix_units(text, bounds[low + 1]), style);
+            if next - x < x - here { return bounds[low + 1]; }
+        }
+        bounds[low]
+    }
+
+    fn any_edit_focused(&self) -> bool {
+        edit_fields_iter(self).any(|edit| unsafe { GetFocus() } == edit)
+    }
+
+    /// Blinks the caret while one of the fields has the focus.
+    pub(super) fn tick_caret(&mut self) {
+        if !self.any_edit_focused() {
+            self.caret_timer = false;
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_CARET) };
+            return;
+        }
+        self.caret_on = !self.caret_on;
+        self.invalidate();
+    }
+
+    /// Collects the text of every visible field before drawing.
+    pub(super) fn prepare_edits(&mut self) -> Vec<EditPaint> {
+        if !self.material { return Vec::new(); }
+        let mut paints = Vec::new();
+        let mut focused_any = false;
+        for edit in self.edit_fields() {
+            if edit.0.is_null() || !unsafe { IsWindowVisible(edit) }.as_bool() { continue; }
+            let Some(rect) = self.edit_rect(edit) else { continue };
+            let text = edit_text(edit);
+            let selection = edit_selection(edit);
+            let focused = unsafe { GetFocus() } == edit;
+            focused_any |= focused;
+            let style = self.text_style();
+            let scroll = self.edit_scroll(edit, &text, &style, selection.1.max(selection.0), rect, focused);
+            let caret = self.text_width(prefix_units(&text, selection.1.max(selection.0)), &style);
+            let composition = if focused { edit_composition(edit) } else { String::new() };
+            paints.push(EditPaint {
+                rect, text_width: self.text_width(&text, &style),
+                cue: if text.is_empty() && edit == self.search_edit { self.search_cue.clone() } else { String::new() },
+                sel_from: self.text_width(prefix_units(&text, selection.0), &style),
+                sel_to: self.text_width(prefix_units(&text, selection.1), &style),
+                composition_width: self.text_width(&composition, &style),
+                composition, selection, caret, scroll, focused,
+                text,
+            });
+        }
+        self.caret_timer = focused_any;
+        paints
+    }
+
+    /// Draws the collected fields. Runs inside the paint closure, so it only
+    /// reads state.
+    pub(super) fn paint_edits(&self, cv: &Canvas, edits: &[EditPaint]) {
+        if edits.is_empty() { return; }
+        let style = self.text_style();
+        let text_color = paint::c(self.palette.text);
+        let cue_color = paint::c(self.palette.text_secondary).with_alpha(0.8);
+        let caret_width = self.sf(1.0).max(1.0);
+        for edit in edits {
+            let rect = edit.rect;
+            cv.push_clip(rect);
+            if edit.text.is_empty() {
+                if !edit.cue.is_empty() { cv.text(&edit.cue, rect, &style, cue_color); }
+            } else {
+                if edit.selection.1 > edit.selection.0 {
+                    cv.fill(RectF::new(rect.x + edit.sel_from - edit.scroll, rect.y,
+                        (edit.sel_to - edit.sel_from).max(1.0), rect.h), paint::c(self.palette.accent).with_alpha(0.32));
+                }
+                cv.text(&edit.text, RectF::new(rect.x - edit.scroll, rect.y, edit.text_width + caret_width * 2.0, rect.h),
+                    &style, text_color);
+                if !edit.composition.is_empty() {
+                    cv.text(&edit.composition, RectF::new(rect.x + edit.caret - edit.scroll, rect.y,
+                        edit.composition_width + caret_width * 2.0, rect.h), &style, text_color);
+                    cv.line(rect.x + edit.caret - edit.scroll, rect.bottom() - self.sf(1.5),
+                        rect.x + edit.caret - edit.scroll + edit.composition_width,
+                        rect.bottom() - self.sf(1.5), text_color, caret_width);
+                }
+            }
+            // The caret sits on the placeholder too: an empty focused field has
+            // to show where typing will land, exactly like the native control.
+            if edit.focused && self.caret_on && edit.composition.is_empty() {
+                let caret_x = rect.x + edit.caret - edit.scroll;
+                cv.fill(RectF::new(caret_x, rect.y + self.sf(1.0), caret_width, rect.h - self.sf(2.0)), text_color);
+            }
+            cv.pop_clip();
+        }
+    }
+
+    pub(super) fn text_style(&self) -> TextStyle {
+        let mut style = self.ui_style();
+        style.ellipsis = false;
+        style.wrap = false;
+        style
+    }
+
+    /// Horizontal offset that keeps the caret inside the field, kept per control
+    /// so the text does not jump while the caret blinks.
+    fn edit_scroll(&mut self, edit: HWND, text: &str, style: &TextStyle, caret: usize, rect: RectF, focused: bool) -> f32 {
+        let key = edit.0 as isize;
+        let caret_x = self.text_width(prefix_units(text, caret), style);
+        let mut scroll = self.edit_scroll.get(&key).copied().unwrap_or(0.0);
+        if !focused {
+            scroll = 0.0;
+        } else {
+            let margin = self.sf(2.0);
+            if caret_x - scroll > rect.w - margin { scroll = caret_x - rect.w + margin; }
+            if caret_x - scroll < 0.0 { scroll = caret_x; }
+            if scroll < 0.0 { scroll = 0.0; }
+        }
+        self.edit_scroll.insert(key, scroll);
+        scroll
+    }
+
+    fn text_width(&self, text: &str, style: &TextStyle) -> f32 {
+        match self.gfx.as_ref() {
+            Some(gfx) if !text.is_empty() => gfx.measure(text, style, MAX_MEASURE).0,
+            _ => 0.0,
+        }
+    }
+}
+
+fn edit_fields_iter(state: &WindowState) -> impl Iterator<Item = HWND> + '_ {
+    [state.search_edit, state.address_edit, state.view_rename, state.rename_hwnd].into_iter()
+}
+
+fn edit_text(edit: HWND) -> String {
+    let length = unsafe { GetWindowTextLengthW(edit) };
+    if length <= 0 { return String::new(); }
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = unsafe { GetWindowTextW(edit, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+}
+
+/// Selection in UTF-16 units, as the EDIT reports it.
+fn edit_selection(edit: HWND) -> (usize, usize) {
+    let packed = unsafe { SendMessageW(edit, EM_GETSEL, None, None) }.0 as u32;
+    ((packed & 0xffff) as usize, ((packed >> 16) & 0xffff) as usize)
+}
+
+
+/// The IME composition string, empty when the input method is not composing.
+fn edit_composition(edit: HWND) -> String {
+    use windows::Win32::UI::Input::Ime::{ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR};
+    let context = unsafe { ImmGetContext(edit) };
+    if context.0.is_null() { return String::new(); }
+    let length = unsafe { ImmGetCompositionStringW(context, GCS_COMPSTR, None, 0) };
+    let mut result = String::new();
+    if length > 0 {
+        let mut bytes = vec![0u8; length as usize];
+        let copied = unsafe {
+            ImmGetCompositionStringW(context, GCS_COMPSTR, Some(bytes.as_mut_ptr().cast()), length as u32)
+        };
+        if copied > 0 {
+            let units: Vec<u16> = bytes[..copied as usize].chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+            result = String::from_utf16_lossy(&units);
+        }
+    }
+    let _ = unsafe { ImmReleaseContext(edit, context) };
+    result
+}
+
+/// Byte prefix that covers `units` UTF-16 code units.
+fn prefix_units(text: &str, units: usize) -> &str {
+    let mut count = 0;
+    for (index, character) in text.char_indices() {
+        if count >= units { return &text[..index]; }
+        count += character.len_utf16();
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_units;
+
+    #[test]
+    fn prefix_units_respects_surrogate_pairs() {
+        assert_eq!(prefix_units("abc", 2), "ab");
+        assert_eq!(prefix_units("a中b", 2), "a中");
+        assert_eq!(prefix_units("😀x", 2), "😀");
+        assert_eq!(prefix_units("abc", 9), "abc");
+    }
+}

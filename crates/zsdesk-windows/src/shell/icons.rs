@@ -38,7 +38,27 @@ pub fn icon_index(pidl: &[u8]) -> Option<i32> {
 }
 
 /// Icon index for a file name pattern without touching the disk.
+///
+/// With `SHGFI_USEFILEATTRIBUTES` the answer depends only on the extension and
+/// on whether the item is a folder, and the call costs a few hundred
+/// microseconds. A folder repeats a handful of extensions thousands of times,
+/// so every answer is kept for the life of the process; listing a 17 000 entry
+/// folder then costs the same as listing a small one.
 pub fn icon_index_for_name(name: &str, directory: bool) -> Option<i32> {
+    static CACHE: Mutex<Option<std::collections::HashMap<(String, bool), Option<i32>>>> = Mutex::new(None);
+    let key = (name.rsplit_once('.').map(|(stem, extension)| if stem.is_empty() { "" } else { extension })
+        .unwrap_or("").to_lowercase(), directory);
+    if let Some(hit) = CACHE.lock().ok().and_then(|cache| cache.as_ref().and_then(|cache| cache.get(&key).copied())) {
+        return hit;
+    }
+    let index = query_icon_index(name, directory);
+    if let Ok(mut cache) = CACHE.lock() {
+        cache.get_or_insert_with(std::collections::HashMap::new).insert(key, index);
+    }
+    index
+}
+
+fn query_icon_index(name: &str, directory: bool) -> Option<i32> {
     let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
     let attrs = if directory { windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY } else { windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL };
     let mut info = SHFILEINFOW::default();

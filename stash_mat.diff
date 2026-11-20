@@ -1,0 +1,614 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4933488..7b619a5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,6 +12,25 @@
+   扫描间隔 140→30ms、循环尾 16→6ms、二次复核 80→40ms，把原来的 0.1 秒级空转
+   压缩到十几毫秒，双击到窗口出现之间的空档明显变短。
+ 
++### 窗口材质
++
++- 新增“窗口材质”，三种可选，都在**设置 → 外观**里切换，默认“云母”：
++  - **亚克力**：Windows 11 的瞬时窗口材质，桌面在窗口后方模糊，并叠一层细噪点；
++  - **云母**：只把桌面壁纸的色调透进标题栏与命令栏区域，不模糊后面的窗口；
++  - **经典**：完全由本程序绘制的不透明背景，任何 Windows 版本上表现一致。
++- 材质对全部版本开放（以前只有主题版能选），颜色模式仍归主题版；主题版的初始设置保持亚克力。
++- 材质覆盖整窗：DWM 边框扩展改为整个客户区，尺寸变化与分隔条缝隙等自绘区域都透出材质；
++  经典材质、全屏下自动回到不透明。
++- 左侧导航树与右侧文件列表保持系统底色的不透明背景。这两块由 Windows 自己绘制（`SysTreeView32`
++  与 DirectUI 项目视图），没有 alpha 通道，也不接受 `WS_EX_LAYERED`；让树透明的唯一手段是颜色键
++  分层，但分层窗口会吞掉鼠标点击（实测点击后选中项不变），所以不作为。要真正透出材质只能自绘。
++- 切换即时生效：设置窗口自己也吃这套材质——客户区扩展进 DWM 边框、底色改为 82% 半透明，
++  点中哪一项当场就能在弹窗和背后的文件窗口上看到，不用重启。
++- 系统条件不满足时自动退回经典：Windows 11 22H2（22621）之前、关闭“透明效果”、或开启高对比度
++  时都不写系统材质，设置页的说明文字会直接写出原因。
++- 旧配置里的 `"solid"` 继续读作经典，`"system"` 按云母处理；新配置写入 `classic` / `mica` /
++  `acrylic`。
++
+ ### 多标签的打开方式
+ 
+ - 设置 → 常规新增“多标签的打开方式”，以**下拉框**（select）形式呈现，可选
+diff --git a/README.md b/README.md
+index 44ba333..25ab213 100644
+--- a/README.md
++++ b/README.md
+@@ -17,7 +17,7 @@ Windows 原生文件管理器，使用 Rust、Win32/COM、Direct2D 和 DirectWri
+ | 标准版 | 无 | 文件管理器、搜索、预览、设置和系统集成 |
+ | 网络版 | `network` | 标准版 + FTP、SFTP/SSH 地址、网络驱动器和网络位置 |
+ | 全量版 | `network` | 全部功能，默认构建版本 |
+-| 主题版 | `network,themed` | 全量功能 + 亚克力、Mica、纯色深浅主题，独立安装与配置 |
++| 主题版 | `network,themed` | 全量功能 + 浅色／深色颜色模式，独立安装与配置（窗口材质各版本都有） |
+ 
+ 打包脚本支持为上述版本生成 Windows x64 便携 ZIP 和安装器，文件名为
+ `ZSDesk-<版本>-<standard|network|full|themed>-x64`。
+@@ -75,7 +75,7 @@ Windows 原生文件管理器，使用 Rust、Win32/COM、Direct2D 和 DirectWri
+ | 页面 | 内容 |
+ |---|---|
+ | 常规 | 新建窗口、窗口内搜索、收藏当前文件夹、开机自启（默认开启） |
+-| 外观 | 颜色模式与窗口材质（仅主题版显示） |
++| 外观 | 窗口材质（亚克力／云母／经典）、颜色模式（仅主题版） |
+ | 界面 | 导航窗格、展开策略、收藏栏、命令栏、空格与悬停预览、预览插件优先级 |
+ | 系统集成 | 接管方式、接管桌面回收站、接管新出现的系统浏览窗口、恢复系统资源管理器、文件位置转发 |
+ | 右键菜单 | 菜单样式与逐项显示开关 |
+@@ -87,6 +87,23 @@ Windows 原生文件管理器，使用 Rust、Win32/COM、Direct2D 和 DirectWri
+ 再次点击齿轮只把已打开的窗口切到前台。需要文件管理器配合的动作（选择 Everything、
+ 打开转发设置、查看快捷键等）由弹窗转发给所属窗口执行，两条入口共用同一份实现。
+ 
++### 窗口材质
++
++“设置 → 外观 → 窗口材质”提供三种背景，切换后所有已打开的窗口和设置弹窗立即换材质：
++
++| 材质 | 效果 |
++|---|---|
++| 亚克力 | Windows 11 瞬时窗口材质：桌面在窗口后方模糊，并叠一层细噪点 |
++| 云母 | 只把桌面壁纸的色调透进标题栏、地址栏与命令栏，不模糊后面的窗口 |
++| 经典 | 完全由 ZSDesk 绘制的不透明背景，任何 Windows 版本上外观一致 |
++
++默认云母。材质铺满整个窗口：标题栏、地址栏、命令栏这些自绘区域都能看见壁纸与模糊效果。
++左侧导航树与右侧文件列表由 Windows 自己绘制（`SysTreeView32`、DirectUI 项目视图），它们没有
++alpha 通道也不接受分层样式，所以保持系统的白/黑底，与资源管理器一致；要让这两块也透出材质，
++只能改成自绘视图。
++Windows 11 22H2（22621）之前、关闭“透明效果”或开启高对比度时，三种选择都按经典显示，设置页会
++写明原因。
++
+ ## 搜索与预览
+ 
+ 搜索框固定在地址栏右侧，`Ctrl+F` 聚焦输入文件名或 Everything 搜索表达式，例如 `ext:pdf`。
+@@ -198,7 +215,7 @@ Listary 插件通过官方 FileAppPlugin 接口提供当前标签页已打开的
+ 默认目录为 `%APPDATA%\ZSDesk`。程序旁的 `portable.flag` 使用相邻 `data/` 目录，
+ `--profile-dir` 可指定独立配置目录。
+ 主题版默认使用 `%APPDATA%\ZSDesk-Theme`，安装目录、启动标识和配置与其他版本独立。
+-主题版可在“主题与材质”中切换亚克力、Mica、纯色浅色和纯色深色；不支持材质效果的系统使用纯色背景。
++主题版另可在“设置 → 外观”里切换颜色模式（跟随系统／浅色／深色）；不支持材质效果的系统使用经典背景。
+ 地址栏输入 `pwsh`、`powershell`、`nu` 或 `nushell` 可在当前文件夹启动对应终端。
+ 
+ 桌面布局、会话、搜索索引、应用绑定和系统接管备份仅保存于本机，
+diff --git a/crates/zsdesk-app/src/framework_windows.rs b/crates/zsdesk-app/src/framework_windows.rs
+index 7ba61c8..a42f523 100644
+--- a/crates/zsdesk-app/src/framework_windows.rs
++++ b/crates/zsdesk-app/src/framework_windows.rs
+@@ -13,8 +13,8 @@ impl AppearancePolicy {
+     pub fn new(style: BackdropStyle) -> Self { let result = Self(Arc::new(AtomicU8::new(0)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicIsize::new(0))); result.set(style); result }
+     pub fn search_keys(&self, enabled: bool) { self.1.store(enabled, Ordering::Release); }
+     pub fn foreground(&self) -> bool { let root = self.2.load(Ordering::Acquire); root != 0 && unsafe { GetForegroundWindow() }.0 as isize == root }
+-    pub fn set(&self, style: BackdropStyle) { self.0.store(match style { BackdropStyle::System => 0, BackdropStyle::Solid => 1, BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3 }, Ordering::Release); }
+-    fn style(&self) -> BackdropStyle { match self.0.load(Ordering::Acquire) { 1 => BackdropStyle::Solid, 2 => BackdropStyle::Mica, 3 => BackdropStyle::Acrylic, _ => BackdropStyle::System } }
++    pub fn set(&self, style: BackdropStyle) { self.0.store(match style { BackdropStyle::System => 0, BackdropStyle::Classic => 1, BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3 }, Ordering::Release); }
++    fn style(&self) -> BackdropStyle { match self.0.load(Ordering::Acquire) { 1 => BackdropStyle::Classic, 2 => BackdropStyle::Mica, 3 => BackdropStyle::Acrylic, _ => BackdropStyle::System } }
+ }
+ 
+ pub fn hooks(wake: UiInvalidationHandle, appearance: AppearancePolicy, search_keys: bool) -> WindowsWindowHooks {
+@@ -44,7 +44,7 @@ impl NativeMessageFilter for UtilityFilter {
+             let style = self.appearance.style();
+             let mut current = 0i32;
+             let _ = unsafe { DwmGetWindowAttribute(root, DWMWA_SYSTEMBACKDROP_TYPE, (&mut current as *mut i32).cast(), 4) };
+-            let wanted = match style { BackdropStyle::Solid => 1, BackdropStyle::Acrylic => 3, _ => 2 };
++            let wanted = match style { BackdropStyle::Classic => 1, BackdropStyle::Acrylic => 3, _ => 2 };
+             if current != wanted { zsdesk_windows::theme::set_backdrop(root, style); }
+         }
+         if !self.appearance.1.load(Ordering::Acquire) || message.message != WM_KEYDOWN || composing(window) { return false; }
+diff --git a/crates/zsdesk-app/src/settings/mod.rs b/crates/zsdesk-app/src/settings/mod.rs
+index cdced21..b54b708 100644
+--- a/crates/zsdesk-app/src/settings/mod.rs
++++ b/crates/zsdesk-app/src/settings/mod.rs
+@@ -27,7 +27,7 @@ use windows::Win32::{
+         WindowsAndMessaging::*,
+     },
+ };
+-use zsdesk_core::model::explorer::{BackdropStyle, ContextMenuPreferences, ExplorerUi, OpenMode};
++use zsdesk_core::model::explorer::{ContextMenuPreferences, ExplorerUi, OpenMode};
+ use zsdesk_ui::{menus, theme::{Mode, Palette}};
+ use zsdesk_windows::gfx::{Gfx, Surface, TextStyle};
+ 
+@@ -124,6 +124,8 @@ struct Dialog {
+     tracking: bool,
+     dark: bool,
+     active: bool,
++    /// The dialog itself shows a DWM material behind its translucent fill.
++    material: bool,
+     dpi: u32,
+     gfx: Option<Gfx>,
+     surface: Option<Surface>,
+@@ -132,17 +134,13 @@ struct Dialog {
+ 
+ impl Dialog {
+     fn new(parent: HWND, config_path: &Path) -> anyhow::Result<Self> {
+-        let mut ui = crate::storage::load(config_path).map(|session| session.ui).unwrap_or_default();
+-        if !crate::edition::THEMED {
+-            // Only the themed edition honours the material preferences.
+-            ui.appearance = Default::default();
+-        }
++        let ui = crate::storage::load(config_path).map(|session| session.ui).unwrap_or_default();
+         let mut dialog = Self {
+             hwnd: HWND::default(), parent, config_path: config_path.to_path_buf(), ui,
+             sections: Vec::new(), section: 0, scroll: 0.0,
+             layout: model::layout(1, 1, 96, &[], 0, 0.0, &|_, _, _| 0.0),
+             hover: Target::None, pressed: Target::None, open_select: None, drag: None, tracking: false,
+-            dark: false, active: true, dpi: 96, gfx: None, surface: None, message: None,
++            dark: false, active: true, material: false, dpi: 96, gfx: None, surface: None, message: None,
+         };
+         dialog.rebuild();
+         Ok(dialog)
+@@ -168,11 +166,17 @@ impl Dialog {
+     fn apply_frame(&mut self) {
+         let (family, _) = zsdesk_windows::gfx::system_ui_font(Some(self.hwnd));
+         if self.gfx.is_none() { self.gfx = Gfx::new(&family).ok(); }
+-        let appearance = if crate::edition::THEMED { self.ui.appearance.clone() } else { Default::default() };
+-        self.dark = zsdesk_windows::theme::configure_color_scheme(appearance.color_scheme);
++        let appearance = &self.ui.appearance;
++        let scheme = if crate::edition::THEMED { appearance.color_scheme }
++            else { zsdesk_core::model::explorer::ColorScheme::System };
++        self.dark = zsdesk_windows::theme::configure_color_scheme(scheme);
+         zsdesk_windows::theme::set_dark_frame(self.hwnd, self.dark);
+         zsdesk_windows::theme::round_corners(self.hwnd, false);
+-        zsdesk_windows::theme::set_backdrop(self.hwnd, appearance.backdrop);
++        // The dialog previews the material itself: the frame is extended over the
++        // whole client area so the DWM backdrop can show through the translucent fill.
++        self.material = zsdesk_windows::theme::set_backdrop(self.hwnd, appearance.backdrop);
++        let (_, height) = self.client_size();
++        zsdesk_windows::theme::extend_frame(self.hwnd, if self.material { height } else { 0 });
+     }
+ 
+     fn palette(&self) -> Palette { Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light }) }
+@@ -206,7 +210,7 @@ impl Dialog {
+             paint::Paint {
+                 canvas, layout: &self.layout, sections: &self.sections, section: self.section,
+                 palette, dark: self.dark, active: self.active, hover: self.hover, scroll: self.scroll,
+-                message: self.message.as_deref(),
++                material: self.material, message: self.message.as_deref(),
+             }.draw();
+         });
+     }
+@@ -249,7 +253,6 @@ impl Dialog {
+             "navigation-expand-never" => { self.ui.navigation_auto_expand = Some(false); return self.commit(); }
+             "open-mode-window" => { self.ui.open_mode = OpenMode::NewWindow; self.open_select = None; return self.commit(); }
+             "open-mode-tab" => { self.ui.open_mode = OpenMode::NewTab; self.open_select = None; return self.commit(); }
+-            "appearance-solid" => { self.ui.appearance.backdrop = BackdropStyle::Solid; self.apply_frame(); return self.commit(); }
+             "context-menu-defaults" => {
+                 self.ui.context_menu = ContextMenuPreferences::default();
+                 return self.commit();
+@@ -507,7 +510,7 @@ mod tests {
+         // is forwarded to the window; both paths must consume the id.
+         let local = |action: &str| {
+             if matches!(action, "autostart" | "navigation-expand-system" | "navigation-expand-always" | "navigation-expand-never"
+-                | "appearance-solid" | "open-mode-window" | "open-mode-tab") { return true; }
++                | "appearance-classic" | "open-mode-window" | "open-mode-tab") { return true; }
+             if action.starts_with("context-menu-") || action.starts_with("context-action-") {
+                 return menus::apply_context_menu_setting(&mut ContextMenuPreferences::default(), action);
+             }
+diff --git a/crates/zsdesk-app/src/settings/model.rs b/crates/zsdesk-app/src/settings/model.rs
+index 34f3eba..ade52af 100644
+--- a/crates/zsdesk-app/src/settings/model.rs
++++ b/crates/zsdesk-app/src/settings/model.rs
+@@ -133,6 +133,15 @@ pub struct Snapshot<'a> {
+ 
+ fn group(title: Option<&'static str>, rows: Vec<Row>) -> Group { Group { title, rows } }
+ 
++/// Explains the three materials, or why two of them cannot show here.
++fn material_hint() -> &'static str {
++    if zsdesk_windows::theme::material_available() {
++        "亚克力在模糊上叠加噪点，云母只透出桌面色调；经典由本程序绘制纯色背景"
++    } else {
++        "当前系统不支持亚克力与云母（需 Windows 11 22H2 及以后并开启透明效果），按经典显示"
++    }
++}
++
+ /// Builds every section for the current state.
+ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
+     let ui = snapshot.ui;
+@@ -148,21 +157,23 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
+             Row::button("bookmark", "收藏当前文件夹", "把当前文件夹加入收藏栏（Ctrl+D）", "收藏"),
+         ])] },
+     ];
++    // The material is offered in every edition; only the themed build adds the
++    // colour scheme on top of it.
++    let appearance = &ui.appearance;
++    let material = match appearance.backdrop {
++        BackdropStyle::Acrylic => 0, BackdropStyle::Classic => 2, _ => 1,
++    };
++    let mut theme_rows = Vec::new();
+     if snapshot.themed {
+-        let appearance = &ui.appearance;
+         let scheme = match appearance.color_scheme { ColorScheme::System => 0, ColorScheme::Light => 1, ColorScheme::Dark => 2 };
+-        let material = match appearance.backdrop {
+-            BackdropStyle::Acrylic => 0, BackdropStyle::Mica => 1, BackdropStyle::Solid => 2, BackdropStyle::System => 1,
+-        };
+-        sections.push(Section { id: "appearance", title: "外观", icon: "\u{E790}", groups: vec![group(Some("主题"), vec![
+-            Row::segments("appearance-scheme", "颜色模式", "跟随 Windows 设置，或固定为浅色／深色",
+-                &["跟随系统", "浅色", "深色"], scheme,
+-                &["appearance-color-system", "appearance-color-light", "appearance-color-dark"]),
+-            Row::segments("appearance-material", "窗口材质", "亚克力与 Mica 需要 Windows 11 22H2 及以后版本",
+-                &["亚克力", "Mica", "纯色"], material,
+-                &["appearance-acrylic", "appearance-mica", "appearance-solid"]),
+-        ])] });
++        theme_rows.push(Row::segments("appearance-scheme", "颜色模式", "跟随 Windows 设置，或固定为浅色／深色",
++            &["跟随系统", "浅色", "深色"], scheme,
++            &["appearance-color-system", "appearance-color-light", "appearance-color-dark"]));
+     }
++    theme_rows.push(Row::segments("appearance-material", "窗口材质", material_hint(),
++        &["亚克力", "云母", "经典"], material,
++        &["appearance-acrylic", "appearance-mica", "appearance-classic"]));
++    sections.push(Section { id: "appearance", title: "外观", icon: "\u{E790}", groups: vec![group(Some("主题"), theme_rows)] });
+     let expand = match ui.navigation_auto_expand { None => 0, Some(true) => 1, Some(false) => 2 };
+     let provider = match ui.preview_provider {
+         PreviewProviderPreference::System => 0, PreviewProviderPreference::Office => 1, PreviewProviderPreference::Wps => 2 };
+@@ -496,6 +507,7 @@ impl Layout {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use zsdesk_core::model::explorer::AppearancePreferences;
+ 
+     fn measure(text: &str, size: f32, _weight: u16) -> f32 {
+         text.chars().map(|c| if c.is_ascii() { size * 0.58 } else { size }).sum()
+@@ -529,17 +541,44 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn single_tab_build_has_no_tab_placement_rows_and_hides_unthemed_appearance() {
+-        let mut theme_snapshot = Snapshot { ui: &ExplorerUi::default(), integration: 2, themed: false, open: None };
+-        let plain = build(&theme_snapshot);
+-        assert!(!plain.iter().any(|section| section.id == "appearance"));
+-        theme_snapshot.themed = true;
+-        let themed = build(&theme_snapshot);
+-        assert!(themed.iter().any(|section| section.id == "appearance"));
+-        assert!(!themed.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows)
++    fn every_edition_offers_the_material_and_only_the_themed_one_the_colour_scheme() {
++        let row = |themed: bool, id: &'static str| build(&Snapshot { ui: &ExplorerUi::default(), integration: 2, themed, open: None })
++            .into_iter().flat_map(|section| section.groups).flat_map(|group| group.rows)
++            .find(|row| row.id == id);
++        for themed in [false, true] {
++            let material = row(themed, "appearance-material").expect("material row in every edition");
++            assert_eq!(material.options, ["亚克力", "云母", "经典"]);
++            assert_eq!(material.action(Some(0)), Some("appearance-acrylic"));
++            assert_eq!(material.action(Some(1)), Some("appearance-mica"));
++            assert_eq!(material.action(Some(2)), Some("appearance-classic"));
++            // Mica is the default look of a fresh profile.
++            assert_eq!(material.selected, 1, "default material is 云母");
++        }
++        assert!(row(false, "appearance-scheme").is_none(), "the colour scheme stays with the themed edition");
++        assert!(row(true, "appearance-scheme").is_some());
++        let sections = build(&Snapshot { ui: &ExplorerUi::default(), integration: 2, themed: true, open: None });
++        assert!(!sections.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows)
+             .any(|row| row.id.contains("tab-placement")), "single-tab windows have no tab bar to place");
+     }
+ 
++    #[test]
++    fn the_material_row_reflects_the_saved_preference() {
++        let mut ui = ExplorerUi::default();
++        let selected = |ui: &ExplorerUi| {
++            build(&Snapshot { ui, integration: 2, themed: false, open: None })
++                .into_iter().flat_map(|section| section.groups).flat_map(|group| group.rows)
++                .find(|row| row.id == "appearance-material").expect("material row").selected
++        };
++        assert_eq!(selected(&ui), 1, "Mica");
++        ui.appearance.backdrop = BackdropStyle::Acrylic;
++        assert_eq!(selected(&ui), 0);
++        ui.appearance.backdrop = BackdropStyle::Classic;
++        assert_eq!(selected(&ui), 2);
++        // Profiles written by older versions say "solid"; they read as 经典.
++        let legacy: AppearancePreferences = serde_json::from_str(r#"{"backdrop":"solid"}"#).expect("legacy solid");
++        assert_eq!(legacy.backdrop, BackdropStyle::Classic);
++    }
++
+     #[test]
+     fn open_mode_defaults_to_a_new_window_and_follows_the_preference() {
+         let mut ui = ExplorerUi::default();
+diff --git a/crates/zsdesk-app/src/settings/paint.rs b/crates/zsdesk-app/src/settings/paint.rs
+index 4b22019..942d272 100644
+--- a/crates/zsdesk-app/src/settings/paint.rs
++++ b/crates/zsdesk-app/src/settings/paint.rs
+@@ -33,6 +33,8 @@ pub struct Paint<'a> {
+     pub active: bool,
+     pub hover: Target,
+     pub scroll: f32,
++    /// A DWM material shows behind the dialog: keep the surface translucent.
++    pub material: bool,
+     pub message: Option<&'a str>,
+ }
+ 
+@@ -43,7 +45,14 @@ impl Paint<'_> {
+         let s = Scaler { dpi: l.dpi };
+         let p = &self.palette;
+         let (width, height) = (l.width as f32, l.height as f32);
+-        cv.fill(RectF::new(0.0, 0.0, width, height), dialog_fill(self.dark));
++        if self.material {
++            // Transparent pixels expose the DWM backdrop; the fill keeps the cards
++            // and text readable without hiding the material.
++            cv.clear_rect(RectF::new(0.0, 0.0, width, height));
++            cv.fill(RectF::new(0.0, 0.0, width, height), dialog_fill(self.dark).with_alpha(0.82));
++        } else {
++            cv.fill(RectF::new(0.0, 0.0, width, height), dialog_fill(self.dark));
++        }
+         // Hairline keeps the popup readable on light and dark wallpapers alike.
+         cv.stroke_round(RectF::new(0.5, 0.5, width - 1.0, height - 1.0), s.s(10.0), c(p.stroke), 1.0);
+         self.header();
+diff --git a/crates/zsdesk-app/src/window/interaction_regression.rs b/crates/zsdesk-app/src/window/interaction_regression.rs
+index 31897a0..6ce13e3 100644
+--- a/crates/zsdesk-app/src/window/interaction_regression.rs
++++ b/crates/zsdesk-app/src/window/interaction_regression.rs
+@@ -185,7 +185,7 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
+     {let _borrow=slot.borrow_mut();unsafe{SendMessageW(hwnd,WM_SETTINGCHANGE,Some(WPARAM(SPI_SETHIGHCONTRAST.0 as usize)),Some(LPARAM(0)));}}
+     unsafe{PostMessageW(Some(hwnd),WM_NULL,WPARAM(0),LPARAM(0))?;}pump(40);
+     ensure!(rectangle(hwnd)?==normal,"theme notifications changed window geometry");
+-    ensure!(native_caption(hwnd)==slot.borrow().as_ref().unwrap().mica,"theme notification left mismatched caption input/paint mode");
++    ensure!(native_caption(hwnd)==slot.borrow().as_ref().unwrap().material,"theme notification left mismatched caption input/paint mode");
+     for (w,h) in [(900,600),(1240,820),(1080,720)]{
+         unsafe{SetWindowPos(hwnd,None,140,120,w,h,SWP_NOACTIVATE|SWP_NOZORDER)?;SendMessageW(hwnd,WM_EXITSIZEMOVE,None,None);}pump(150);
+         let state=slot.borrow();let state=state.as_ref().unwrap();let view=state.browser.as_ref().unwrap().view_window().context("view HWND")?;
+@@ -249,16 +249,16 @@ fn run(output:&std::path::Path)->Result<serde_json::Value>{
+     key(hwnd,acc.0,VK_W,true,false)?;pump(200);ensure!(slot.borrow().as_ref().unwrap().session.tabs.len()==1,"Ctrl+W tab");
+     key(hwnd,acc.0,VK_T,true,true)?;pump(200);ensure!(slot.borrow().as_ref().unwrap().session.tabs.len()==2,"Ctrl+Shift+T reopen");
+     let mut materials=Vec::new();
+-    if crate::edition::THEMED{
++    {
+         use zsdesk_core::model::explorer::{BackdropStyle,ColorScheme};
+-        for (backdrop,scheme) in [(BackdropStyle::Solid,ColorScheme::Light),(BackdropStyle::Solid,ColorScheme::Dark),(BackdropStyle::Mica,ColorScheme::System),(BackdropStyle::Acrylic,ColorScheme::System)]{
++        for (backdrop,scheme) in [(BackdropStyle::Classic,ColorScheme::Light),(BackdropStyle::Classic,ColorScheme::Dark),(BackdropStyle::Mica,ColorScheme::System),(BackdropStyle::Acrylic,ColorScheme::System)]{
+             {let mut state=slot.borrow_mut();let state=state.as_mut().unwrap();state.session.ui.appearance.backdrop=backdrop;state.session.ui.appearance.color_scheme=scheme;state.apply_theme();state.theme_children();unsafe{state.resize();}}
+             pump(80);let mut actual=0i32;
+             let available=unsafe{windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(hwnd,windows::Win32::Graphics::Dwm::DWMWA_SYSTEMBACKDROP_TYPE,(&mut actual as*mut i32).cast(),4)}.is_ok();
+             if available{
+-                let expected=if !theme::transparency_available()||backdrop==BackdropStyle::Solid{1}else if backdrop==BackdropStyle::Acrylic{3}else{2};
++                let expected=if !theme::material_available()||backdrop==BackdropStyle::Classic{1}else if backdrop==BackdropStyle::Acrylic{3}else{2};
+                 ensure!(actual==expected,"DWM did not apply requested material: {backdrop:?} {actual}");
+-            }else{ensure!(!slot.borrow().as_ref().unwrap().mica,"unsupported system did not fall back to solid");}
++            }else{ensure!(!theme::material_available()&&!slot.borrow().as_ref().unwrap().material,"unsupported system did not fall back to the classic look");}
+             materials.push(serde_json::json!({"backdrop":backdrop,"color":scheme,"dwm_supported":available,"dwm_value":actual}));
+         }
+     }
+diff --git a/crates/zsdesk-app/src/window/mod.rs b/crates/zsdesk-app/src/window/mod.rs
+index 30b375c..38b6f78 100644
+--- a/crates/zsdesk-app/src/window/mod.rs
++++ b/crates/zsdesk-app/src/window/mod.rs
+@@ -382,7 +382,8 @@ struct WindowState {
+     surface: Option<Surface>,
+     palette: Palette,
+     dark: bool,
+-    mica: bool,
++    /// A system material (Mica/Acrylic) is showing through the chrome.
++    material: bool,
+     active: bool,
+     layout: ChromeLayout,
+     crumbs: Vec<Crumb>,
+@@ -448,7 +449,7 @@ impl WindowState {
+             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
+             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
+             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
+-            palette: Palette::light(), dark: false, mica: false, active: true, layout: ChromeLayout::default(),
++            palette: Palette::light(), dark: false, material: false, active: true, layout: ChromeLayout::default(),
+             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
+             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, drag_ghost: None,
+             splitter_drag: None,
+@@ -614,7 +615,7 @@ impl WindowState {
+         }
+         self.layout_crumbs();
+         self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel });
+-        let frame_height=if crate::edition::THEMED && self.mica {self.layout.browser.y}else{self.layout.strip.height};
++        let frame_height=if self.material {height}else{self.layout.strip.height};
+         theme::extend_frame(self.hwnd, if self.fullscreen_restore.is_some() { 0 } else { frame_height });
+     }
+ 
+@@ -677,17 +678,20 @@ impl WindowState {
+     }
+ 
+     /// Follows the system app mode for the chrome, DWM frame and Shell controls.
++    /// The material is every edition's setting; the colour scheme stays with the
++    /// themed edition.
+     fn apply_theme(&mut self) {
+-        let prefs=if crate::edition::THEMED {self.session.ui.appearance.clone()}
+-            else {zsdesk_core::model::explorer::AppearancePreferences::default()};
+-        self.dark = theme::configure_color_scheme(prefs.color_scheme);
++        let prefs = &self.session.ui.appearance;
++        let scheme = if crate::edition::THEMED { prefs.color_scheme }
++            else { zsdesk_core::model::explorer::ColorScheme::System };
++        self.dark = theme::configure_color_scheme(scheme);
+         self.palette = Palette::for_mode(if self.dark { Mode::Dark } else { Mode::Light });
+         theme::set_dark_frame(self.hwnd, self.dark);
+         theme::round_corners(self.hwnd, false);
+         theme::round_corners(self.tooltip, true);
+-        self.mica = theme::set_backdrop(self.hwnd, prefs.backdrop);
++        self.material = theme::set_backdrop(self.hwnd, prefs.backdrop);
+         unsafe {
+-            if self.mica { let _=SetPropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
++            if self.material { let _=SetPropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption"),Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
+             else { let _=RemovePropW(self.hwnd,windows::core::w!("ZSDesk.NativeCaption")); }
+         }
+         let (normal, focused, text) = (colorref(self.palette.input), colorref(self.palette.input_focused), colorref(self.palette.text));
+diff --git a/crates/zsdesk-app/src/window/navigation.rs b/crates/zsdesk-app/src/window/navigation.rs
+index 8530974..d5ebbc7 100644
+--- a/crates/zsdesk-app/src/window/navigation.rs
++++ b/crates/zsdesk-app/src/window/navigation.rs
+@@ -152,6 +152,8 @@ impl WindowState {
+                 if from_tree {unsafe {tree.adopt_location(&current);}} else {unsafe {tree.select_location_with_policy(&current,self.navigation_auto_expand());}}
+             }}
+             self.theme_children();
++            // The Shell view for the new folder is a fresh window; keep the
++            // material showing through it.
+             self.refresh_status();
+             if completed_request{if let ShellLocation::Search{query,..}=&current{self.start_fast_search(query);}}
+             self.relayout();self.position_children();
+diff --git a/crates/zsdesk-app/src/window/paint.rs b/crates/zsdesk-app/src/window/paint.rs
+index 3fe4aab..58c4dee 100644
+--- a/crates/zsdesk-app/src/window/paint.rs
++++ b/crates/zsdesk-app/src/window/paint.rs
+@@ -101,7 +101,7 @@ impl WindowState {
+     }
+ 
+     fn paint_chrome_layer(&self, cv: &Canvas, rect: RectF) {
+-        if crate::edition::THEMED && self.mica {
++        if self.material {
+             cv.clear_rect(rect);
+             cv.fill(rect, c(self.palette.layer).with_alpha(0.18));
+         } else { cv.fill(rect, c(self.palette.layer)); }
+@@ -115,7 +115,7 @@ impl WindowState {
+         cv.clear_rect(strip);
+         // Fullscreen has no extended DWM frame: transparent pixels otherwise
+         // become black and hide the dark caption glyphs.
+-        if !self.mica || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
++        if !self.material || window_actions::fullscreen(self.hwnd) { cv.fill(strip, if self.active { c(p.strip) } else { c(p.layer) }); }
+         // Application mark: far left of the title bar, above the strip tint.
+         if let Some(bitmap) = mark {
+             let rect = rf(self.layout.app_icon);
+@@ -368,7 +368,13 @@ impl WindowState {
+         cv.line(l.nav_row.x as f32, l.top as f32 - 0.5, l.nav_row.right() as f32, l.top as f32 - 0.5, c(p.divider), 1.0);
+         // Visible only around the native children (splitter, empty tree area while loading).
+         let content = LayoutRect::new(l.nav_row.x, l.top, l.nav_row.width, (l.status.y - l.top).max(0));
+-        cv.fill(rf(content), c(p.content));
++        if self.material && self.fullscreen_restore.is_none() {
++            // The panes carry the material themselves (translucent hosts), so the
++            // gaps between them must not be painted over with the opaque surface.
++            cv.clear_rect(rf(content));
++        } else {
++            cv.fill(rf(content), c(p.content));
++        }
+         if !l.splitter.is_empty() && (self.hover == Hit::Splitter || self.splitter_drag.is_some()) {
+             let x = l.splitter.x as f32 + l.splitter.width as f32 / 2.0;
+             cv.line(x, l.splitter.y as f32, x, l.splitter.bottom() as f32, c(p.divider), 1.0);
+diff --git a/crates/zsdesk-app/src/window/search_panel.rs b/crates/zsdesk-app/src/window/search_panel.rs
+index fc1fd97..bd07169 100644
+--- a/crates/zsdesk-app/src/window/search_panel.rs
++++ b/crates/zsdesk-app/src/window/search_panel.rs
+@@ -136,7 +136,7 @@ impl WindowState {
+         let card = rect(layout.card);
+         let outer = RectF::new(self.layout.nav_row.x as f32, self.layout.command_row.bottom() as f32,
+             self.layout.nav_row.width as f32, (self.layout.top - self.layout.command_row.bottom()).max(0) as f32);
+-        if crate::edition::THEMED && self.mica {
++        if self.material {
+             cv.clear_rect(outer);
+             cv.fill(outer, color(self.palette.layer).with_alpha(0.18));
+         } else { cv.fill(outer, color(self.palette.layer)); }
+diff --git a/crates/zsdesk-app/src/window/window_actions.rs b/crates/zsdesk-app/src/window/window_actions.rs
+index 12ad58a..18ccd55 100644
+--- a/crates/zsdesk-app/src/window/window_actions.rs
++++ b/crates/zsdesk-app/src/window/window_actions.rs
+@@ -118,6 +118,7 @@ impl WindowState {
+             self.show_message(format!("无法切换全屏：{error}"));
+         }
+         unsafe { self.resize(); }
++        // Fullscreen has no extended frame, so the panes go back to opaque.
+         self.remember_placement();self.save();
+         // Repaint native child panes after DWM changes the frame dimensions.
+         let _=unsafe{windows::Win32::Graphics::Gdi::RedrawWindow(Some(self.hwnd),None,None,
+diff --git a/crates/zsdesk-core/src/model/explorer.rs b/crates/zsdesk-core/src/model/explorer.rs
+index 82f3c2a..db2541a 100644
+--- a/crates/zsdesk-core/src/model/explorer.rs
++++ b/crates/zsdesk-core/src/model/explorer.rs
+@@ -301,9 +301,25 @@ pub enum SearchBackendPreference { Auto, NativeNtfs, DirectoryScan, #[default] E
+ #[serde(rename_all = "snake_case")]
+ pub enum ColorScheme { #[default] System, Light, Dark }
+ 
++/// Window background material of the Explorer chrome.
++///
++/// `Classic` is the only one every Windows version can render: ZSDesk paints
++/// every pixel itself. `Mica` and `Acrylic` are Windows 11 22H2+ DWM backdrops
++/// and fall back to `Classic` when the system cannot show them.
+ #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all = "snake_case")]
+-pub enum BackdropStyle { #[default] System, Solid, Mica, Acrylic }
++pub enum BackdropStyle {
++    /// Opaque, painted entirely by ZSDesk.
++    #[serde(alias = "solid")]
++    Classic,
++    /// Windows 11 Mica: the desktop wallpaper tinted through the window.
++    #[default]
++    Mica,
++    /// Windows 11 Acrylic: blurred desktop plus a noise grain.
++    Acrylic,
++    /// Value written by older profiles; the material follows the system.
++    System,
++}
+ 
+ #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+ #[serde(rename_all="snake_case")]
+diff --git a/crates/zsdesk-ui/src/menus.rs b/crates/zsdesk-ui/src/menus.rs
+index 93e1718..00e1e3b 100644
+--- a/crates/zsdesk-ui/src/menus.rs
++++ b/crates/zsdesk-ui/src/menus.rs
+@@ -255,9 +255,8 @@ pub fn apply_context_menu_setting(options: &mut ContextMenuPreferences, choice:
+ pub fn appearance_menu(preferences: &AppearancePreferences) -> MenuSpec {
+     menu(vec![
+         entry("亚克力", "appearance-acrylic", true, preferences.backdrop == BackdropStyle::Acrylic),
+-        entry("Mica", "appearance-mica", true, preferences.backdrop == BackdropStyle::Mica),
+-        entry("纯色浅色", "appearance-light", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Light),
+-        entry("纯色深色", "appearance-dark", true, preferences.backdrop == BackdropStyle::Solid && preferences.color_scheme == ColorScheme::Dark),
++        entry("云母", "appearance-mica", true, preferences.backdrop == BackdropStyle::Mica),
++        entry("经典", "appearance-classic", true, preferences.backdrop == BackdropStyle::Classic),
+         entry("跟随系统", "appearance-system", true, *preferences == AppearancePreferences::default()),
+         MenuItemSpec::Separator,
+         submenu("配色", vec![entry("系统", "appearance-color-system", true, preferences.color_scheme == ColorScheme::System),
+@@ -270,8 +269,10 @@ pub fn apply_appearance(preferences: &mut AppearancePreferences, choice: &str) -
+     match choice {
+         "appearance-acrylic" => preferences.backdrop = BackdropStyle::Acrylic,
+         "appearance-mica" => preferences.backdrop = BackdropStyle::Mica,
+-        "appearance-light" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Light; }
+-        "appearance-dark" => { preferences.backdrop = BackdropStyle::Solid; preferences.color_scheme = ColorScheme::Dark; }
++        // `appearance-solid` is the id older profiles and menus used for it.
++        "appearance-classic" | "appearance-solid" => preferences.backdrop = BackdropStyle::Classic,
++        "appearance-light" => { preferences.backdrop = BackdropStyle::Classic; preferences.color_scheme = ColorScheme::Light; }
++        "appearance-dark" => { preferences.backdrop = BackdropStyle::Classic; preferences.color_scheme = ColorScheme::Dark; }
+         "appearance-system" => *preferences = AppearancePreferences::default(),
+         "appearance-color-system" => preferences.color_scheme = ColorScheme::System,
+         "appearance-color-light" => preferences.color_scheme = ColorScheme::Light,
+diff --git a/crates/zsdesk-windows/src/theme.rs b/crates/zsdesk-windows/src/theme.rs
+index 59d6ffa..3e086f3 100644
+--- a/crates/zsdesk-windows/src/theme.rs
++++ b/crates/zsdesk-windows/src/theme.rs
+@@ -13,7 +13,7 @@ use windows::{
+         Graphics::Dwm::{DwmExtendFrameIntoClientArea, DwmGetWindowAttribute, DwmSetWindowAttribute,
+             DWMWA_CAPTION_BUTTON_BOUNDS, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMSBT_MAINWINDOW},
+         System::{LibraryLoader::{GetProcAddress, LoadLibraryW}, Registry::{RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ}},
+-        UI::{Controls::{SetWindowTheme, MARGINS}},
++        UI::Controls::{SetWindowTheme, MARGINS},
+     },
+ };
+ 
+@@ -96,13 +96,25 @@ pub fn transparency_available() -> bool {
+     enabled != 0
+ }
+ 
+-/// Uses supported DWM materials; unsupported or accessibility modes remain opaque.
++/// Whether this system can draw Windows 11 materials: 22H2+ with the
++/// transparency effects switch on (high contrast always wins over both).
++pub fn material_available() -> bool {
++    os_build() >= 22621 && !high_contrast() && transparency_available()
++}
++
++/// Uses supported DWM materials; unsupported or accessibility modes remain
++/// opaque. Returns whether the window now shows a system material, which is
++/// also when the chrome may leave pixels transparent.
+ pub fn set_backdrop(hwnd: HWND, style: zsdesk_core::model::explorer::BackdropStyle) -> bool {
+     use zsdesk_core::model::explorer::BackdropStyle;
++    // DWMSBT_NONE / DWMSBT_MAINWINDOW (Mica) / DWMSBT_TRANSIENTWINDOW (Acrylic).
+     if os_build() < 22621 || hwnd.0.is_null() { return false; }
+-    let value = if !transparency_available() { 1i32 } else { match style {
+-        BackdropStyle::Solid => 1, BackdropStyle::System | BackdropStyle::Mica => 2, BackdropStyle::Acrylic => 3,
+-    }};
++    let wanted = match style {
++        BackdropStyle::Classic => 1,
++        BackdropStyle::System | BackdropStyle::Mica => 2,
++        BackdropStyle::Acrylic => 3,
++    };
++    let value = if material_available() { wanted } else { 1 };
+     let mut current = 0i32;
+     if unsafe { DwmGetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&mut current as *mut i32).cast(), 4) }.is_ok() && current == value {
+         return value != 1;
