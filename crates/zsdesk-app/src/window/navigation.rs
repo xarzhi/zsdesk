@@ -1,5 +1,22 @@
 use super::*;
 
+/// A "show this item in its folder" request. The folder reports that it
+/// finished navigating before a large folder has enumerated its items, and
+/// selecting an item the view does not hold yet does nothing at all — no
+/// highlight and no scrolling. The request is therefore confirmed against the
+/// view and retried on a timer instead of being applied once and dropped.
+pub(super) struct PendingReveal {
+    folder: Option<std::path::PathBuf>,
+    names: Vec<std::ffi::OsString>,
+    tries: u8,
+    deadline: std::time::Instant,
+}
+const REVEAL_TRIES:u8=20;
+const REVEAL_INTERVAL_MS:u32=100;
+/// Waiting for a navigation to finish does not consume an attempt, so the
+/// deadline keeps a stuck folder from retrying forever.
+const REVEAL_TIMEOUT:std::time::Duration=std::time::Duration::from_secs(4);
+
 #[derive(Clone)]
 pub(super) struct NavigationRequest {
     pub tab:ExplorerTab,
@@ -13,6 +30,41 @@ impl WindowState {
     pub(super) fn navigation_auto_expand(&self)->bool {
         self.session.ui.navigation_auto_expand.unwrap_or_else(NamespaceTreeHost::system_auto_expand)
     }
+    /// Selects an item of the folder that is on screen and scrolls it into
+    /// view, retrying while the view is still enumerating.
+    pub(super) fn reveal_items(&mut self, names: Vec<std::ffi::OsString>) {
+        if names.is_empty() { return; }
+        let folder=self.current_location().as_path().map(std::path::Path::to_path_buf);
+        self.launch_selection=None;
+        self.launch_selections.clear();
+        self.reveal=Some(PendingReveal{folder,names,tries:0,deadline:std::time::Instant::now()+REVEAL_TIMEOUT});
+        self.poll_reveal();
+    }
+    pub(super) fn poll_reveal(&mut self) {
+        let Some(mut pending)=self.reveal.take() else {return;};
+        // The user may have moved on; a stale request must not pull another
+        // folder's selection around.
+        let current=self.current_location().as_path().map(std::path::Path::to_path_buf);
+        let same= match (pending.folder.as_deref(),current.as_deref()) {
+            (Some(folder),Some(current))=>crate::explorer_forwarder::same_path(current,folder),
+            (None,None)=>true,
+            _=>false,
+        };
+        if !same {let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};return;}
+        // The view that will hold the items does not exist until the folder
+        // finishes navigating; wait for it instead of selecting into the old one.
+        if self.pending.is_some()||self.queued.is_some()||self.browser.is_none() {
+            if std::time::Instant::now()<pending.deadline {self.reveal=Some(pending);unsafe {SetTimer(Some(self.hwnd),TIMER_REVEAL,REVEAL_INTERVAL_MS,None)};}
+            return;
+        }
+        let confirmed=self.browser.as_ref().is_some_and(|browser|browser.reveal_children(&pending.names).unwrap_or(false));
+        if confirmed {let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};return;}
+        pending.tries=pending.tries.saturating_add(1);
+        if pending.tries<REVEAL_TRIES&&std::time::Instant::now()<pending.deadline {
+            self.reveal=Some(pending);unsafe {SetTimer(Some(self.hwnd),TIMER_REVEAL,REVEAL_INTERVAL_MS,None)};
+        }
+        else {let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};self.show_message("无法定位到该项目，文件夹可能已改变".into());}
+    }
     pub(super) unsafe fn open_requested(&mut self,request:crate::instance::OpenRequest){
         // A login start leaves its window hidden. The first folder that arrives
         // is what the user asked for, so this window takes it over: otherwise
@@ -20,13 +72,21 @@ impl WindowState {
         // would be a second one.
         if self.silent {
             self.silent=false;
-            self.launch_selection=request.selection.clone();
-            self.launch_selections=request.selections.clone();
             if self.session.ui.open_mode.single_tab() {
                 self.session.tabs.truncate(1);
                 self.session.active_tab=0;
             }
             unsafe {crate::instance::activate(self.hwnd);}
+            // A restored session often already shows the requested folder.
+            // Navigating to the folder it is on is refused by the tab, so
+            // asking for a navigation here would silently drop the selection.
+            if self.session.active_tab().current()==&request.location {
+                let names=revealed_names(request);
+                unsafe {self.reveal_items(names);}
+                return;
+            }
+            self.launch_selection=request.selection;
+            self.launch_selections=request.selections;
             unsafe {self.navigate_to(request.location);}
             return;
         }
@@ -36,8 +96,9 @@ impl WindowState {
         }
         let index=self.session.tabs.iter().position(|t|t.current()==&request.location);
         if index==Some(self.session.active_tab){
-            if !request.selections.is_empty(){if let Some(browser)=&self.browser{let _=browser.select_children(&request.selections);}return;}
-            if let (Some(browser),Some(name))=(&self.browser,request.selection){let _=browser.select_child(&name);}
+            unsafe {crate::instance::activate(self.hwnd);}
+            let names=revealed_names(request);
+            unsafe {self.reveal_items(names);}
             return;
         }
         if self.session.ui.open_mode.single_tab() {
@@ -145,10 +206,9 @@ impl WindowState {
                     if let (Some(browser),Some(view))=(&self.browser,&self.session.tabs[index].view) {
                         unsafe {browser.restore_view(view);}
                     }
-                    if let (Some(browser),Some(name))=(&self.browser,self.launch_selection.take()) {
-                        if let Err(e)=browser.select_child(&name) {self.show_message(format!("无法选中项目：{e}"));}
-                    }
-                    if !self.launch_selections.is_empty(){if let Some(browser)=&self.browser{if let Err(e)=browser.select_children(&self.launch_selections){self.show_message(format!("无法选中项目：{e}"));}}self.launch_selections.clear();}
+                    let names=if self.launch_selections.is_empty(){std::mem::take(&mut self.launch_selection).into_iter().collect()}
+                        else {std::mem::take(&mut self.launch_selections)};
+                    unsafe {self.reveal_items(names);}
                 }
             } else {self.shown_tab=None;}
         } else if let Some(id)=self.shown_tab {
@@ -179,6 +239,8 @@ impl WindowState {
         self.cancel_fast_search();self.browser_role=BrowserRole::Ordinary;
         self.launch_selection=None;
         self.launch_selections.clear();
+        self.reveal=None;
+        let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};
         let failed=self.pending.take().map(|p|p.tab.current().address()).unwrap_or_default();
         self.show_message(format!("无法打开：{failed}"));
         if self.queued.is_none() {
@@ -400,6 +462,12 @@ pub(super) fn sftp_to_unc(text:&str)->Option<PathBuf> {
     Some(PathBuf::from(target))
 }
 
+/// Items an open request asks to select: a multi-selection wins over the single
+/// name a launch argument carries.
+fn revealed_names(request:crate::instance::OpenRequest)->Vec<std::ffi::OsString>{
+    if request.selections.is_empty() {request.selection.into_iter().collect()}
+    else {request.selections}
+}
 fn strip_scheme<'a>(text:&'a str,schemes:&[&str])->Option<&'a str> {
     schemes.iter().find_map(|s| (text.len()>=s.len() && text[..s.len()].eq_ignore_ascii_case(s)).then(||&text[s.len()..]))
 }
@@ -416,6 +484,15 @@ pub(super) fn window_text(hwnd:HWND)->String {
 }
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn a_reveal_request_prefers_the_named_items() {
+        use crate::instance::OpenRequest;
+        let many=revealed_names(OpenRequest{location:ShellLocation::ThisPc,selection:Some("a.txt".into()),
+            selections:vec!["b.txt".into(),"c.txt".into()]});
+        assert_eq!(many,vec![std::ffi::OsString::from("b.txt"),std::ffi::OsString::from("c.txt")]);
+        let one=revealed_names(OpenRequest{location:ShellLocation::ThisPc,selection:Some("a.txt".into()),selections:Vec::new()});
+        assert_eq!(one,vec![std::ffi::OsString::from("a.txt")]);
+        assert!(revealed_names(OpenRequest{location:ShellLocation::ThisPc,selection:None,selections:Vec::new()}).is_empty());
+    }
     #[test] fn address_accepts_shell_unc_and_quoted_paths_without_io() {
         assert_eq!(parse_address("  此电脑 "),Some(ShellLocation::ThisPc));
         assert_eq!(parse_address("\"D:\\not-yet-mounted\\folder\""),Some(ShellLocation::Path(PathBuf::from("D:\\not-yet-mounted\\folder"))));

@@ -25,8 +25,28 @@ impl Snapshot{
     /// Navigation roots that are forwarded as a whole location instead of a
     /// file-system folder.
     fn special(&self)->bool{self.this_pc||self.recycle}
+    /// Explorer shows its start location first and navigates afterwards, so an
+    /// early snapshot can pair a folder with selected items that live somewhere
+    /// else. Such a state must not be forwarded: it would open the wrong folder.
+    fn consistent(&self)->bool{
+        if self.special(){return self.selected.is_empty();}
+        self.folder.is_absolute()&&self.selected.iter().all(|item|item.parent().is_some_and(|parent|same_path(parent,&self.folder)))
+    }
     fn equivalent(&self,other:&Self)->bool{self.window==other.window&&self.pid==other.pid&&self.this_pc==other.this_pc&&self.recycle==other.recycle&&same_path(&self.folder,&other.folder)
         && self.selected.len()==other.selected.len()&&self.selected.iter().all(|a|other.selected.iter().any(|b|same_path(a,b)))}
+    /// Reads the window again through its own browser object. Enumerating
+    /// `IShellWindows` can report a window twice while Explorer navigates, and
+    /// that duplicate used to make a settled window look like a changed one.
+    fn refresh(&self)->Option<Self>{
+        let view=unsafe{self.browser.Document().ok()?}.cast::<IShellFolderViewDual>().ok()?;
+        let folder=unsafe{view.Folder().ok()?}.cast::<Folder2>().ok()?;
+        let folder=PathBuf::from(unsafe{folder.Self_().ok()?.Path().ok()?}.to_string());
+        let items=unsafe{view.SelectedItems().ok()?};let count=unsafe{items.Count().ok()?};
+        if !(0..=128).contains(&count){return None;}
+        let mut selected=Vec::with_capacity(count as usize);
+        for i in 0..count{selected.push(PathBuf::from(unsafe{items.Item(&VARIANT::from(i)).ok()?.Path().ok()?}.to_string()));}
+        Some(Self{window:self.window,pid:self.pid,folder,selected,browser:self.browser.clone(),this_pc:self.this_pc,recycle:self.recycle})
+    }
 }
 fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{
     let mut result=Vec::new();let mut counts=HashMap::new();
@@ -52,7 +72,22 @@ fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{
             let recycle=folder.to_string_lossy().eq_ignore_ascii_case(zsdesk_core::model::explorer::RECYCLE_BIN_ADDRESS);
             Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc,recycle})
         })();
-        if let Ok(snapshot)=snapshot{if (snapshot.special()&&snapshot.selected.is_empty())||(snapshot.folder.is_absolute()&&snapshot.selected.iter().all(|p|p.parent().is_some_and(|parent|same_path(parent,&snapshot.folder)))){result.push(snapshot);}}
+        // A window mid-navigation may pair a start folder with unrelated
+        // selected items. Keep it and let the forwarding loop wait until it
+        // settles instead of dropping the window and handing it back to Explorer.
+        if let Ok(mut snapshot)=snapshot{
+            // Explorer sometimes leaves the start folder in place while the
+            // requested item is already selected (the `/select` hand-off).
+            // The item's own folder is the location the caller asked for, so
+            // forward that instead of opening an unrelated folder.
+            if !snapshot.special()&&!snapshot.consistent()&&!snapshot.selected.is_empty(){
+                let parent=snapshot.selected[0].parent().map(Path::to_path_buf);
+                if let Some(parent)=parent{
+                    if snapshot.selected.iter().all(|item|item.parent().is_some_and(|path|same_path(path,&parent))){snapshot.folder=parent;}
+                }
+            }
+            if snapshot.special()||snapshot.folder.is_absolute(){result.push(snapshot);}
+        }
     }
     result.retain(|snapshot|counts.get(&(snapshot.window.0 as isize))==Some(&1));Ok(result)
 }
@@ -103,11 +138,33 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
         if let Some(confirmed)=profile_windows(profile).into_iter().find(|window|send(*window,verify,confirmation)){break confirmed;}
         ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(15));
     };
-    // A fresh snapshot prevents closing a window the user has already navigated
+    // Explorer can apply the requested selection a moment after the window is
+    // created. The folder is already open, so wait briefly and forward the
+    // selection as a follow-up; otherwise a late `/select` would be lost when
+    // the system window closes and the item would never be highlighted.
+    if !snapshot.special()&&snapshot.selected.is_empty(){
+        for _ in 0..5{
+            thread::sleep(Duration::from_millis(40));
+            let Some(current)=snapshot.refresh()else{break;};
+            if current.selected.is_empty()||!current.consistent(){continue;}
+            if let Some(follow_up)=crate::reveal::encode(&current.folder,&current.selected){let _=send(target,crate::reveal::COPYDATA_TAG,&follow_up);}
+            break;
+        }
+    }
+    // A fresh read prevents closing a window the user has already navigated
     // elsewhere, turned into multiple tabs, or placed behind a modal dialog.
-    let shell:IShellWindows=unsafe{CoCreateInstance(&ShellWindows,None,CLSCTX_LOCAL_SERVER)}?;
-    let latest=windows(&shell)?.into_iter().find(|item|item.window==snapshot.window).context("来源窗口状态已改变")?;
-    ensure!(snapshot.equivalent(&latest)&&unsafe{IsWindowEnabled(snapshot.window)}.as_bool(),"来源窗口已改变，保留系统窗口");
+    // A concealed window keeps navigating after it is hidden, so a folder that
+    // moved on its own is not user intent: only a visible window must still
+    // match the state that was forwarded.
+    let hidden=!unsafe{IsWindowVisible(snapshot.window)}.as_bool();
+    let mut settled=None;
+    for _ in 0..6{
+        if let Some(latest)=snapshot.refresh(){settled=Some(latest);break;}
+        thread::sleep(Duration::from_millis(60));
+    }
+    let latest=settled.context("来源窗口状态已改变")?;
+    ensure!(unsafe{IsWindowEnabled(snapshot.window)}.as_bool(),"来源窗口已改变，保留系统窗口");
+    ensure!(hidden||snapshot.equivalent(&latest),"来源窗口已改变，保留系统窗口");
     let foreground=unsafe{GetForegroundWindow()}==snapshot.window;
     if foreground{crate::instance::request_activation(target);}
     unsafe{snapshot.browser.Quit()}?;Ok(())
@@ -262,6 +319,12 @@ impl Bridge{
                                 let hidden=concealed.contains(&key);
                                 if baseline.contains(&key)||(!hidden&&!unsafe{IsWindowVisible(snapshot.window)}.as_bool())||!unsafe{IsWindowEnabled(snapshot.window)}.as_bool(){continue;}
                                 if snapshot.recycle&&!recycle_allowed{continue;}
+                                // Explorer resolves `explorer.exe /select` in two
+                                // steps: a window is created at the start folder
+                                // and only then navigates to the requested one.
+                                // Forwarding the first state would open the wrong
+                                // folder, so wait for a settled pair.
+                                if !snapshot.consistent(){candidates.remove(&key);continue;}
                                 let settle=if hidden{Duration::from_millis(40)}else{Duration::from_millis(600)};
                                 match candidates.get(&key){
                                     Some((old,at)) if old.equivalent(&snapshot)&&at.elapsed()>=settle=>{

@@ -87,6 +87,9 @@ const TIMER_FAST_SEARCH:usize=4;
 const TIMER_PLACEMENT:usize=9;
 /// Coalesces session writes while the user opens or closes tree branches.
 const TIMER_TREE_STATE:usize=10;
+/// Retries a "show this item in its folder" request while the view is still
+/// enumerating, so the item ends up selected and scrolled into view.
+const TIMER_REVEAL:usize=11;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
 type Slot = RefCell<Option<WindowState>>;
@@ -421,6 +424,8 @@ struct WindowState {
     status: String,
     launch_selection: Option<std::ffi::OsString>,
     launch_selections: Vec<std::ffi::OsString>,
+    /// Pending "show this item" request, retried until the view confirms it.
+    reveal: Option<navigation::PendingReveal>,
     open_requests: std::collections::VecDeque<crate::instance::OpenRequest>,
     /// Folder the current search started from, and the results location it produced.
     search_scope: Option<ShellLocation>,
@@ -462,7 +467,7 @@ impl WindowState {
             icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(),
             drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
             pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
-            launch_selection, launch_selections:Vec::new(), open_requests: Default::default(), search_scope: None, search_result: None,
+            launch_selection, launch_selections:Vec::new(), reveal:None, open_requests: Default::default(), search_scope: None, search_result: None,
             browser_role:BrowserRole::Fresh,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
             fast_reset_pending:false,fast_clearing:None,fast_restore:None,
             search_settings_job:None,
@@ -1297,6 +1302,7 @@ impl WindowState {
                     if let Some(tree) = &self.tree { self.session.ui.tree_expanded = tree.expanded(); }
                     self.save();
                 }
+                if wp.0 == TIMER_REVEAL { self.poll_reveal(); }
             }
             WM_MOUSEMOVE => self.mouse_move(point(), wp.0),
             WM_MOUSELEAVE => {

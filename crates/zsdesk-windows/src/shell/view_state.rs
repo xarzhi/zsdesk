@@ -21,6 +21,37 @@ impl ExplorerBrowserHost {
         }
         Ok(())
     }
+    /// Selects `names` in the current view, scrolls the first one into view and
+    /// reports whether the view actually holds that selection afterwards.
+    ///
+    /// A folder is navigated to before its items exist in the view: a large
+    /// folder keeps enumerating after the navigation notification, and
+    /// `SelectItem` for an item that is not in the view yet silently does
+    /// nothing. Callers use the answer to retry on a timer instead of losing
+    /// the request, which is what "show in folder" from a browser hits.
+    pub fn reveal_children(&self,names:&[std::ffi::OsString])->windows::core::Result<bool>{
+        use std::os::windows::ffi::OsStrExt;
+        use windows::{core::PCWSTR,Win32::{Foundation::HWND,System::Com::CoTaskMemFree,UI::Shell::IShellFolder}};
+        let names:Vec<_>=names.iter().take(128).collect();
+        if names.is_empty(){return Ok(true);}
+        let shell=unsafe {self.current_view()?};
+        let view:IFolderView2=shell.cast()?;
+        let folder:IShellFolder=unsafe {view.GetFolder()?};
+        let mut pidls=Vec::with_capacity(names.len());
+        for name in &names{
+            let name:Vec<u16>=name.encode_wide().chain(Some(0)).collect();let mut pidl=std::ptr::null_mut();
+            let parsed=unsafe {folder.ParseDisplayName(HWND::default(),None,PCWSTR(name.as_ptr()),None,&mut pidl,std::ptr::null_mut())};
+            if parsed.is_ok()&&!pidl.is_null(){pidls.push(pidl);}
+        }
+        let mut applied=false;
+        for (index,pidl) in pidls.iter().enumerate(){
+            let flags=SVSI_SELECT.0|if index==0{SVSI_DESELECTOTHERS.0|SVSI_FOCUSED.0|SVSI_ENSUREVISIBLE.0}else{0};
+            applied|=unsafe {shell.SelectItem(*pidl,flags as u32)}.is_ok();
+        }
+        for pidl in pidls{unsafe {CoTaskMemFree(Some(pidl.cast()))};}
+        if !applied{return Ok(false);}
+        Ok(unsafe {selected_count(&view)}==names.len())
+    }
     pub fn select_child(&self, name:&std::ffi::OsStr) -> windows::core::Result<()> {
         use std::os::windows::ffi::OsStrExt;
         use windows::{core::PCWSTR,Win32::{Foundation::HWND,UI::Shell::IShellFolder}};
@@ -222,6 +253,21 @@ fn restore_layout(shell:&IShellView,view:&IFolderView2,state:&ShellViewState) {
     }
 }
 
+/// Selected items the view reports right now. Only a confirmation bound: the
+/// caller compares it with the number of items it asked for.
+unsafe fn selected_count(view:&IFolderView2)->usize {
+    let Ok(items)=(unsafe {view.Items::<IEnumIDList>(SVGIO_SELECTION)}) else {return 0;};
+    let mut count=0;
+    for _ in 0..256 {
+        let mut pointers=[std::ptr::null_mut()];let mut fetched=0;
+        let status=unsafe {items.Next(&mut pointers,Some(&mut fetched))};
+        if status.is_err() || fetched!=1 {break;}
+        unsafe {CoTaskMemFree(Some(pointers[0].cast()))};
+        count+=1;
+        if status!=HRESULT(0) {break;}
+    }
+    count
+}
 unsafe fn item_bytes(view:&IFolderView2,index:i32)->Option<Vec<u8>> {
     let pointer: *mut ITEMIDLIST=unsafe {view.Item(index).ok()?};
     unsafe {take_item_bytes(pointer)}
