@@ -20,8 +20,16 @@ pub(super) fn view_preset(number: u8) -> Option<(i32, i32)> {
     })
 }
 
-pub(super) fn next_icon_size(size: i32, increase: bool) -> i32 {
-    const SIZES: [i32; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
+/// The drawn list's name for the preset the Shell numbers 1..8, so Ctrl+Shift+N
+/// changes the layout the same way it changes the Shell view mode.
+pub(super) fn preset_layout(number: u8) -> Option<&'static str> {
+    Some(match number {
+        1 => "xl", 2 => "large", 3 => "medium", 4 => "small",
+        5 => "list", 6 => "details", 7 => "tiles", 8 => "content", _ => return None,
+    })
+}
+
+pub(super) fn next_icon_size(size: i32, increase: bool) -> i32 {    const SIZES: [i32; 9] = [16, 24, 32, 48, 64, 96, 128, 192, 256];
     if increase { SIZES.into_iter().find(|value| *value > size).unwrap_or(256) }
     else { SIZES.into_iter().rev().find(|value| *value < size).unwrap_or(16) }
 }
@@ -37,6 +45,24 @@ impl WindowState {
         }
     }
     pub(super) fn zoom_view(&mut self, increase: bool) {
+        // The drawn list zooms its own icons: Ctrl+wheel must not ask the
+        // invisible Shell view, which would leave the rows exactly as they are.
+        if self.custom_view {
+            let size = match self.file_view.layout() {
+                file_view::Layout::Icons { icon, .. } => icon as i32,
+                file_view::Layout::Content => 32,
+                file_view::Layout::Details | file_view::Layout::Listing => 48,
+            };
+            let id = match next_icon_size(size, increase) {
+                ..=24 => "small",
+                ..=34 => "content",
+                ..=56 => "medium",
+                ..=80 => "large",
+                _ => "xl",
+            };
+            self.choose_view(id);
+            return;
+        }
         let Some((_, size)) = self.browser.as_ref().and_then(|browser| browser.view_mode()) else { return; };
         self.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0, next_icon_size(size, increase));
     }

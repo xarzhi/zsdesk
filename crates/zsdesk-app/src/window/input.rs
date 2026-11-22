@@ -8,7 +8,7 @@ impl WindowState {
         unsafe { self.update_address(); }
     }
 
-    pub(super) unsafe fn action(&mut self, id: usize, _value: isize) {
+    pub(super) unsafe fn action(&mut self, id: usize, value: isize) {
         match id {
             ACTION_COMMIT_ADDRESS => unsafe { self.commit_address() },
             ACTION_CANCEL_ADDRESS => { self.end_address_edit(); self.focus_view(); }
@@ -16,13 +16,19 @@ impl WindowState {
             ACTION_COMMIT_RENAME => unsafe { if !self.commit_view_rename() { self.commit_bookmark_rename() } },
             ACTION_CANCEL_RENAME => unsafe { if !self.cancel_view_rename() { self.cancel_rename() } },
             ACTION_VIEW_RENAME => unsafe { if let Some(index) = self.file_view.focus() { self.begin_view_rename(index) } },
+            // The pane's menu commits a rename the Shell would have started on
+            // the hidden view: the row the user right-clicked is the selection.
+            ACTION_TREE_RENAME => unsafe { if let Some(index) = self.nav_tree.selection { self.begin_tree_rename(index) } },
             ACTION_VIEW_COMMIT => unsafe { self.commit_view_rename(); },
             ACTION_VIEW_CANCEL => unsafe { self.cancel_view_rename(); },
             ACTION_SEARCH => unsafe { self.search() },
             ACTION_SEARCH_PAGE => unsafe { self.request_integrated_search(false) },
             ACTION_CLOSE_SEARCH => unsafe { self.close_integrated_search() },
             ACTION_SEARCH_SETTINGS => unsafe { self.search_settings_menu() },
+            ACTION_EMPTY_RECYCLE_DONE => unsafe { self.empty_recycle_bin_finished(value) },
             ACTION_FOCUS_VIEW => { self.end_address_edit(); self.focus_view(); }
+            // The target applied a move: the rows on disk are gone from here.
+            ACTION_AFTER_DRAG => unsafe { self.execute(Command::Refresh) },
             _ => if let Some(command) = Command::from_id(id as u16) { unsafe { self.execute(command); } },
         }
     }
@@ -53,6 +59,10 @@ impl WindowState {
             Command::Up => unsafe { self.go_up() },
             Command::FocusAddress => unsafe { self.focus_address() },
             Command::Refresh => unsafe {
+                // 刷新 also re-reads the pinned quick-access folders: the pane
+                // is built from the Shell namespace, and a pin made in another
+                // window would otherwise stay invisible until a restart.
+                self.refresh_nav_tree();
                 if matches!(self.current_location(), ShellLocation::Search { .. }) {
                     self.cancel_fast_search();
                     self.request_integrated_search(false);
@@ -72,8 +82,12 @@ impl WindowState {
             Command::FocusPrevious => self.cycle_focus(true),
             Command::ZoomIn => self.zoom_view(true),
             Command::ZoomOut => self.zoom_view(false),
-            Command::ResetZoom => self.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,48),
-            Command::ViewPreset(number) => if let Some((mode,size))=super::window_actions::view_preset(number) {self.set_view_dimensions(mode,size);},
+            Command::ResetZoom => if self.custom_view { self.choose_view("medium") } else { self.set_view_dimensions(windows::Win32::UI::Shell::FVM_ICON.0,48) },
+            Command::ViewPreset(number) => {
+                if self.custom_view {
+                    if let Some(id)=super::window_actions::preset_layout(number) { self.choose_view(id); }
+                } else if let Some((mode,size))=super::window_actions::view_preset(number) {self.set_view_dimensions(mode,size);}
+            },
         }
     }
 
@@ -86,6 +100,10 @@ impl WindowState {
         // A verb changed the folder (copy, delete, new folder…): re-read it so
         // the painted rows match the Shell view again.
         if ran { self.reload_file_view(); }
+        // 固定到快速访问 / 从快速访问取消固定 is carried out by the Shell on its
+        // own thread and can land after the menu returns, so the pane is read
+        // again a moment later instead of only once.
+        if ran { unsafe { SetTimer(Some(self.hwnd), super::TIMER_NAV_REFRESH, 600, None) }; }
         self.refresh_status();
     }
 
@@ -184,6 +202,19 @@ impl WindowState {
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut track) }.is_ok();
         }
         if self.drag_edit_selection(p) { return; }
+        // A held row press turns into a Shell drag once the pointer moves far
+        // enough: the drawn list has no Shell view behind it to start one.
+        if self.view_press.is_some() {
+            if unsafe { GetKeyState(VK_LBUTTON.0 as i32) } < 0 {
+                if self.drag_view(p) { return; }
+            } else {
+                self.view_press = None;
+                if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
+            }
+        }
+        // A column boundary owns the pointer while it is held, exactly like
+        // the scrollbar thumb: both keep following it outside the pane.
+        if self.view_drag_divider(p) { return; }
         // The scrollbar thumb follows the pointer even outside the pane, which
         // is what makes a long list draggable at all.
         if self.view_drag_bar(p) { return; }
@@ -280,8 +311,15 @@ impl WindowState {
 
     pub(super) fn mouse_up(&mut self, p: POINT) {
         let pressed = self.pressed.take();
+        // A press that never left its row is a plain click, and stops being a
+        // candidate for a drag here.
+        self.view_press = None;
         let had_capture = unsafe { GetCapture() } == self.hwnd;
         if self.end_edit_drag() {
+            if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            return;
+        }
+        if self.end_view_drag_divider() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
             return;
         }
@@ -323,8 +361,8 @@ impl WindowState {
             Hit::Command(id) => unsafe { self.command(id) },
             Hit::Bookmark(i) => unsafe { self.open_bookmark(i, ctrl) },
             Hit::BookmarkOverflow => unsafe { self.bookmarks_overflow() },
-            Hit::StatusDetails => self.set_view(menus::view_choice("details")),
-            Hit::StatusTiles => self.set_view(menus::view_choice("large")),
+            Hit::StatusDetails => if self.custom_view { self.choose_view("details") } else { self.set_view(menus::view_choice("details")) },
+            Hit::StatusTiles => if self.custom_view { self.choose_view("large") } else { self.set_view(menus::view_choice("large")) },
             _ => {}
         }
     }
@@ -453,7 +491,17 @@ impl WindowState {
 
     pub(super) fn right_click(&mut self, p: POINT) {
         if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
-            // The tree has no verbs of its own; leave the system menu closed.
+            // A row hands its identity to the Shell, which builds the menu
+            // Explorer shows in its own pane (固定到快速访问, 管理, 格式化为 …).
+            // Right-clicking a row selects it without navigating, and empty
+            // space inside the pane keeps the old behaviour of no menu.
+            match self.tree_hit(p) {
+                nav_tree::NavHit::Row(index) | nav_tree::NavHit::Chevron(index) => {
+                    let _ = unsafe { SetFocus(Some(self.hwnd)) };
+                    unsafe { self.tree_context_menu(p, index) };
+                }
+                nav_tree::NavHit::Empty => {}
+            }
             return;
         }
         if self.custom_view && self.view_hit(p).is_some() {
@@ -530,9 +578,9 @@ impl WindowState {
                 let result = self.browser.as_ref().map(|b| b.show_new_menu(hwnd, point));
                 self.shell_result(result);
             }
-            CommandId::Cut => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "cut", false)); self.shell_result(r); }
-            CommandId::Copy => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "copy", false)); self.shell_result(r); }
-            CommandId::Paste => { let r = self.browser.as_ref().map(|b| b.invoke_background(hwnd, "paste")); self.shell_result(r); }
+            CommandId::Cut => { if !self.search_shortcut(keyboard::FileShortcut::Cut) { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "cut", false)); self.shell_result(r); } }
+            CommandId::Copy => { if !self.search_shortcut(keyboard::FileShortcut::Copy) { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "copy", false)); self.shell_result(r); } }
+            CommandId::Paste => { if !self.search_shortcut(keyboard::FileShortcut::Paste) { let r = self.browser.as_ref().map(|b| b.invoke_background(hwnd, "paste")); self.shell_result(r); } }
             CommandId::Rename => {
                 if self.custom_view {
                     if let Some(index) = self.file_view.focus() { unsafe { self.begin_view_rename(index); } }
@@ -542,7 +590,7 @@ impl WindowState {
                 }
             }
             CommandId::Share => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "Windows.ModernShare", false)); self.shell_result(r); }
-            CommandId::Delete => { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "delete", shift)); self.shell_result(r); }
+            CommandId::Delete => { if !self.search_shortcut(keyboard::FileShortcut::Delete { permanent: shift }) { let r = self.browser.as_ref().map(|b| b.invoke_selection(hwnd, "delete", shift)); self.shell_result(r); } }
             CommandId::Sort => unsafe {
                 if matches!(self.current_location(), ShellLocation::Search { .. }) {
                     self.search_panel_action(SearchPanelHit::Sort);
@@ -557,16 +605,63 @@ impl WindowState {
         self.focus_view();
     }
 
-    /// Empties the Recycle Bin from the command bar. Windows asks for a
-    /// confirmation first, so a stray click cannot destroy anything.
+    /// Empties the Recycle Bin from the command bar.
+    ///
+    /// The confirmation stays — the bin is the last stop before the files are
+    /// gone — but it is asked here instead of by the Shell, because the Shell's
+    /// own path keeps the caller busy for the whole deletion: its progress
+    /// window, its sound and its per-item enumeration all run on the thread
+    /// that asked, which is the thread that paints this window. So the click
+    /// asks, and a worker does the emptying with `NOPROGRESSUI | NOSOUND`,
+    /// leaving the window responsive and reporting back through
+    /// `ACTION_EMPTY_RECYCLE_DONE`.
     unsafe fn empty_recycle_bin(&mut self) {
         use windows::Win32::UI::Shell::SHEmptyRecycleBinW;
-        // No flags: the system keeps its confirmation, progress and sound.
-        match unsafe { SHEmptyRecycleBinW(Some(self.hwnd), PCWSTR::null(), 0) } {
-            Ok(()) => unsafe { self.execute(Command::Refresh) },
-            // 0x800704C7 = ERROR_CANCELLED: the user dismissed the confirmation.
-            Err(error) if error.code().0 == 0x8007_04C7u32 as i32 => {}
-            Err(error) => self.show_message(format!("无法清空回收站：{error}")),
+        if self.empty_bin_running { return; }
+        let question = wide("清空回收站？\n\n回收站里的所有项目都会被永久删除，无法撤销。");
+        let title = wide("清空回收站");
+        let answer = unsafe {
+            MessageBoxW(Some(self.hwnd), pcwstr(&question), PCWSTR(title.as_ptr()),
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2)
+        };
+        if answer != IDYES { return; }
+        // NOCONFIRMATION: already asked. NOPROGRESSUI | NOSOUND: the two things
+        // that made a fast deletion feel slow.
+        const FLAGS: u32 = 0x1 | 0x2 | 0x4;
+        self.empty_bin_running = true;
+        self.show_message("正在清空回收站…".to_owned());
+        let window = self.hwnd.0 as isize;
+        let spawned = std::thread::Builder::new().name("zsdesk-empty-bin".to_owned()).spawn(move || {
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+            let hwnd = HWND(window as *mut _);
+            let result = unsafe {
+                let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+                let result = SHEmptyRecycleBinW(Some(hwnd), PCWSTR::null(), FLAGS);
+                if initialized { CoUninitialize(); }
+                result
+            };
+            let code = match result { Ok(()) => 0isize, Err(error) => error.code().0 as isize };
+            // The window may be gone by now; posting is still the safe way back.
+            post(hwnd, WM_ACTION, ACTION_EMPTY_RECYCLE_DONE, code);
+        });
+        if spawned.is_err() {
+            // No worker thread: empty it here rather than do nothing at all.
+            let code = match unsafe { SHEmptyRecycleBinW(Some(self.hwnd), PCWSTR::null(), FLAGS) } {
+                Ok(()) => 0isize,
+                Err(error) => error.code().0 as isize,
+            };
+            unsafe { self.empty_recycle_bin_finished(code) };
+        }
+    }
+
+    /// The worker is done: say so and read the folder again.
+    unsafe fn empty_recycle_bin_finished(&mut self, code: isize) {
+        self.empty_bin_running = false;
+        if code == 0 {
+            self.show_message("回收站已清空".to_owned());
+            unsafe { self.execute(Command::Refresh) };
+        } else {
+            self.show_message(format!("无法清空回收站：0x{:08X}", code as u32));
         }
     }
 
@@ -613,8 +708,22 @@ impl WindowState {
         self.refresh_status();
     }
 
+    /// Switches the drawn list's layout. The hidden Shell view keeps its own
+    /// mode, so a folder opened with the drawn list off still looks like
+    /// Explorer; only the visible list changes here.
+    pub(super) fn choose_view(&mut self, id: &str) {
+        // 此电脑 draws device cards; a layout would change nothing but the tick.
+        if self.file_view.is_devices() { return; }
+        let Some(layout) = file_view::Layout::from_id(id) else { return };
+        if !self.file_view.set_layout(layout) { return; }
+        self.file_view.set_viewport(self.view_rect(), self.dpi);
+        self.refresh_status();
+        self.invalidate_rect(self.layout.browser);
+        self.invalidate_rect(self.layout.status);
+        unsafe { let _ = SetFocus(Some(self.hwnd)); }
+    }
+
     unsafe fn view_menu(&mut self) {
-        let (mode, icon) = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
         let (hidden, extensions) = folder_settings();
         let show = ShowState {
             navigation: self.session.ui.show_tree, preview: self.session.ui.show_preview, details: self.session.ui.show_details,
@@ -622,7 +731,19 @@ impl WindowState {
             extensions, hidden,
         };
         let anchor = self.layout.command_rect(CommandId::View);
-        let choice = popup(self.hwnd, &menus::view_menu(mode, icon, show), anchor);
+        let spec = if self.custom_view {
+            // 此电脑 draws device cards, so the eight modes would only move a
+            // tick; every other folder really changes geometry.
+            if self.file_view.is_devices() {
+                menus::view_menu_with(self.file_view.layout().id(), show, false)
+            } else {
+                menus::view_menu_current(self.file_view.layout().id(), show)
+            }
+        } else {
+            let (mode, icon) = self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0));
+            menus::view_menu(mode, icon, show)
+        };
+        let choice = popup(self.hwnd, &spec, anchor);
         match choice.as_deref() {
             Some("show-nav") => {
                 self.session.ui.show_tree = !show.navigation; self.save(); unsafe { self.resize(); }
@@ -638,7 +759,7 @@ impl WindowState {
             Some("show-checkboxes") => { if let Some(b) = &self.browser { let _ = b.set_checkboxes(!show.checkboxes); } }
             Some("show-extensions") => { set_folder_settings(None, Some(!show.extensions)); unsafe { self.execute(Command::Refresh); } }
             Some("show-hidden") => { set_folder_settings(Some(!show.hidden), None); unsafe { self.execute(Command::Refresh); } }
-            Some(id) => self.set_view(menus::view_choice(id)),
+            Some(id) => if self.custom_view { self.choose_view(id) } else { self.set_view(menus::view_choice(id)) },
             None => {}
         }
     }
@@ -646,13 +767,38 @@ impl WindowState {
     unsafe fn sort_menu(&mut self) {
         let to_key = |c: Column| match c { Column::Name => SortKey::Name, Column::Modified => SortKey::Modified, Column::Type => SortKey::Type, Column::Size => SortKey::Size, Column::Created => SortKey::Created };
         let to_column = |k: SortKey| match k { SortKey::Name => Column::Name, SortKey::Modified => Column::Modified, SortKey::Type => Column::Type, SortKey::Size => Column::Size, SortKey::Created => Column::Created };
-        let Some(browser) = &self.browser else { return };
-        let current = browser.sort();
-        let group = browser.group().map(to_key);
+        let to_view = |k: SortKey| match k { SortKey::Name => file_view::SortKey::Name, SortKey::Modified => file_view::SortKey::Modified, SortKey::Type => file_view::SortKey::Kind, SortKey::Size => file_view::SortKey::Size, SortKey::Created => file_view::SortKey::Created };
+        let custom = self.custom_view;
+        let (current, group) = if custom {
+            (self.file_view.sort_order().map(|(key, ascending)| match key {
+                file_view::SortKey::Name => (SortKey::Name, ascending),
+                file_view::SortKey::Modified => (SortKey::Modified, ascending),
+                file_view::SortKey::Kind => (SortKey::Type, ascending),
+                file_view::SortKey::Size => (SortKey::Size, ascending),
+                file_view::SortKey::Created => (SortKey::Created, ascending),
+            }), None)
+        } else {
+            let Some(browser) = &self.browser else { return };
+            (browser.sort().map(|(column, ascending)| (to_key(column), ascending)), browser.group().map(to_key))
+        };
         let anchor = self.layout.command_rect(CommandId::Sort);
-        let choice = popup(self.hwnd, &menus::sort_menu(current.map(|(c, a)| (to_key(c), a)), group), anchor);
+        // The drawn list has no grouping yet, and 此电脑 keeps its drives in
+        // letter order, so sorting it would only move the tick.
+        let sortable = !(custom && self.file_view.is_devices());
+        let choice = popup(self.hwnd, &menus::sort_menu_with(current, group, !custom, sortable), anchor);
+        if custom {
+            match choice.as_deref() {
+                Some("sort-asc") => { if let Some((key, _)) = self.file_view.sort_order() { self.file_view.sort_by(key, true); } }
+                Some("sort-desc") => { if let Some((key, _)) = self.file_view.sort_order() { self.file_view.sort_by(key, false); } }
+                Some(id) => { if let Some(key) = menus::sort_key(id) { self.file_view.set_sort(to_view(key)); } }
+                None => {}
+            }
+            self.file_view.set_viewport(self.view_rect(), self.dpi);
+            self.invalidate_rect(self.layout.browser);
+            return;
+        }
         let Some(browser) = &self.browser else { return };
-        let (column, ascending) = current.unwrap_or((Column::Name, true));
+        let (column, ascending) = current.map(|(key, ascending)| (to_column(key), ascending)).unwrap_or((Column::Name, true));
         let result = match choice.as_deref() {
             Some("sort-asc") => browser.set_sort(column, true),
             Some("sort-desc") => browser.set_sort(column, false),

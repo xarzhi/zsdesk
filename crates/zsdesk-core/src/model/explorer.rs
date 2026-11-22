@@ -388,6 +388,10 @@ pub struct ExplorerUi {
     /// Navigation tree width in DIP.
     pub tree_width: i32,
     pub show_bookmarks: bool,
+    /// Widths of 修改日期 / 类型 / 大小 in DIP; the name column takes the rest.
+    /// Dragging a column boundary writes them back here so every window and
+    /// every later launch shows the same table.
+    pub details_columns: [i32; 3],
     pub show_preview: bool,
     pub show_details: bool,
     pub command_bar: CommandBarPreferences,
@@ -419,7 +423,8 @@ pub struct ExplorerUi {
 
 impl Default for ExplorerUi {
     fn default() -> Self {
-        Self { tab_placement:TabPlacement::Top, show_tree: true, tree_width: 220, show_bookmarks: true, show_preview: false, show_details: false,
+        Self { tab_placement:TabPlacement::Top, show_tree: true, tree_width: 220, show_bookmarks: true,
+            details_columns: [132, 96, 86], show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
             search_all_files: true, search_backend: SearchBackendPreference::Everything, space_preview: true,
             everything_executable:None,
@@ -468,6 +473,12 @@ impl ExplorerSession {
         }
         self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         self.ui.tree_width = self.ui.tree_width.clamp(120, 800);
+        // A config written by hand, or by a build that stored nothing, must not
+        // leave a column collapsed or wider than a screen.
+        let defaults = ExplorerUi::default().details_columns;
+        for (width, fallback) in self.ui.details_columns.iter_mut().zip(defaults) {
+            *width = if *width > 0 { (*width).clamp(48, 1200) } else { fallback };
+        }
         normalize_expanded(&mut self.ui.tree_expanded);
         let largest = self.tabs.iter().map(|t|t.id)
             .chain(self.bookmarks.iter().map(|b|b.id)).max().unwrap_or(0);

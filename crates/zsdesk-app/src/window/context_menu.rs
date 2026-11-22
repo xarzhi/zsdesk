@@ -3,10 +3,17 @@ use super::*;
 use std::collections::HashMap;
 use windows::{core::{Interface,Error,HRESULT},Win32::{System::{Com::CoTaskMemFree,SystemServices::SFGAO_FOLDER},UI::Shell::{IFolderView2,IPersistFolder2,IShellItemArray,IShellView,SVGIO_SELECTION}}};
 use zsdesk_windows::shell::{file_transfer,menu::{self,MenuInterceptions,MenuOutcome,QuickAction,QuickMenu}};
-use crate::context_menu_process::{Client,Mode as WorkerMode};
+use crate::context_menu_process::{Client,Mode as WorkerMode,trace};
 
 pub(super) const TIMER:usize=19;
-struct Session{generation:u64,view:IShellView,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client}
+/// `view` is `None` for a menu built from explicit item identities: a
+/// navigation-pane row or a search result, whose items live outside the Shell
+/// view that is hidden behind the drawn list.
+struct Session{generation:u64,view:Option<IShellView>,pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,background:Option<Vec<u8>>,client:Client,
+    /// Where "打开" lands for each item, aligned with `pidls`: a navigation-pane
+    /// row or a search result stands for a folder that is not necessarily a
+    /// directory the hidden view could browse.
+    targets:Vec<Option<ShellLocation>>}
 thread_local!{static ACTIVE:RefCell<HashMap<isize,Session>>=RefCell::new(HashMap::new());}
 thread_local!{static GENERATIONS:RefCell<HashMap<isize,u64>>=RefCell::new(HashMap::new());static NEXT:Cell<u64>=const{Cell::new(1)};}
 fn generation(owner:HWND)->Option<u64>{GENERATIONS.with(|generations|generations.borrow().get(&(owner.0 as isize)).copied())}
@@ -55,7 +62,33 @@ pub(super) fn show(window:HWND,view:&IShellView,position:LPARAM)->windows::core:
     let client=Client::spawn_extended(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
     if !current(owner,generation){return Ok(());}
-    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,view:view.clone(),pidls,folder,background,client});});
+    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,view:Some(view.clone()),pidls,folder,background,client,targets:Vec::new()});});
+    unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
+}
+
+/// The same native menu for one navigation-pane row.
+///
+/// The pane is self-drawn, so no Shell view sits behind it. The row's own PIDL
+/// goes to the Shell, which builds exactly the menu Explorer shows there
+/// (固定到快速访问, 管理, 格式化为, 清空回收站 …); this side only decides where
+/// 打开 lands: in this window, not in a second file manager.
+pub(super) fn show_item(window:HWND,pidl:Vec<u8>,target:Option<ShellLocation>,position:LPARAM)->windows::core::Result<()>{
+    show_items(window,vec![(pidl,target)],position)
+}
+
+/// The same native menu for a selection the drawn list owns: navigation-pane
+/// rows and search results, whose items the hidden Shell view does not hold.
+pub(super) fn show_items(window:HWND,items:Vec<(Vec<u8>,Option<ShellLocation>)>,position:LPARAM)->windows::core::Result<()>{
+    if items.is_empty(){return Ok(());}
+    let owner=root(window);close(owner);
+    let generation=generation(owner).unwrap();
+    let point=point(window,position);let pidls:Vec<Vec<u8>>=items.iter().map(|(pidl,_)|pidl.clone()).collect();
+    let targets:Vec<Option<ShellLocation>>=items.into_iter().map(|(_,target)|target).collect();
+    let client=Client::spawn_extended(owner,point,pidls.clone(),None,menu::context_menu_options(),
+        MenuInterceptions{rename:true,open:true},WorkerMode::More,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
+        .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
+    if !current(owner,generation){return Ok(());}
+    ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,view:None,pidls,folder:None,background:None,client,targets});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
 
@@ -64,6 +97,9 @@ fn open_folder(owner:HWND,pidls:&[Vec<u8>])->bool{
     let Ok(item)=zsdesk_windows::shell::pidl::item_from_pidl(&pidls[0])else{return false;};
     if !unsafe{item.GetAttributes(SFGAO_FOLDER)}.is_ok_and(|attributes|attributes.0&SFGAO_FOLDER.0!=0){return false;}
     let Some(location)=(unsafe{zsdesk_windows::shell::location_from_shell_item(&item)})else{return false;};
+    open_location(owner,location)
+}
+fn open_location(owner:HWND,location:ShellLocation)->bool{
     let value=Box::new(location);let pointer=Box::into_raw(value);
     if unsafe{PostMessageW(Some(owner),WM_SHELL_FOLDER_INVOKED,WPARAM(0),LPARAM(pointer as isize))}.is_err(){unsafe{drop(Box::from_raw(pointer));}return false;}
     true
@@ -71,25 +107,42 @@ fn open_folder(owner:HWND,pidls:&[Vec<u8>])->bool{
 pub(super) fn poll(owner:HWND){
     let Some(mut session)=ACTIVE.with(|active|active.borrow_mut().remove(&(owner.0 as isize)))else{let _=unsafe{KillTimer(Some(owner),TIMER)};return;};
     let generation=session.generation;let view=session.view.clone();let pidls=session.pidls.clone();let folder=session.folder.clone();let background=session.background.clone();
-    let result=session.client.poll(&mut|_|current(owner,generation)&&unsafe{view.GetWindow()}.is_ok_and(|window|unsafe{IsWindow(Some(window))}.as_bool())&&same_selection(&view,&pidls,&folder,&background)&&current(owner,generation));
-    let valid=unsafe{session.view.GetWindow()}.is_ok_and(|window|unsafe{IsWindow(Some(window))}.as_bool())&&same_selection(&session.view,&session.pidls,&session.folder,&session.background);
+    // A menu with a view behind it must still describe the same selection when
+    // the user commits a verb; a self-drawn row has nothing to compare, only the
+    // window that owns the menu has to be alive.
+    let unchanged=||match &view{
+        Some(view)=>unsafe{view.GetWindow()}.is_ok_and(|window|unsafe{IsWindow(Some(window))}.as_bool())&&same_selection(view,&pidls,&folder,&background),
+        None=>true,
+    };
+    let result=session.client.poll(&mut|_|current(owner,generation)&&unchanged());
+    let valid=unchanged();
+    trace(format!("poll view={} valid={} result={:?}",view.is_some(),valid,result.as_ref().map(|value|match value{Ok(outcome)=>format!("{outcome:?}"),Err(error)=>format!("{error:#}")})));
     if !current(owner,generation){return;}
     match result{
         None=>{ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});},
         Some(Ok(MenuOutcome::Rename)) if valid=>{
             // A painted list owns the editor; the hidden Shell view would put it
-            // somewhere nobody can see.
-            post(owner,WM_ACTION,ACTION_VIEW_RENAME,0);
+            // somewhere nobody can see. The pane has its own editor as well.
+            post(owner,WM_ACTION,if session.view.is_some(){ACTION_VIEW_RENAME}else{ACTION_TREE_RENAME},0);
         },
         Some(Ok(MenuOutcome::Open|MenuOutcome::Explore)) if valid=>{
-            if !open_folder(owner,&session.pidls){
+            // A navigation-pane row already knows the folder it stands for: its
+            // item may live in 快速访问, which is a namespace, not a directory.
+            if let Some(target)=session.targets.iter().flatten().next().cloned(){
+                open_location(owner,target);
+            } else if !open_folder(owner,&session.pidls){
                 let mut point=POINT::default();let _=unsafe{GetCursorPos(&mut point)};
                 if let Ok(client)=Client::spawn(owner,point,session.pidls.clone(),session.folder.clone(),menu::context_menu_options(),MenuInterceptions::default(),WorkerMode::Open){
                     if current(owner,generation){session.client=client;ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});}
                 }
             }
         },
-        Some(Ok(MenuOutcome::ShellInvoked))=>post(owner,WM_ACTION,Command::Refresh.id()as usize,0),
+        Some(Ok(MenuOutcome::ShellInvoked))=>{
+            post(owner,WM_ACTION,Command::Refresh.id()as usize,0);
+            // 固定到快速访问 runs on the Shell's own thread and may land after
+            // the menu returned: read the pinned list again once it has.
+            unsafe{SetTimer(Some(owner),super::TIMER_NAV_REFRESH,600,None)};
+        },
         Some(Err(error))=>{eprintln!("isolated Shell menu: {error:#}");menu::report_failure(owner,HRESULT(0x80004005u32 as i32));},
         _=>{},
     }

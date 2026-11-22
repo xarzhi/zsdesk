@@ -51,17 +51,17 @@ use std::{cell::{Cell, RefCell}, collections::HashMap, mem::size_of, path::PathB
 use anyhow::{Context, Result};
 use windows::{core::{PCWSTR, PWSTR}, Win32::{
     Foundation::{COLORREF, HWND, HINSTANCE, LPARAM, LRESULT, WPARAM, POINT, RECT},
-    Graphics::{Dwm::{DwmDefWindowProc, DwmSetWindowAttribute, DWMWA_CLOAK}, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint,
-        InvalidateRect, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
+    Graphics::{Dwm::{DwmDefWindowProc, DwmSetWindowAttribute, DWMWA_CLOAK}, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
+        InvalidateRect, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, SetWindowRgn, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
         MonitorFromRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL}},
-    System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_LINK, DROPEFFECT_NONE}},
+    System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE}, SystemServices::{MK_CONTROL, MK_SHIFT}},
     UI::{Controls::*, HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi},
         Input::KeyboardAndMouse::*, Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::*},
 }};
 use zsdesk_core::model::explorer::{ExplorerSession, ExplorerTab, ShellLocation, WindowPlacement};
 use zsdesk_ui::{chrome::{scale, ChromeInput, ChromeLayout, Hit, Rect as LayoutRect, STRIP_H}, theme::{Mode, Palette}};
-use zsdesk_windows::{gfx::{Gfx, Surface}, ole::{has_hdrop, hdrop_paths, DropHandler, DropRegistration},
+use zsdesk_windows::{gfx::{Gfx, Surface}, ole::{all_inside, crosses_volume, has_hdrop, hdrop_paths, DropHandler, DropRegistration},
     shell::{acknowledge_selection_changed, commands::ViewStatus, Crumb, ExplorerBrowserHost, NamespaceTreeHost, Panes,
         WM_BOOKMARK_PATH_DROPPED, WM_SHELL_FOLDER_INVOKED, WM_SHELL_NAVIGATED, WM_SHELL_NAVIGATION_FAILED,
         WM_SHELL_SELECTION_CHANGED, WM_TREE_NAVIGATE}, theme};
@@ -85,6 +85,12 @@ pub(super) const ACTION_VIEW_CANCEL: usize = 2117;
 pub(super) const ACTION_SEARCH_SETTINGS:usize=2112;
 pub(super) const ACTION_SEARCH_PAGE:usize=2113;
 pub(super) const ACTION_CLOSE_SEARCH:usize=2114;
+/// A drag that ended in a move: the rows have to be read again.
+pub(super) const ACTION_AFTER_DRAG: usize = 2118;
+/// 重命名 chosen for a navigation-pane row.
+pub(super) const ACTION_TREE_RENAME: usize = 2119;
+/// The worker that empties the Recycle Bin finished; the value is its HRESULT.
+pub(super) const ACTION_EMPTY_RECYCLE_DONE: usize = 2120;
 const WM_LAYOUT: u32 = WM_APP + 2;
 pub(super) const WM_ACTION: u32 = WM_APP + 3;
 const WM_OPEN_REQUEST: u32 = WM_APP + 4;
@@ -99,8 +105,21 @@ const TIMER_TREE_STATE:usize=10;
 /// Retries a "show this item in its folder" request while the view is still
 /// enumerating, so the item ends up selected and scrolled into view.
 const TIMER_REVEAL:usize=11;
+/// Re-reads the pinned quick-access folders once the Shell has finished a pin.
+const TIMER_NAV_REFRESH:usize=12;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
+/// Starts an OLE drag of the selected rows. Runs outside the state borrow so
+/// the modal drag loop can re-enter this window normally.
+const WM_BEGIN_DRAG: u32 = WM_APP + 50;
+/// Files were dropped on the list: the payload is a `DroppedFiles`.
+const WM_DROP_PATHS: u32 = WM_APP + 51;
+/// The pointer moved over the list during a drag; carries client x and y.
+const WM_DROP_HOVER: u32 = WM_APP + 52;
+/// The drag left the list or ended: the drop highlight goes away.
+const WM_DROP_LEAVE: u32 = WM_APP + 53;
+/// The thumbnail worker finished one picture: WPARAM carries its loader token.
+const WM_VIEW_IMAGES: u32 = WM_APP + 54;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -278,6 +297,11 @@ unsafe fn run_inner(session: ExplorerSession, config_path: PathBuf, selection: O
         }
         if msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN {
             if let Some(action) = keyboard::resolve(msg.wParam.0 as u16, modifiers, true, editing) {
+                // Search results are drawn rows: the hidden Shell view holds no
+                // items for them, so these commands address the rows instead.
+                let drawn = slot.try_borrow_mut().ok().and_then(|mut slot| slot.as_mut()
+                    .map(|state| state.search_shortcut(action))).unwrap_or(false);
+                if drawn { continue; }
                 let view = slot.try_borrow().ok().and_then(|s| s.as_ref().and_then(|s| s.keyboard_view(&msg, true)));
                 if let Some(view) = view {
                     // Shell verbs can enter COM/modal loops: release the state borrow first.
@@ -401,7 +425,17 @@ pub(super) struct TabDrag { pub index: usize, pub start_axis: i32, pub moved: bo
 
 /// Drop zones of the chrome shared with the OLE drop target.
 #[derive(Clone, Copy, Default)]
-pub(super) struct DropZones { pub bookmarks: LayoutRect, pub strip: LayoutRect, pub tabs:LayoutRect }
+pub(super) struct DropZones {
+    pub bookmarks: LayoutRect,
+    pub strip: LayoutRect,
+    pub tabs: LayoutRect,
+    /// File pane, and the navigation tree beside it.
+    pub browser: LayoutRect,
+    pub tree: LayoutRect,
+}
+
+/// Files dropped on the window, resolved to a folder on the UI thread.
+struct DroppedFiles { paths: Vec<PathBuf>, x: i32, y: i32, moving: bool }
 
 struct WindowState {
     search_panel:search_panel::SearchPanel,
@@ -425,6 +459,9 @@ struct WindowState {
     dark: bool,
     /// A DWM material is composited behind the window: pixels may be transparent.
     material: bool,
+    /// The text fields are currently reduced to an empty window region so the
+    /// native controls paint nothing; `material` is what turns that on.
+    edits_hollow: bool,
     wallpaper: crate::wallpaper::WallpaperLayer,
     /// The list is painted by ZSDesk and the Shell view is only its model.
     file_view: file_view::FileView,
@@ -433,13 +470,32 @@ struct WindowState {
     /// Keyboard focus last landed on the tree instead of the file list.
     tree_focus: bool,
     custom_view: bool,
+    /// Paths of the current search page, in the order the engine streamed
+    /// them. The drawn list owns them, so it can select a row without asking
+    /// the Shell to materialize every result first.
+    search_paths: Vec<PathBuf>,
+    /// Identity of every path already queued for the list, so a path repeated
+    /// by a refinement never becomes a second row.
+    search_seen: std::collections::HashSet<Vec<u16>>,
+    /// Paths waiting for a row-building worker; one batch at a time.
+    search_queue: Vec<PathBuf>,
+    /// A row-building worker is in flight.
+    search_listing: bool,
+    /// Listing token of the search rows on screen.
+    search_token: u64,
     /// In-place rename editor over a painted row.
     view_rename: HWND,
     view_rename_index: Option<usize>,
+    /// The same editor, over a navigation-pane row instead of a list row.
+    tree_rename_index: Option<usize>,
     /// Row of the previous click and when it happened: a second click inside
     /// the double-click time opens it, even when the window never receives a
     /// `WM_LBUTTONDBLCLK` (slow pointer, remote session, synthetic input).
     last_click: Option<(usize, std::time::Instant)>,
+    /// The row a left press landed on and where it landed. Once the pointer
+    /// leaves that spot the press turns into a Shell drag of the selection
+    /// instead of a click, which is how Explorer's own list behaves.
+    view_press: Option<(POINT, usize)>,
     /// EDIT whose selection is being dragged out with the pointer.
     edit_drag: Option<isize>,
     /// Horizontal scroll per self-drawn text field, keyed by window handle.
@@ -474,6 +530,13 @@ struct WindowState {
     drag_ghost: Option<tab_ghost::TabGhost>,
     splitter_drag: Option<(i32, i32)>,
     icons: HashMap<String, paint::IconEntry>,
+    /// Thumbnails and per-file icons for the drawn list, keyed by kind, size and
+    /// path. `None` means the Shell has no image for that file.
+    view_images: HashMap<String, paint::IconEntry>,
+    /// Keys already handed to the worker, so repaints never queue them twice.
+    view_images_wanted: std::collections::HashSet<String>,
+    /// Background STA that decodes pictures and reads per-file icons.
+    images: Option<zsdesk_windows::shell::icons::IconLoader>,
     /// Embedded application icon shown at the far left of the title bar.
     app_icon: Option<paint::IconEntry>,
     view_status: ViewStatus,
@@ -483,12 +546,19 @@ struct WindowState {
     bookmark_widths: Vec<i32>,
     drop_registration: Option<DropRegistration>,
     drop_zones: Rc<Cell<DropZones>>,
+    /// Folder the painted list shows; `None` while the Shell view owns the pane.
+    drop_folder: Rc<RefCell<Option<PathBuf>>>,
+    /// Pointer origin of a press on a row. Moving far enough turns the press
+    /// into an OLE drag instead of a click.
+    view_drag: Option<POINT>,
     last_focus: HWND,
     pending: Option<NavigationRequest>,
     queued: Option<NavigationRequest>,
     shown_tab: Option<u64>,
     closed_tabs: Vec<ExplorerTab>,
     status: String,
+    /// An empty-the-bin worker is running: a second click must not start one.
+    empty_bin_running: bool,
     launch_selection: Option<std::ffi::OsString>,
     launch_selections: Vec<std::ffi::OsString>,
     /// Pending "show this item" request, retried until the view confirms it.
@@ -502,6 +572,9 @@ struct WindowState {
     fast_generation:u64,
     fast_submitted:Option<integrated_search::SubmittedSearch>,
     fast_found:usize,
+    /// The last progress event, kept so the status line can be recomputed when
+    /// rows land after it: the count it was built with is then out of date.
+    fast_last:Option<crate::fast_search::SearchEvent>,
     search_progress:Option<String>,
     fast_events:std::collections::VecDeque<crate::fast_search::SearchEvent>,
     fast_reset_pending:bool,
@@ -527,19 +600,22 @@ impl WindowState {
             hwnd: HWND::default(), dpi: 96, session, config_path, modern, browser: None, tree: None,
             address_edit: HWND::default(), search_edit: HWND::default(), rename_hwnd: HWND::default(), rename_index: None,
             tooltip: HWND::default(), tooltip_text: vec![0], font: HFONT::default(), gfx: None, surface: None,
-            palette: Palette::light(), dark: false, material: false, wallpaper: crate::wallpaper::WallpaperLayer::default(),
-            file_view: file_view::FileView::default(), custom_view: false, view_rename: HWND::default(), view_rename_index: None, last_click: None,
+            palette: Palette::light(), dark: false, material: false, edits_hollow: false, wallpaper: crate::wallpaper::WallpaperLayer::default(),
+            file_view: file_view::FileView::default(), custom_view: false, search_paths: Vec::new(), search_seen: Default::default(),
+            search_queue: Vec::new(), search_listing: false, search_token: 0,
+            view_rename: HWND::default(), view_rename_index: None, tree_rename_index: None, last_click: None, view_press: None,
             edit_drag: None, edit_scroll: HashMap::new(), caret_on: true, caret_timer: false, search_cue: String::new(), search_area: LayoutRect::default(), address_area: LayoutRect::default(), view_rename_area: LayoutRect::default(), rename_area: LayoutRect::default(),
             nav_tree: nav_tree::NavTree::default(), tree_focus: false,
             active: true, silent: false, layout: ChromeLayout::default(),
             crumbs: Vec::new(), crumb_slots: Vec::new(), crumbs_for: None, address_editing: false, open_chevron: None,
             hover: Hit::None, hover_crumb: None, pressed: None, tracking_mouse: false, tab_drag: None, drag_ghost: None,
             splitter_drag: None,
-            icons: HashMap::new(), app_icon: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(), list_loader: Default::default(),
-            drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())), last_focus: HWND::default(),
-            pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(),
+            icons: HashMap::new(), app_icon: None, view_images: HashMap::new(), view_images_wanted: std::collections::HashSet::new(), images: None, view_status: ViewStatus::default(), view_mode: (0, 0), bookmark_widths: Vec::new(), list_loader: Default::default(),
+            drop_registration: None, drop_zones: Rc::new(Cell::new(DropZones::default())),
+            drop_folder: Rc::new(RefCell::new(None)), view_drag: None, last_focus: HWND::default(),
+            pending: None, queued: None, shown_tab: None, closed_tabs: Vec::new(), status: String::new(), empty_bin_running: false,
             launch_selection, launch_selections:Vec::new(), reveal:None, open_requests: Default::default(), search_scope: None, search_result: None,
-            browser_role:BrowserRole::Fresh,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,search_progress:None,fast_events:Default::default(),
+            browser_role:BrowserRole::Fresh,fast_search:None,fast_generation:0,fast_submitted:None,fast_found:0,fast_last:None,search_progress:None,fast_events:Default::default(),
             fast_reset_pending:false,fast_clearing:None,fast_restore:None,
             search_settings_job:None,
             fullscreen_restore:None,wheel_remainder:0,
@@ -555,6 +631,10 @@ impl WindowState {
         self.hwnd = hwnd;
         self.dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         self.list_loader.attach(hwnd);
+        // Decoding a JPEG or reading a program's icon is a Shell call that can
+        // block; it runs on its own STA and wakes this window when a result is
+        // ready, so painting never waits for it.
+        self.images = Some(zsdesk_windows::shell::icons::IconLoader::spawn(hwnd, WM_VIEW_IMAGES));
         listary::initialize(hwnd)?;
         stage("listary");
         context_menu::install();
@@ -577,7 +657,13 @@ impl WindowState {
         stage("controls");
         self.apply_theme();
         unsafe { self.update_font(); }
-        let handler = Rc::new(ChromeDrop { hwnd: hwnd.0 as isize, zones: self.drop_zones.clone(), accepted: Cell::new(false) });
+        let handler = Rc::new(ChromeDrop {
+            hwnd: hwnd.0 as isize,
+            zones: self.drop_zones.clone(),
+            folder: self.drop_folder.clone(),
+            accepted: Cell::new(false),
+            cross_volume: Cell::new(false),
+        });
         self.drop_registration = unsafe { DropRegistration::register(hwnd, handler) }.ok();
         stage("theme-font");
         self.measure_bookmarks();
@@ -683,7 +769,7 @@ impl WindowState {
             // strip to show, so the single-tab chrome is only for one folder.
             single_tab: self.session.ui.open_mode.single_tab() && self.session.tabs.len() <= 1,
             show_tree: self.session.ui.show_tree && self.tree.is_some() && (!self.session.ui.show_preview || width>=self.s(if self.session.ui.open_mode.single_tab()||self.session.ui.tab_placement==zsdesk_core::model::explorer::TabPlacement::Top{900}else{1110})), tree_width: self.s(self.session.ui.tree_width),
-            show_bookmarks: self.session.ui.show_bookmarks, status_bar: true, view_toggles: !self.custom_view, bookmark_widths: &self.bookmark_widths,
+            show_bookmarks: self.session.ui.show_bookmarks, status_bar: true, view_toggles: true, bookmark_widths: &self.bookmark_widths,
             recycle_bin: self.current_location().is_recycle_bin(),
         };
         let mut layout=ChromeLayout::new(&input);
@@ -697,7 +783,8 @@ impl WindowState {
             self.preview_rect=Some(LayoutRect::new(area.x+area.width-width,area.y,width,area.height));
         }
         self.layout_crumbs();
-        self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel });
+        self.drop_zones.set(DropZones { bookmarks: self.layout.bookmarks_row, strip: self.layout.strip,tabs:self.layout.tab_panel,
+            browser: self.layout.browser, tree: self.layout.tree });
         // A material covers the whole client area; the classic look only needs
         // the frame over the caption strip for the real caption buttons.
         let frame_height = if self.material { height } else { self.layout.strip.height };
@@ -783,14 +870,22 @@ impl WindowState {
         }
         let (normal, focused, text) = (colorref(self.palette.input), colorref(self.palette.input_focused), colorref(self.palette.text));
         let _=replace_edit_colors(self.hwnd,normal,focused,text);
-        self.search_cue = format!("搜索 {}", self.current_location().title());
-        let cue = wide(&self.search_cue);
-        unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.as_ptr() as isize))); }
+        self.update_search_cue();
         for control in [self.address_edit, self.search_edit, self.rename_hwnd, self.view_rename, self.tooltip] {
             theme::theme_control(control, self.dark);
         }
         // The material decides whether the native fields may paint at all.
         self.sync_edit_regions();
+    }
+
+    /// Keeps the search placeholder naming the folder on screen. It is part of
+    /// the chrome, so a tab that moves to another folder has to refresh it.
+    pub(super) fn update_search_cue(&mut self) {
+        let cue = format!("搜索 {}", self.current_location().title());
+        if cue == self.search_cue { return; }
+        self.search_cue = cue;
+        let text = wide(&self.search_cue);
+        unsafe { SendMessageW(self.search_edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(text.as_ptr() as isize))); }
     }
 
     /// The settings dialog edits the saved preferences on its own; this pulls
@@ -882,11 +977,18 @@ impl WindowState {
     fn refresh_status(&mut self) {
         // The drawn list is the folder on screen: its count is known as soon as
         // the listing lands, while the Shell view behind it lags a navigation
-        // by its own enumeration. The list is always a details view.
+        // by its own enumeration.
         let (status, mode) = if self.custom_view {
+            let layout = self.file_view.layout();
+            let mode = match layout {
+                file_view::Layout::Details => 4,
+                file_view::Layout::Listing => 3,
+                file_view::Layout::Content => 8,
+                file_view::Layout::Icons { .. } => 1,
+            };
             (ViewStatus { items: self.file_view.items.len(), selected: self.file_view.selection.len(),
                 selected_bytes: self.file_view.selected_bytes() },
-             (4, self.view_mode.1))
+             (mode, layout.icon_px(self.dpi) as i32))
         } else {
             (self.browser.as_ref().map(|b| b.status()).unwrap_or_default(),
              self.browser.as_ref().and_then(|b| b.view_mode()).unwrap_or((0, 0)))
@@ -1186,6 +1288,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         _ => {}
     }
+    // A file drag runs a modal OLE loop that re-enters this procedure for every
+    // pointer move and paint request. It must not hold the state borrow while it
+    // does, so the drag starts here rather than inside `handle`.
+    if msg == WM_BEGIN_DRAG {
+        let pidls = unsafe { *Box::from_raw(lp.0 as *mut Vec<Vec<u8>>) };
+        let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+        let outcome = unsafe { zsdesk_windows::ole::begin_drag(hwnd, &pidls, allowed) };
+        let effect = outcome.unwrap_or(DROPEFFECT_NONE);
+        // A move already happened on disk when the target applied it; a copy
+        // leaves the rows alone.
+        if effect & DROPEFFECT_MOVE != DROPEFFECT_NONE { post(hwnd, WM_ACTION, ACTION_AFTER_DRAG, 0); }
+        return LRESULT(0);
+    }
     let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Slot;
     if pointer.is_null() { return unsafe { DefWindowProcW(hwnd, msg, wp, lp) }; }
     if msg == WM_NCDESTROY {
@@ -1263,6 +1378,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_OPEN_TAB_PATH | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
+        | WM_DROP_PATHS | WM_DROP_HOVER | WM_DROP_LEAVE | WM_VIEW_IMAGES
         | zsdesk_windows::shell::WM_TREE_STATE | tab_transfer::WM_TAB_TRANSFER
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => {
             defer_message(hwnd,msg,wp,lp);
@@ -1371,6 +1487,9 @@ impl WindowState {
                 self.relayout();
                 self.invalidate_rect(self.layout.strip);
                 if activation == WA_ACTIVE {
+                    // Coming back from Explorer: the pinned folders may have
+                    // been changed while this window was in the background.
+                    self.refresh_nav_tree();
                     let target = self.last_focus;
                     if self.owns_live_focus(target) { let _ = unsafe { SetFocus(Some(target)) }; }
                     else if self.custom_view { let _ = unsafe { SetFocus(Some(self.hwnd)) }; }
@@ -1390,6 +1509,10 @@ impl WindowState {
                 if wp.0 == TIMER_STATUS { self.refresh_status();self.poll_search_settings(); }
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
                 if wp.0 == TIMER_FAST_SEARCH { let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};self.poll_fast_search(); }
+                if wp.0 == TIMER_NAV_REFRESH {
+                    let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_NAV_REFRESH) };
+                    self.refresh_nav_tree();
+                }
                 if wp.0 == TIMER_MESSAGE {
                     let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_MESSAGE) };
                     self.status.clear();
@@ -1454,6 +1577,7 @@ impl WindowState {
             WM_CANCELMODE => {
                 self.cancel_tab_drag();
                 self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
+                self.view_drag = None;
                 self.end_edit_drag();
                 self.end_view_drag_bar();
                 if unsafe { GetCapture() } == self.hwnd { let _ = unsafe { ReleaseCapture() }; }
@@ -1462,9 +1586,11 @@ impl WindowState {
             WM_CAPTURECHANGED => {
                 self.cancel_tab_drag();
                 self.tab_drag = None; self.splitter_drag = None; self.pressed = None;
+                self.view_drag = None;
                 self.end_edit_drag();
                 // A menu or another window taking the capture ends the thumb drag.
                 self.end_view_drag_bar();
+                self.end_view_drag_divider();
                 self.invalidate();
             }
             WM_SETCURSOR => {
@@ -1477,7 +1603,12 @@ impl WindowState {
                         Hit::Address if !self.address_editing && self.crumb_at(p.x, p.y).is_none() => Some(IDC_IBEAM),
                         _ => None,
                     };
-                    let cursor = cursor.or(self.splitter_drag.map(|_| IDC_SIZEWE)).unwrap_or(IDC_ARROW);
+                    // A column boundary in the details header reads as a splitter.
+                    let cursor = cursor
+                        .or(matches!(self.view_hit(p), Some(file_view::ViewHit::HeaderDivider(_))).then_some(IDC_SIZEWE))
+                        .or(self.splitter_drag.map(|_| IDC_SIZEWE))
+                        .or(self.file_view.dragging_divider().then_some(IDC_SIZEWE))
+                        .unwrap_or(IDC_ARROW);
                     if let Ok(c) = unsafe { LoadCursorW(None, cursor) } { unsafe { SetCursor(Some(c)); } }
                     return Some(LRESULT(1));
                 }
@@ -1547,6 +1678,13 @@ impl WindowState {
                 unsafe { SetTimer(Some(self.hwnd), TIMER_TREE_STATE, 500, None); }
             }
             WM_FAST_SEARCH => self.poll_fast_search(),
+            WM_DROP_PATHS => if lp.0 != 0 {
+                let dropped = unsafe { *Box::from_raw(lp.0 as *mut DroppedFiles) };
+                self.drop_files(dropped);
+            },
+            WM_DROP_HOVER => self.drop_highlight(Some(POINT { x: wp.0 as i32, y: lp.0 as i32 })),
+            WM_DROP_LEAVE => self.drop_highlight(None),
+            WM_VIEW_IMAGES => self.apply_view_images(wp.0),
             list_loader::WM_VIEW_LISTED => self.apply_listed_folders(),
             WM_DIAGNOSTIC=>if lp.0!=0{let request=unsafe{Box::from_raw(lp.0 as *mut crate::instance::DiagnosticRequest)};let _=self.write_diagnostics(&request);},
             crate::routing_control::WM_RESULT => if lp.0!=0{self.show_message(unsafe{*Box::from_raw(lp.0 as *mut String)});},
@@ -1554,6 +1692,10 @@ impl WindowState {
                 let code=wp.0 as u32;
                 if code==0{
                     if let Some(path)=zsdesk_windows::shell::file_transfer::take_created_folder(self.hwnd){if let(Some(browser),Some(name))=(&self.browser,path.file_name()){let _=browser.select_child(name);let _=browser.rename_selection();}}
+                    // A copy, move or delete changed the folder: read it again.
+                    // Re-listing the same folder keeps the scroll position and
+                    // the selection, so nothing jumps under the pointer.
+                    else { self.reload_file_view(); }
                 }else if code!=0x800704c7{self.show_message(format!("文件操作未完成：{}",windows::core::Error::from_hresult(windows::core::HRESULT(code as i32))));}
             },
             message if message >= 0xC000 && message == zsdesk_windows::shell::menu::failure_message() => {
@@ -1577,38 +1719,133 @@ impl WindowState {
     }
 }
 
-/// Bookmarks bar and tab strip accept files/folders dragged from anywhere.
-struct ChromeDrop { hwnd: isize, zones: Rc<Cell<DropZones>>, accepted: Cell<bool> }
+/// Accepts files dragged from anywhere: the bookmarks bar and the tab strip
+/// turn them into a bookmark or a tab, the painted file list copies or moves
+/// them into the folder under the pointer.
+struct ChromeDrop {
+    hwnd: isize,
+    zones: Rc<Cell<DropZones>>,
+    /// Folder the painted list shows. The handler cannot borrow the window
+    /// state (OLE calls it from inside the drag loop), so it keeps its own copy.
+    folder: Rc<RefCell<Option<PathBuf>>>,
+    accepted: Cell<bool>,
+    /// Source and destination sit on different volumes: copy, do not move.
+    cross_volume: Cell<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropZone { Bookmark, Tab, Files }
 
 impl ChromeDrop {
-    fn zone(&self, point: POINT) -> Option<bool> {
+    fn zone(&self, point: POINT) -> Option<DropZone> {
         let hwnd = HWND(self.hwnd as *mut _);
         let mut p = point;
         let _ = unsafe { ScreenToClient(hwnd, &mut p) };
         let zones = self.zones.get();
-        if zones.bookmarks.contains(p.x, p.y) { Some(true) } else if zones.strip.contains(p.x, p.y)||zones.tabs.contains(p.x,p.y) { Some(false) } else { None }
+        if zones.bookmarks.contains(p.x, p.y) {
+            Some(DropZone::Bookmark)
+        } else if zones.strip.contains(p.x, p.y) || zones.tabs.contains(p.x, p.y) {
+            Some(DropZone::Tab)
+        } else if (zones.browser.contains(p.x, p.y) || zones.tree.contains(p.x, p.y))
+            && self.folder.borrow().is_some() {
+            Some(DropZone::Files)
+        } else {
+            None
+        }
+    }
+
+    fn client(&self, point: POINT) -> POINT {
+        let mut p = point;
+        let _ = unsafe { ScreenToClient(HWND(self.hwnd as *mut _), &mut p) };
+        p
+    }
+
+    /// What the cursor offers over `zone`, following the Explorer convention:
+    /// Ctrl copies, Shift moves, Alt links, and an unmodified drag moves inside
+    /// one volume but copies across volumes.
+    fn effect(&self, keys: u32, zone: DropZone, allowed: DROPEFFECT) -> DROPEFFECT {
+        let offered = match zone {
+            DropZone::Bookmark | DropZone::Tab => DROPEFFECT_LINK,
+            DropZone::Files => {
+                // Alt is not part of the drag key state, so it is read directly.
+                if unsafe { GetKeyState(VK_MENU.0 as i32) } < 0 { DROPEFFECT_LINK }
+                else if keys & MK_CONTROL.0 != 0 { DROPEFFECT_COPY }
+                else if keys & MK_SHIFT.0 != 0 { DROPEFFECT_MOVE }
+                else if self.cross_volume.get() { DROPEFFECT_COPY }
+                else { DROPEFFECT_MOVE }
+            }
+        };
+        offered & allowed
+    }
+
+    /// Points the window at the row to outline (or clears it). The walk from a
+    /// point to a row happens there: only the window knows the rows.
+    fn highlight(&self, point: Option<POINT>) {
+        let hwnd = HWND(self.hwnd as *mut _);
+        match point {
+            Some(point) => {
+                let client = self.client(point);
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_DROP_HOVER, WPARAM(client.x as usize), LPARAM(client.y as isize)) };
+            }
+            None => { let _ = unsafe { PostMessageW(Some(hwnd), WM_DROP_LEAVE, WPARAM(0), LPARAM(0)) }; }
+        }
     }
 }
 
 impl DropHandler for ChromeDrop {
-    fn enter(&self, data: &windows::Win32::System::Com::IDataObject, _keys: u32, point: POINT, _allowed: DROPEFFECT) -> DROPEFFECT {
-        self.accepted.set(has_hdrop(data));
-        self.over(0, point, DROPEFFECT_LINK)
+    fn enter(&self, data: &windows::Win32::System::Com::IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
+        let paths = if has_hdrop(data) { hdrop_paths(data) } else { Vec::new() };
+        self.accepted.set(!paths.is_empty());
+        let folder = self.folder.borrow().clone();
+        self.cross_volume.set(folder.as_ref().is_some_and(|folder| crosses_volume(&paths, folder)));
+        self.over(keys, point, allowed)
     }
-    fn over(&self, _keys: u32, point: POINT, _allowed: DROPEFFECT) -> DROPEFFECT {
-        if self.accepted.get() && self.zone(point).is_some() { DROPEFFECT_LINK } else { DROPEFFECT_NONE }
+    fn over(&self, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
+        if !self.accepted.get() { return DROPEFFECT_NONE; }
+        let Some(zone) = self.zone(point) else {
+            self.highlight(None);
+            return DROPEFFECT_NONE;
+        };
+        let effect = self.effect(keys, zone, allowed);
+        self.highlight((zone == DropZone::Files && effect != DROPEFFECT_NONE).then_some(point));
+        effect
     }
-    fn leave(&self) { self.accepted.set(false); }
-    fn dropped(&self, data: &windows::Win32::System::Com::IDataObject, _keys: u32, point: POINT, _allowed: DROPEFFECT) -> DROPEFFECT {
-        let Some(bookmarks) = self.zone(point).filter(|_| self.accepted.get()) else { return DROPEFFECT_NONE };
-        let message = if bookmarks { WM_BOOKMARK_PATH_DROPPED } else { WM_OPEN_TAB_PATH };
-        for path in hdrop_paths(data).into_iter().take(32) {
-            let payload = Box::into_raw(Box::new(path));
-            if unsafe { PostMessageW(Some(HWND(self.hwnd as *mut _)), message, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
-                unsafe { drop(Box::from_raw(payload)); }
+    fn leave(&self) {
+        self.accepted.set(false);
+        self.highlight(None);
+    }
+    fn dropped(&self, data: &windows::Win32::System::Com::IDataObject, keys: u32, point: POINT, allowed: DROPEFFECT) -> DROPEFFECT {
+        if !self.accepted.get() { return DROPEFFECT_NONE; }
+        let Some(zone) = self.zone(point) else { return DROPEFFECT_NONE };
+        let effect = self.effect(keys, zone, allowed);
+        if effect == DROPEFFECT_NONE { return DROPEFFECT_NONE; }
+        let hwnd = HWND(self.hwnd as *mut _);
+        match zone {
+            DropZone::Bookmark | DropZone::Tab => {
+                let message = if zone == DropZone::Bookmark { WM_BOOKMARK_PATH_DROPPED } else { WM_OPEN_TAB_PATH };
+                for path in hdrop_paths(data).into_iter().take(32) {
+                    let payload = Box::into_raw(Box::new(path));
+                    if unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
+                        unsafe { drop(Box::from_raw(payload)); }
+                    }
+                }
+            }
+            DropZone::Files => {
+                // The window resolves the folder under the pointer, because the
+                // OLE call runs where the window state cannot be borrowed.
+                let paths = hdrop_paths(data);
+                if paths.is_empty() { return DROPEFFECT_NONE; }
+                let client = self.client(point);
+                let dropped = DroppedFiles { paths, x: client.x, y: client.y, moving: effect == DROPEFFECT_MOVE };
+                let payload = Box::into_raw(Box::new(dropped));
+                if unsafe { PostMessageW(Some(hwnd), WM_DROP_PATHS, WPARAM(0), LPARAM(payload as isize)) }.is_err() {
+                    unsafe { drop(Box::from_raw(payload)); }
+                    return DROPEFFECT_NONE;
+                }
             }
         }
-        DROPEFFECT_LINK
+        self.highlight(None);
+        effect
     }
 }
 
@@ -1632,10 +1869,18 @@ unsafe fn create_tooltip(owner: HWND) -> HWND {
 pub(super) unsafe fn move_control(hwnd: HWND, r: LayoutRect) {
     if !hwnd.0.is_null() { let _ = unsafe { MoveWindow(hwnd, r.x, r.y, r.width, r.height, true) }; }
 }
+/// Moves a control without asking it to repaint. Used for the hollow text
+/// fields: their pixels are not theirs to draw, and a repaint is exactly what
+/// puts the white an EDIT keeps in its backing store back on screen.
+pub(super) unsafe fn move_control_quiet(hwnd: HWND, r: LayoutRect) {
+    if hwnd.0.is_null() { return; }
+    let _ = unsafe { SetWindowPos(hwnd, None, r.x, r.y, r.width, r.height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW) };
+}
 pub(super) fn win_rect(r: LayoutRect) -> RECT { RECT { left: r.x, top: r.y, right: r.x + r.width, bottom: r.y + r.height } }
 pub(super) fn wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
 pub(super) fn pcwstr(s: &[u16]) -> PCWSTR { PCWSTR(s.as_ptr()) }
 pub(super) fn post(hwnd: HWND, msg: u32, wp: usize, lp: isize) { let _ = unsafe { PostMessageW(Some(hwnd), msg, WPARAM(wp), LPARAM(lp)) }; }
+
 pub(super) fn x_lparam(v: isize) -> i32 { (v as i16) as i32 }
 pub(super) fn y_lparam(v: isize) -> i32 { ((v >> 16) as i16) as i32 }
 pub(super) fn colorref(c: zsdesk_ui::theme::Color) -> u32 {
@@ -1674,6 +1919,19 @@ fn accelerator_table() -> Vec<ACCEL> {
 }
 
 unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, parent: usize) -> LRESULT {
+    // A hollow field paints nothing: an EDIT erases its own background without
+    // consulting its window region, so an empty region alone still left an
+    // opaque plate on screen. The text, caret, selection and IME composition
+    // are drawn by `paint_edits`; here the update region is only validated.
+    if edits::field_hollow(hwnd) {
+        if msg == WM_ERASEBKGND { return LRESULT(1); }
+        if msg == WM_PAINT || msg == WM_PRINTCLIENT {
+            let mut ps = PAINTSTRUCT::default();
+            unsafe { BeginPaint(hwnd, &mut ps); }
+            let _ = unsafe { EndPaint(hwnd, &ps) };
+            return LRESULT(0);
+        }
+    }
     // EDIT focus notifications can arrive while the parent state is borrowed
     // by Shell. Queue the transition directly so reentrancy cannot lose it.
     if msg==WM_KILLFOCUS && id==ID_ADDRESS {post(HWND(parent as *mut _),WM_ACTION,ACTION_END_ADDRESS_EDIT,0);}

@@ -12,6 +12,36 @@ const POOL_WAKE:u32=WM_APP+112;
 const MAX_PACKET:usize=128*1024;
 const MAX_WINDOW_THREADS:usize=16;
 const MAX_QUEUED_WINDOWS:usize=64;
+/// Wakes the host so it can notice that its own executable was replaced.
+const UPDATE_TIMER:usize=9;
+
+/// Size and modification time of an executable: the cheapest way to tell two
+/// builds apart without loading version resources.
+fn stamp_of(path:&Path)->Option<(u64,i64)>{
+    let meta=std::fs::metadata(path).ok()?;
+    let modified=meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((meta.len(),modified.as_secs()as i64))
+}
+fn image_stamp()->Option<(u64,i64)>{stamp_of(&std::env::current_exe().ok()?)}
+fn stamp_changed(loaded:Option<(u64,i64)>,disk:Option<(u64,i64)>)->bool{
+    matches!((loaded,disk),(Some(loaded),Some(disk))if loaded!=disk)
+}
+/// True while this process still shows a file window of its own.
+fn has_open_window()->bool{
+    // Any visible top-level window of this process counts: the file windows,
+    // a settings dialog, the search popup. Only the host window itself is
+    // invisible, so an empty answer really means nothing would be lost.
+    struct Search(usize,bool);
+    unsafe extern "system" fn visit(hwnd:HWND,param:LPARAM)->windows::core::BOOL{
+        let state=unsafe{&mut*(param.0 as*mut Search)};
+        let mut pid=0;unsafe{GetWindowThreadProcessId(hwnd,Some(&mut pid))};
+        if pid as usize==state.0&&unsafe{IsWindowVisible(hwnd)}.as_bool(){state.1=true;return windows::core::BOOL(0);}
+        windows::core::BOOL(1)
+    }
+    let mut state=Search(std::process::id()as usize,false);
+    let _=unsafe{EnumWindows(Some(visit),LPARAM(&mut state as*mut Search as isize))};
+    state.1
+}
 static LOCAL:OnceLock<(PathBuf,isize)>=OnceLock::new();
 #[derive(Serialize,Deserialize)]
 struct Request{args:Vec<OsString>}
@@ -103,6 +133,16 @@ fn wake_pool(worker:&WindowWorker)->Result<()>{
     // Before PoolReady the thread checks its already-populated queue itself.
     Ok(())
 }
+/// Asks every idle window STA to end, leaving the host's first STA pumping
+/// until they are gone.
+fn retire(pool:&mut [WindowWorker],last_error:&mut Option<String>){
+    for worker in pool{
+        if !worker.ending{
+            worker.ending=true;let _=worker.commands.try_send(PoolCommand::Stop);
+            if let Err(error)=wake_pool(worker){*last_error=Some(format!("文件窗口线程退出通知失败：{error:#}"));}
+        }
+    }
+}
 fn run_window_pool(id:u64,destination:isize,commands:mpsc::Receiver<PoolCommand>,sender:&mpsc::Sender<Notice>)->Result<()>{
     // Keep this STA alive across serial windows. Shell's per-thread menu
     // runtime then has a bounded lifetime instead of being recreated per open.
@@ -193,6 +233,8 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     ingress.tx.try_send(Request{args}).context("初始启动请求失败")?;
     let (finished_tx,finished_rx)=mpsc::channel::<Notice>();let mut workers:Vec<Worker>=Vec::new();let mut pool:Vec<WindowWorker>=Vec::new();
     let mut queued:VecDeque<WindowJob>=VecDeque::new();let mut last_error=None;let mut serial=0u64;let mut shutting_down=false;let mut previous_status=None;
+    let mut retiring_for_update=false;let loaded_image=image_stamp();
+    unsafe{SetTimer(Some(hwnd),UPDATE_TIMER,2000,None);}
     loop{
         while !shutting_down&&queued.len()<MAX_QUEUED_WINDOWS{let Ok(request)=rx.try_recv()else{break;};
             let kind=if request.args.iter().any(|a|a=="--background"||a=="--quick-search"||a=="--quick-search-settings"){"background"}else{"window"};
@@ -246,20 +288,27 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
         // another window remains alive. Once the last component ends, retire
         // the pool while the host's first STA continues pumping COM messages.
         if !shutting_down&&workers.is_empty()&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none()){
-            shutting_down=true;ingress.accepting.set(false);
-            for worker in &mut pool{
-                if !worker.ending{
-                    worker.ending=true;let _=worker.commands.try_send(PoolCommand::Stop);
-                    if let Err(error)=wake_pool(worker){last_error=Some(format!("文件窗口线程退出通知失败：{error:#}"));}
-                }
-            }
+            shutting_down=true;ingress.accepting.set(false);retire(&mut pool,&mut last_error);
+        }
+        // An update replaced the executable under this process: it still runs
+        // the old image, and the resident background component (quick search)
+        // would otherwise keep it alive forever, forwarding every new launch
+        // into stale code. Step aside as soon as no window would be lost.
+        if !retiring_for_update&&queued.is_empty()&&pool.iter().all(|worker|worker.job.is_none())
+            &&stamp_changed(loaded_image,image_stamp())&&!has_open_window(){
+            trace("host-retire-for-update");
+            retiring_for_update=true;shutting_down=true;ingress.accepting.set(false);retire(&mut pool,&mut last_error);
         }
         // COM/TLS finalizers can still need the first STA after component code
         // returns. Keep pumping while the OS thread finishes; never block it.
         let retiring_menus=zsdesk_windows::shell::file_transfer::pending_operations()+crate::context_menu_process::pending_workers();
         unsafe{if workers.iter().any(|worker|worker.ending)||pool.iter().any(|worker|worker.ending)||retiring_menus>0{SetTimer(Some(hwnd),1,25,None);}else{let _=KillTimer(Some(hwnd),1);}}
         status(&profile,&workers,&pool,queued.len(),last_error.as_deref(),&mut previous_status);
-        if shutting_down&&workers.is_empty()&&pool.is_empty()&&retiring_menus==0{break;}
+        // A host that is only holding background components may leave while
+        // those threads are still alive: the process ending is exactly what the
+        // next launch needs in order to load the new build.
+        if (shutting_down&&workers.is_empty()&&pool.is_empty()&&retiring_menus==0)
+            ||(retiring_for_update&&pool.is_empty()&&retiring_menus==0){break;}
         let mut message=MSG::default();let received=unsafe{GetMessageW(&mut message,None,0,0)}.0;
         // Component WM_QUIT belongs to its UI thread. Only component lifetime
         // accounting may end this host, including after COM pumps a quit.
@@ -270,4 +319,29 @@ pub fn run(profile:PathBuf,args:Vec<OsString>)->Result<()>{
     drop(window);drop(ingress);
     if let Err(error)=crate::fast_search::everything::shutdown_managed_if_unused(){trace(&format!("Everything shutdown: {error:#}"));}
     if let Some(error)=last_error{bail!("{error}");}Ok(())
+}
+
+#[cfg(test)]
+mod tests{
+    use super::*;
+
+    #[test]
+    fn an_unchanged_executable_keeps_the_host_alive(){
+        // Same build: nothing to retire for, even with no window open.
+        assert!(!stamp_changed(Some((5_524_480,1_795_244_400)),Some((5_524_480,1_795_244_400))));
+    }
+
+    #[test]
+    fn a_replaced_executable_asks_the_host_to_step_aside(){
+        // A rebuild changes both the timestamp and, usually, the length.
+        assert!(stamp_changed(Some((5_524_480,1_795_244_400)),Some((5_601_000,1_795_250_000))));
+        assert!(stamp_changed(Some((5_524_480,1_795_244_400)),Some((5_524_480,1_795_250_000))));
+    }
+
+    #[test]
+    fn a_missing_executable_is_not_an_update(){
+        // A half-copied or unmounted path must not make a running host quit.
+        assert!(!stamp_changed(Some((5_524_480,1_795_244_400)),None));
+        assert!(!stamp_changed(None,Some((5_524_480,1_795_244_400))));
+    }
 }

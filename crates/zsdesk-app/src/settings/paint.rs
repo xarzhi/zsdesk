@@ -226,22 +226,24 @@ impl Paint<'_> {
         let cv = self.canvas;
         let p = &self.palette;
         let radius = rect.h / 2.0;
-        let knob = rect.h - 4.0;
-        let knob_rect = |x: f32| RectF::new(x, rect.y + 2.0, knob, knob);
+        // WinUI keeps a smaller thumb than the track: 12 px inside 20, 14 on.
+        let knob = if on { rect.h * 0.64 } else { rect.h * 0.55 };
+        let inset = (rect.h - knob) / 2.0;
+        let knob_rect = |x: f32| RectF::new(x, rect.y + inset, knob, knob);
         if !enabled {
             cv.round(rect, radius, track_off(self.dark));
             cv.stroke_round(rect, radius, c(p.stroke), 1.0);
-            let x = if on { rect.right() - knob - 2.0 } else { rect.x + 2.0 };
+            let x = if on { rect.right() - knob - inset } else { rect.x + inset };
             cv.round(knob_rect(x), knob / 2.0, c(p.text_disabled));
             return;
         }
         if on {
             cv.round(rect, radius, c(p.accent));
-            cv.round(knob_rect(rect.right() - knob - 2.0), knob / 2.0, c(p.accent_text));
+            cv.round(knob_rect(rect.right() - knob - inset), knob / 2.0, c(p.accent_text));
         } else {
             cv.round(rect, radius, track_off(self.dark));
             cv.stroke_round(rect, radius, if self.dark { Color::rgba8(0xFF, 0xFF, 0xFF, 0x66) } else { Color::rgba8(0, 0, 0, 0x60) }, 1.0);
-            cv.round(knob_rect(rect.x + 2.0), knob / 2.0,
+            cv.round(knob_rect(rect.x + inset), knob / 2.0,
                 if self.dark { Color::rgba8(0xD6, 0xD6, 0xD6, 0xFF) } else { Color::rgba8(0x5A, 0x5A, 0x5A, 0xFF) });
         }
     }

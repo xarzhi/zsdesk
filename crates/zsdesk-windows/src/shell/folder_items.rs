@@ -15,16 +15,18 @@ use windows::{
         Storage::FileSystem::{
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
         },
-        System::{SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN}, WindowsProgramming::GetPrivateProfileStringW},
+        System::{SystemServices::{SFGAO_FOLDER, SFGAO_HIDDEN, SFGAO_STREAM}, WindowsProgramming::GetPrivateProfileStringW},
         UI::Shell::{
-            BHID_EnumItems, IEnumShellItems, IShellItem, SHLoadIndirectString,
+            BHID_EnumItems, IEnumShellItems, IShellItem, SHGetKnownFolderItem, SHLoadIndirectString,
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_Profile,
+            FOLDERID_Pictures, FOLDERID_Videos, KF_FLAG_DEFAULT,
             SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
         },
     },
 };
 use zsdesk_core::model::explorer::ShellLocation;
 
-use super::{icons, shell_item};
+use super::{drives::Drive, icons, shell_item};
 
 /// One row of the file view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,8 +42,13 @@ pub struct FolderEntry {
     pub size: Option<u64>,
     /// Last write time in Unix milliseconds.
     pub modified: Option<u64>,
+    /// Creation time in Unix milliseconds, for the 创建日期 column.
+    pub created: Option<u64>,
     /// Index in the system image list.
     pub icon: i32,
+    /// Volume behind the entry, when it is a drive root. 此电脑 draws these as
+    /// device cards with a capacity bar instead of plain rows.
+    pub drive: Option<Drive>,
 }
 
 impl FolderEntry {
@@ -61,7 +68,12 @@ impl FolderEntry {
 
     /// Real file name, without the localized rename a folder may give itself.
     /// Commands hand this to the Shell, which parses it without guessing.
+    ///
+    /// A drive root has no last segment to report, and the Shell's 此电脑
+    /// folder parses it by its letter, so `D:\` is the name commands need —
+    /// "本地磁盘 (D:)" is a display name no verb accepts.
     pub fn file_name(&self) -> String {
+        if let Some(drive) = &self.drive { return format!("{}:\\", drive.letter); }
         self.path.as_ref().and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
@@ -71,16 +83,43 @@ impl FolderEntry {
 
 /// Lists the children of `location`.
 ///
+/// `include_hidden` follows 查看 → 隐藏的项目: the Shell hides them unless the
+/// user asked for them, and the drawn list has to obey the same switch.
+///
 /// # Safety
 ///
 /// COM must be initialized on the calling thread.
-pub unsafe fn list(location: &ShellLocation) -> Result<Vec<FolderEntry>> {
+pub unsafe fn list(location: &ShellLocation, include_hidden: bool) -> Result<Vec<FolderEntry>> {
     if let ShellLocation::Path(path) = location {
         // A namespace folder reached through a path (a control panel page, a
         // device) has no directory to scan, so the Shell takes it from here.
-        if let Some(entries) = list_directory(path) { return Ok(entries); }
+        if let Some(entries) = list_directory(path, include_hidden) { return Ok(entries); }
     }
-    unsafe { list_shell(location) }
+    let entries = unsafe { list_shell(location) }?;
+    // 此电脑 lists devices, not files: Explorer shows a drive that is present
+    // but not ready (an empty card reader, an open tray) instead of hiding it,
+    // and the hidden attribute the Shell puts on those means nothing here.
+    let mut entries: Vec<FolderEntry> = if include_hidden || matches!(location, ShellLocation::ThisPc) {
+        entries
+    } else {
+        entries.into_iter().filter(|entry| !entry.hidden).collect()
+    };
+    // 此电脑 is not a folder of files: it is the drive list, and Explorer puts
+    // it in letter order. The Shell's own enumeration depends on how the
+    // devices were mounted, so a USB disk can land between C: and D:.
+    if matches!(location, ShellLocation::ThisPc) { sort_drives(&mut entries); }
+    Ok(entries)
+}
+
+/// Drive roots by letter, the way 此电脑 lists them: C:, D:, E: … and then
+/// anything the Shell calls an item without a volume.
+fn sort_drives(entries: &mut [FolderEntry]) {
+    entries.sort_by(|a, b| match (&a.drive, &b.drive) {
+        (Some(a), Some(b)) => a.letter.cmp(&b.letter),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => zsdesk_core::model::view::natural_cmp(&a.name, &b.name),
+    });
 }
 
 unsafe fn list_shell(location: &ShellLocation) -> Result<Vec<FolderEntry>> {
@@ -101,7 +140,7 @@ unsafe fn list_shell(location: &ShellLocation) -> Result<Vec<FolderEntry>> {
 const TICKS_PER_MS: u64 = 10_000;
 const EPOCH_DIFFERENCE_MS: u64 = 11_644_473_600_000;
 
-fn list_directory(path: &Path) -> Option<Vec<FolderEntry>> {
+fn list_directory(path: &Path, include_hidden: bool) -> Option<Vec<FolderEntry>> {
     use std::os::windows::fs::MetadataExt;
     let reader = std::fs::read_dir(path).ok()?;
     let mut entries = Vec::with_capacity(reader.size_hint().0);
@@ -111,19 +150,53 @@ fn list_directory(path: &Path) -> Option<Vec<FolderEntry>> {
         let attributes = metadata.file_attributes();
         // The Shell enumerates without SHCONTF_INCLUDEHIDDEN, which is what
         // Explorer shows by default: profile files and junctions stay hidden.
-        if attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0 { continue; }
+        let hidden = attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0;
+        if hidden && !include_hidden { continue; }
         let file_name = item.file_name().to_string_lossy().into_owned();
         if file_name.is_empty() { continue; }
         let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
         let path = item.path();
         let name = if is_dir { names.folder_name(&path, &file_name, attributes) } else { names.file_name(&file_name) };
         let modified = (metadata.last_write_time() / TICKS_PER_MS).checked_sub(EPOCH_DIFFERENCE_MS);
+        let created = (metadata.creation_time() / TICKS_PER_MS).checked_sub(EPOCH_DIFFERENCE_MS);
         let icon = names.icon(&file_name, is_dir);
         let parsing_name = path.to_string_lossy().into_owned();
-        entries.push(FolderEntry { name, parsing_name, path: Some(path), is_dir, hidden: false,
-            size: (!is_dir).then(|| metadata.len()), modified, icon });
+        entries.push(FolderEntry { name, parsing_name, path: Some(path), is_dir, hidden,
+            size: (!is_dir).then(|| metadata.len()), modified, created, icon, drive: None });
     }
     Some(entries)
+}
+
+/// Rows for a set of paths, the way a search result page needs them.
+///
+/// The index answers with paths only, while the drawn list needs the same
+/// name, size, timestamp and icon a directory scan produces. Paths that
+/// vanished between the index read and this call are skipped, exactly like the
+/// Shell's own results folder does when an item cannot be materialized.
+///
+/// # Safety
+///
+/// COM must be initialized on the calling thread.
+pub unsafe fn entries_for_paths(paths: &[PathBuf], include_hidden: bool) -> Vec<FolderEntry> {
+    use std::os::windows::fs::MetadataExt;
+    let mut names = Names::default();
+    let mut entries = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Ok(metadata) = std::fs::metadata(path) else { continue };
+        let attributes = metadata.file_attributes();
+        let hidden = attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0;
+        if hidden && !include_hidden { continue; }
+        let Some(file_name) = path.file_name().map(|name| name.to_string_lossy().into_owned()) else { continue };
+        if file_name.is_empty() { continue; }
+        let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        let name = if is_dir { names.folder_name(path, &file_name, attributes) } else { names.file_name(&file_name) };
+        let modified = (metadata.last_write_time() / TICKS_PER_MS).checked_sub(EPOCH_DIFFERENCE_MS);
+        let created = (metadata.creation_time() / TICKS_PER_MS).checked_sub(EPOCH_DIFFERENCE_MS);
+        let icon = names.icon(&file_name, is_dir);
+        entries.push(FolderEntry { name, parsing_name: path.to_string_lossy().into_owned(), path: Some(path.clone()),
+            is_dir, hidden, size: (!is_dir).then(|| metadata.len()), modified, created, icon, drive: None });
+    }
+    entries
 }
 
 /// Per-listing caches: one system-image-list lookup and one "is this a known
@@ -245,18 +318,24 @@ fn describe(item: &IShellItem) -> FolderEntry {
         .map(|value| unsafe { super::take(value) }).unwrap_or_default();
     let is_dir = attributes & SFGAO_FOLDER.0 != 0;
     let hidden = attributes & SFGAO_HIDDEN.0 != 0;
-    let (size, modified) = match path.as_ref().and_then(|path| std::fs::metadata(path).ok()) {
+    let (size, modified, created) = match path.as_ref().and_then(|path| std::fs::metadata(path).ok()) {
         Some(metadata) => {
             let size = (!is_dir).then(|| metadata.len());
-            let modified = metadata.modified().ok()
+            let millis = |time: std::io::Result<std::time::SystemTime>| time.ok()
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|since| since.as_millis() as u64);
-            (size, modified)
+            (size, millis(metadata.modified()), millis(metadata.created()))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
-    let icon = icons::icon_index_for_name(&name, is_dir).unwrap_or(0);
-    FolderEntry { name, parsing_name, path, is_dir, hidden, size, modified, icon }
+    let drive = path.as_ref().and_then(|path| Drive::of_root(path));
+    // A drive root wears the volume icon (a hard disk, a USB stick, a disc),
+    // not the folder icon a plain directory would get.
+    let icon = match (&drive, path.as_ref()) {
+        (Some(_), Some(path)) => icons::icon_index_for_path(path),
+        _ => None,
+    }.or_else(|| icons::icon_index_for_name(&name, is_dir)).unwrap_or(0);
+    FolderEntry { name, parsing_name, path, is_dir, hidden, size, modified, created, icon, drive }
 }
 
 /// Rebuilds the Shell item of an entry, for context menus and verbs.
@@ -278,39 +357,188 @@ pub fn icon_index_of(location: &ShellLocation) -> i32 {
     index.or_else(|| icons::icon_index_for_name(&location.title(), true)).unwrap_or(0)
 }
 
-/// Top-level rows of the self-drawn navigation tree: label, target, icon index.
-pub fn tree_roots() -> Vec<(String, ShellLocation, i32)> {
-    use windows::Win32::UI::Shell::{
-        FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music, FOLDERID_NetworkFolder,
-        FOLDERID_Pictures, FOLDERID_Videos,
-    };
-    let mut roots: Vec<(String, ShellLocation)> = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from).filter(|path| path.is_dir()) {
-        roots.push(("主文件夹".into(), ShellLocation::Path(home)));
+/// One row of the self-drawn navigation tree.
+#[derive(Clone, Debug)]
+pub struct TreeRow {
+    /// Label shown next to the icon; empty on a separator.
+    pub name: String,
+    /// Folder the row opens; `None` marks a separator line.
+    pub location: Option<ShellLocation>,
+    /// System image-list index.
+    pub icon: i32,
+    /// Identity of the item inside the namespace it came from.
+    ///
+    /// A pinned quick-access folder is a child of the quick-access namespace,
+    /// not a plain folder: its menu offers "从快速访问取消固定", while the same
+    /// folder reached by path only offers "固定到快速访问". Keeping the PIDL is
+    /// what lets the pane hand the Shell the item Explorer itself would.
+    pub pidl: Option<Vec<u8>>,
+}
+
+/// Quick access: the folders the user pinned, in the order Explorer shows them.
+pub const QUICK_ACCESS: &str = "shell:::{679F85CB-0220-4080-B29B-5540CC05AAB6}";
+/// Gallery (图库), present from Windows 11 22H2 on.
+const GALLERY: &str = "shell:::{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}";
+/// Network places. It has no filesystem path, so it is opened by CLSID.
+const NETWORK: &str = "shell:::{F02C1A0D-BE21-4350-88B0-7367FC96EF3C}";
+
+/// Top-level rows of the self-drawn navigation tree.
+///
+/// The layout follows Explorer's own pane: 主文件夹 and 图库 on their own, a
+/// rule, the pinned quick-access folders, another rule, then 此电脑 and 网络.
+/// The quick-access list is read from the Shell namespace rather than assumed,
+/// so pinning or unpinning a folder in Explorer changes this pane too.
+pub fn tree_roots() -> Vec<TreeRow> {
+    let mut rows: Vec<TreeRow> = Vec::new();
+    if let Some(home) = crate::desktop::known_folder(&FOLDERID_Profile) {
+        let location = ShellLocation::Path(home);
+        rows.push(TreeRow { name: "主文件夹".into(), icon: icon_index_of(&location), location: Some(location), pidl: None });
     }
-    for (folder, title) in [
-        (&FOLDERID_Desktop, "桌面"),
-        (&FOLDERID_Downloads, "下载"),
-        (&FOLDERID_Documents, "文档"),
-        (&FOLDERID_Pictures, "图片"),
-        (&FOLDERID_Music, "音乐"),
-        (&FOLDERID_Videos, "视频"),
-    ] {
-        if let Some(path) = crate::desktop::known_folder(folder) {
-            roots.push((title.into(), ShellLocation::Path(path)));
+    if let Some(gallery) = shell_row(GALLERY, "图库") { rows.push(gallery); }
+    rows.push(separator());
+    let mut quick_access = quick_access_rows();
+    if quick_access.is_empty() {
+        // A system without the quick-access namespace still gets the folders
+        // Explorer pins by default, so the pane is never empty above 此电脑.
+        for folder in [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
+            &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos] {
+            if let Some(row) = known_folder_row(folder) { quick_access.push(row); }
         }
     }
-    roots.push(("此电脑".into(), ShellLocation::ThisPc));
-    if let Some(path) = crate::desktop::known_folder(&FOLDERID_NetworkFolder) {
-        roots.push(("网络".into(), ShellLocation::Path(path)));
+    rows.extend(quick_access);
+    rows.push(separator());
+    rows.push(TreeRow { name: "此电脑".into(), icon: icon_index_of(&ShellLocation::ThisPc), location: Some(ShellLocation::ThisPc), pidl: None });
+    if let Some(network) = shell_row(NETWORK, "网络") { rows.push(network); }
+    rows
+}
+
+/// A blank line that divides the pane into groups, like Explorer's rules.
+fn separator() -> TreeRow { TreeRow { name: String::new(), location: None, icon: 0, pidl: None } }
+
+/// A row for one Shell namespace, resolved through its CLSID.
+fn shell_row(parsing_name: &str, title: &str) -> Option<TreeRow> {
+    let location = ShellLocation::Shell { parsing_name: parsing_name.into(), title: title.into() };
+    let item = unsafe { shell_item::shell_item(&location) }.ok()?;
+    Some(TreeRow { name: title.into(), icon: item_icon(&item), location: Some(location), pidl: None })
+}
+
+/// A row for a known folder: the name Explorer uses, its own icon, and the
+/// filesystem path when the folder has one.
+fn known_folder_row(folder: &windows::core::GUID) -> Option<TreeRow> {
+    let item = unsafe { SHGetKnownFolderItem::<IShellItem>(folder, KF_FLAG_DEFAULT, None) }.ok()?;
+    let name = unsafe { item.GetDisplayName(SIGDN_NORMALDISPLAY) }.map(|value| unsafe { super::take(value) }).unwrap_or_default();
+    let path = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()
+        .map(|value| PathBuf::from(unsafe { super::take(value) }))
+        .filter(|path| !path.as_os_str().is_empty());
+    let location = match path {
+        Some(path) => ShellLocation::Path(path),
+        // A folder with no directory behind it (a library, a device) is only
+        // resolvable through its absolute parsing name; the display name is not
+        // a parsing name and would leave the row pointing at nothing.
+        None => {
+            let parsing_name = unsafe { item.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }
+                .map(|value| unsafe { super::take(value) }).unwrap_or_default();
+            if parsing_name.is_empty() { return None; }
+            ShellLocation::Shell { parsing_name, title: name.clone() }
+        }
+    };
+    Some(TreeRow { name, icon: item_icon(&item), location: Some(location), pidl: None })
+}
+
+/// The pinned quick-access folders, read from the Shell namespace that
+/// Explorer itself fills. Recent files live in the same namespace but are not
+/// folders, so they never reach the pane.
+fn quick_access_rows() -> Vec<TreeRow> {
+    // A pinned known folder keeps the icon and the localized name Explorer
+    // shows for it; only the user's own pins fall back to their item name.
+    let known = known_folder_lookup();
+    let mut rows = Vec::new();
+    for child in quick_access_folders() {
+        let path = unsafe { child.GetDisplayName(SIGDN_FILESYSPATH) }.ok()
+            .map(|value| PathBuf::from(unsafe { super::take(value) }))
+            .filter(|path| !path.as_os_str().is_empty());
+        let pinned = path.as_ref().map(|path| normalize(path)).and_then(|key| known.get(&key).cloned());
+        let name = pinned.as_ref().map(|(name, _)| name.clone())
+            .unwrap_or_else(|| unsafe { child.GetDisplayName(SIGDN_NORMALDISPLAY) }
+                .map(|value| unsafe { super::take(value) }).unwrap_or_default());
+        let icon = pinned.map(|(_, icon)| icon).unwrap_or_else(|| item_icon(&child));
+        let location = match path {
+            Some(path) => ShellLocation::Path(path),
+            None => ShellLocation::Shell {
+                parsing_name: unsafe { child.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }
+                    .map(|value| unsafe { super::take(value) }).unwrap_or_default(),
+                title: name.clone(),
+            },
+        };
+        rows.push(TreeRow { name, icon, location: Some(location), pidl: super::pidl::item_pidl(&child) });
     }
-    roots.push(("回收站".into(), ShellLocation::recycle_bin()));
-    roots.into_iter().map(|(name, location)| { let icon = icon_index_of(&location); (name, location, icon) }).collect()
+    rows
+}
+
+/// Identity of the pinned quick-access group: the absolute parsing name of
+/// every pinned folder, in Explorer's order.
+///
+/// Pinning or unpinning a folder — from this pane's menu, from a folder's menu
+/// or from Explorer itself — changes this list. Comparing it is how the pane
+/// notices the change without re-reading icons and names on every focus.
+pub fn quick_access_signature() -> Vec<String> {
+    quick_access_folders().into_iter()
+        .map(|child| unsafe { child.GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING) }
+            .map(|value| unsafe { super::take(value) }).unwrap_or_default())
+        .collect()
+}
+
+/// The folder items of the quick-access namespace, in Explorer's order.
+///
+/// Recent files live in the same namespace but are not folders, so they are
+/// filtered out here instead of in every caller.
+fn quick_access_folders() -> Vec<IShellItem> {
+    let location = ShellLocation::Shell { parsing_name: QUICK_ACCESS.into(), title: "快速访问".into() };
+    let Ok(folder) = (unsafe { shell_item::shell_item(&location) }) else { return Vec::new() };
+    let Ok(items) = (unsafe { folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) }) else { return Vec::new() };
+    let mut folders = Vec::new();
+    loop {
+        let mut fetched = [None];
+        if unsafe { items.Next(&mut fetched, None) }.is_err() { break; }
+        let Some(child) = fetched[0].take() else { break };
+        let attributes = unsafe { child.GetAttributes(SFGAO_FOLDER | SFGAO_STREAM | SFGAO_HIDDEN) }
+            .map(|value| value.0).unwrap_or(0);
+        if attributes & SFGAO_FOLDER.0 == 0 || attributes & (SFGAO_STREAM.0 | SFGAO_HIDDEN.0) != 0 { continue; }
+        folders.push(child);
+    }
+    folders
+}
+
+/// Names and icons of the six folders Explorer pins on a fresh profile.
+fn known_folder_lookup() -> std::collections::HashMap<String, (String, i32)> {
+    let mut lookup = std::collections::HashMap::new();
+    for folder in [&FOLDERID_Desktop, &FOLDERID_Downloads, &FOLDERID_Documents,
+        &FOLDERID_Pictures, &FOLDERID_Music, &FOLDERID_Videos] {
+        let Some(path) = crate::desktop::known_folder(folder) else { continue };
+        let Some(row) = known_folder_row(folder) else { continue };
+        lookup.insert(normalize(&path), (row.name, row.icon));
+    }
+    lookup
+}
+
+/// Case-insensitive key for a folder path, so a Shell item and a known folder
+/// compare equal.
+fn normalize(path: &Path) -> String { path.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase() }
+
+/// System image-list index of a Shell item, through its PIDL.
+fn item_icon(item: &IShellItem) -> i32 {
+    super::pidl::item_pidl(item).and_then(|pidl| icons::icon_index(&pidl)).unwrap_or(0)
 }
 
 /// Sub-folders of `location`, the children of one navigation-tree row.
 pub fn folder_children(location: &ShellLocation) -> Vec<FolderEntry> {
-    let mut items = unsafe { list(location) }.unwrap_or_default();
+    let mut items = unsafe { list(location, false) }.unwrap_or_default();
+    // 此电脑 already arrives in drive order and carries the drives that are
+    // present but not ready; a folder tree keeps only the folders it can open.
+    if matches!(location, ShellLocation::ThisPc) {
+        items.retain(|item| item.is_dir);
+        return items;
+    }
     items.retain(|item| item.is_dir && !item.hidden);
     items.sort_by_key(|item| item.name.to_lowercase());
     items
@@ -323,11 +551,11 @@ mod tests {
     #[test]
     fn kind_and_extension_describe_files_and_folders() {
         let file = FolderEntry { name: "report.PDF".into(), parsing_name: String::new(), path: Some(PathBuf::from(r"C:\a\report.PDF")),
-            is_dir: false, hidden: false, size: Some(1), modified: None, icon: 0 };
+            is_dir: false, hidden: false, size: Some(1), modified: None, created: None, icon: 0, drive: None };
         assert_eq!(file.extension(), "pdf");
         assert_eq!(file.kind(), "PDF 文件");
         let folder = FolderEntry { name: "docs".into(), parsing_name: String::new(), path: Some(PathBuf::from(r"C:\a\docs")),
-            is_dir: true, hidden: false, size: None, modified: None, icon: 0 };
+            is_dir: true, hidden: false, size: None, modified: None, created: None, icon: 0, drive: None };
         assert_eq!(folder.kind(), "文件夹");
         assert_eq!(folder.extension(), "");
     }
@@ -336,7 +564,7 @@ mod tests {
     fn a_file_is_known_by_its_real_name_not_the_localized_folder_name() {
         let folder = FolderEntry { name: "桌面".into(), parsing_name: r"C:\Users\me\Desktop".into(),
             path: Some(PathBuf::from(r"C:\Users\me\Desktop")), is_dir: true, hidden: false,
-            size: None, modified: None, icon: 0 };
+            size: None, modified: None, created: None, icon: 0, drive: None };
         assert_eq!(folder.file_name(), "Desktop");
     }
 
@@ -357,15 +585,30 @@ mod tests {
     }
 
     #[test]
+    fn drives_are_listed_by_letter_not_by_their_display_name() {
+        let drive = |letter: char, name: &str| FolderEntry { name: name.into(), parsing_name: format!("{letter}:\\"),
+            path: Some(PathBuf::from(format!("{letter}:\\"))), is_dir: true, hidden: false,
+            size: None, modified: None, created: None, icon: 0,
+            drive: Some(Drive { letter, kind: super::super::drives::DriveKind::Fixed, total: 1, free: 1 }) };
+        // The Shell can hand the volumes over in any order, and sorting by the
+        // localized name would put "Lenovo (G:)" above "本地磁盘 (C:)".
+        let mut entries = vec![drive('G', "Lenovo (G:)"), drive('C', "本地磁盘 (C:)"), drive('E', "新加卷 (E:）")];
+        sort_drives(&mut entries);
+        assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+            ["本地磁盘 (C:)", "新加卷 (E:）", "Lenovo (G:)"]);
+    }
+
+    #[test]
     fn the_current_system_lists_a_real_directory_with_sizes_and_dates() {
         let directory = std::env::current_dir().expect("a working directory");
-        let entries = list_directory(&directory).expect("the crate directory is a real folder");
+        let entries = list_directory(&directory, false).expect("the crate directory is a real folder");
         assert!(!entries.is_empty());
         let manifest = entries.iter().find(|entry| entry.parsing_name.ends_with("Cargo.toml"))
             .expect("the manifest is listed");
         assert!(!manifest.is_dir);
         assert!(manifest.size.is_some_and(|size| size > 0), "a file has its size");
         assert!(manifest.modified.is_some(), "a file has its last write time");
+        assert!(manifest.created.is_some(), "a file has its creation time");
         assert!(manifest.path.is_some() && manifest.icon != 0, "a row knows where it lives and which icon it uses");
         assert!(entries.iter().all(|entry| !entry.hidden), "hidden entries stay out of the list");
     }

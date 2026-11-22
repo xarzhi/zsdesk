@@ -9,7 +9,12 @@ pub fn entry(label: &str, id: &str, enabled: bool, checked: bool) -> MenuItemSpe
 pub fn item(label: &str, id: &str) -> MenuItemSpec { entry(label, id, true, false) }
 pub fn menu(items: Vec<MenuItemSpec>) -> MenuSpec { let mut m = MenuSpec::new(); m.items = items; m }
 pub fn submenu(label: &str, items: Vec<MenuItemSpec>) -> MenuItemSpec {
-    MenuItemSpec::Submenu { id: None, label: label.into(), enabled: true, menu: menu(items) }
+    submenu_enabled(label, items, true)
+}
+/// A submenu that can be shown greyed out, for a feature the current view
+/// cannot offer (the drawn list has no grouping yet).
+pub fn submenu_enabled(label: &str, items: Vec<MenuItemSpec>, enabled: bool) -> MenuItemSpec {
+    MenuItemSpec::Submenu { id: None, label: label.into(), enabled, menu: menu(items) }
 }
 
 pub fn tab_menu(count: usize, index: usize, can_restore: bool) -> MenuSpec {
@@ -59,8 +64,21 @@ pub struct ShowState {
 }
 
 pub fn view_menu(mode: i32, icon: i32, show: ShowState) -> MenuSpec {
-    let current = current_view(mode, icon);
-    let mut items: Vec<MenuItemSpec> = VIEW_CHOICES.iter().map(|(label, id, _)| entry(label, id, true, *id == current)).collect();
+    view_menu_current(current_view(mode, icon), show)
+}
+
+/// The same menu, ticked from a view id the caller already knows. The drawn
+/// list names its own layout that way instead of imitating the Shell's
+/// (mode, icon-size) pair, which cannot tell 小图标 from 中等图标.
+pub fn view_menu_current(current: &str, show: ShowState) -> MenuSpec {
+    view_menu_with(current, show, true)
+}
+
+/// The same menu with the eight view modes switched off, for a folder that has
+/// exactly one presentation of its own — 此电脑 draws device cards, and picking
+/// 大图标 there would change nothing but the tick.
+pub fn view_menu_with(current: &str, show: ShowState, choices: bool) -> MenuSpec {
+    let mut items: Vec<MenuItemSpec> = VIEW_CHOICES.iter().map(|(label, id, _)| entry(label, id, choices, *id == current)).collect();
     items.push(MenuItemSpec::Separator);
     items.push(submenu("显示", vec![
         entry("导航窗格", "show-nav", true, show.navigation),
@@ -84,17 +102,23 @@ pub const SORT_KEYS: &[(&str, &str, SortKey)] = &[
     ("类型", "sort-type", SortKey::Type), ("大小", "sort-size", SortKey::Size), ("创建日期", "sort-created", SortKey::Created),
 ];
 
-pub fn sort_menu(current: Option<(SortKey, bool)>, group: Option<SortKey>) -> MenuSpec {
+pub fn sort_menu(current: Option<(SortKey, bool)>, group: Option<SortKey>, groupable: bool) -> MenuSpec {
+    sort_menu_with(current, group, groupable, true)
+}
+
+/// The same menu, optionally greyed out. 此电脑 keeps its drives in letter
+/// order, so sorting it by size would only move the tick and not one card.
+pub fn sort_menu_with(current: Option<(SortKey, bool)>, group: Option<SortKey>, groupable: bool, sortable: bool) -> MenuSpec {
     let mut items: Vec<MenuItemSpec> = SORT_KEYS.iter()
-        .map(|(label, id, key)| entry(label, id, true, current.is_some_and(|(k, _)| k == *key))).collect();
+        .map(|(label, id, key)| entry(label, id, sortable, current.is_some_and(|(k, _)| k == *key))).collect();
     let ascending = current.is_none_or(|(_, asc)| asc);
     items.push(MenuItemSpec::Separator);
-    items.push(entry("递增", "sort-asc", true, ascending));
-    items.push(entry("递减", "sort-desc", true, !ascending));
+    items.push(entry("递增", "sort-asc", sortable, ascending));
+    items.push(entry("递减", "sort-desc", sortable, !ascending));
     items.push(MenuItemSpec::Separator);
-    let mut groups = vec![entry("（无）", "group-none", true, group.is_none())];
-    groups.extend(SORT_KEYS.iter().map(|(label, id, key)| entry(label, &id.replace("sort-", "group-"), true, group == Some(*key))));
-    items.push(submenu("分组依据", groups));
+    let mut groups = vec![entry("（无）", "group-none", sortable, group.is_none())];
+    groups.extend(SORT_KEYS.iter().map(|(label, id, key)| entry(label, &id.replace("sort-", "group-"), sortable, group == Some(*key))));
+    items.push(submenu_enabled("分组依据", groups, groupable && sortable));
     menu(items)
 }
 
@@ -324,8 +348,24 @@ mod tests {
         assert_eq!(sort_key("sort-size"), Some(SortKey::Size));
         assert_eq!(sort_key("group-type"), Some(SortKey::Type));
         assert_eq!(sort_key("group-none"), None);
-        assert!(ids(&sort_menu(Some((SortKey::Name, true)), None)).contains(&"sort-asc".to_string()));
+        assert!(ids(&sort_menu(Some((SortKey::Name, true)), None, false)).contains(&"sort-asc".to_string()));
+        assert!(matches!(&sort_menu(None, None, false).items.last(), Some(MenuItemSpec::Submenu { enabled: false, .. })));
     }
+    #[test]
+    fn a_folder_with_one_presentation_greys_out_the_view_choices() {
+        // 此电脑 always draws device cards, so its menu reports the eight view
+        // modes as unavailable rather than ticking one that changes nothing.
+        let spec = view_menu_with("details", ShowState::default(), false);
+        let disabled = spec.items.iter().take(VIEW_CHOICES.len()).all(|item| {
+            matches!(item, MenuItemSpec::Command { enabled: false, .. })
+        });
+        assert!(disabled);
+        let sort = sort_menu_with(Some((SortKey::Name, true)), None, false, false);
+        assert!(matches!(&sort.items.last(), Some(MenuItemSpec::Submenu { enabled: false, .. })));
+        assert!(sort.items.iter().take(SORT_KEYS.len())
+            .all(|item| matches!(item, MenuItemSpec::Command { enabled: false, .. })));
+    }
+
     #[test]
     fn tab_list_escapes_mnemonics() {
         let spec = tab_list_menu(&["A&B".into()], 0, false);

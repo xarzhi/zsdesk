@@ -67,6 +67,19 @@ fn query_icon_index(name: &str, directory: bool) -> Option<i32> {
     (ok != 0).then_some(info.iIcon)
 }
 
+/// Icon index of a real path, as the disk sees it.
+///
+/// A drive root has to be looked up on disk, not by name: `C:\` answers with
+/// the hard-disk icon, a card reader with the removable-volume icon, and an
+/// optical drive with a disc — three icons no file-name pattern can produce.
+pub fn icon_index_for_path(path: &std::path::Path) -> Option<i32> {
+    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    let ok = unsafe { SHGetFileInfoW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info),
+        std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX) };
+    (ok != 0).then_some(info.iIcon)
+}
+
 /// Extracts an icon of at least `pixels` size from the system image list. Caller owns the HICON.
 pub fn system_icon(index: i32, pixels: i32) -> Option<HICON> {
     let mut candidates = Vec::new();
@@ -93,9 +106,29 @@ fn icon_size_rank(width: i32, height: i32, requested: i32) -> Option<(bool, i32)
     (size > 0).then(|| if size >= requested.max(1) { (false, size) } else { (true, -size) })
 }
 
+/// Extensions the list draws as a real picture instead of a generic icon.
+///
+/// Everything else — programs, documents, archives, shortcuts — keeps its own
+/// Shell icon, so an `.exe` shows the icon it embeds rather than a page glyph.
+const PICTURE: &[&str] = &[
+    "png", "jpg", "jpeg", "jpe", "jfif", "gif", "bmp", "dib", "webp", "tif", "tiff", "ico",
+    "heic", "heif", "avif", "jxl", "raw", "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf",
+];
+const VIDEO: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "avi", "wmv", "webm", "flv", "f4v", "mpg", "mpeg", "m2ts", "mts",
+    "ts", "3gp", "3g2", "ogv", "rm", "rmvb", "vob", "asf", "divx",
+];
+
+/// Pictures and videos get a thumbnail; the Shell falls back to the file's icon
+/// when no thumbnailer is installed or the file cannot be decoded.
+pub fn wants_thumbnail(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else { return false };
+    let extension = extension.to_ascii_lowercase();
+    PICTURE.contains(&extension.as_str()) || VIDEO.contains(&extension.as_str())
+}
+
 /// Owned icon handle.
-pub struct OwnedIcon(pub HICON);
-impl Drop for OwnedIcon { fn drop(&mut self) { let _ = unsafe { DestroyIcon(self.0) }; } }
+pub struct OwnedIcon(pub HICON);impl Drop for OwnedIcon { fn drop(&mut self) { let _ = unsafe { DestroyIcon(self.0) }; } }
 
 pub fn pidl_icon(pidl: &[u8], pixels: i32) -> Option<OwnedIcon> {
     system_icon(icon_index(pidl)?, pixels).map(OwnedIcon)
@@ -123,7 +156,16 @@ impl Drop for IconResult {
 // materializes its WIC copy or drops this result before anyone else uses it.
 unsafe impl Send for IconResult {}
 
-pub struct IconRequest { pub key: String, pub pidl: Vec<u8>, pub size: u32, pub thumbnail: bool, pub token: u64 }
+pub struct IconRequest { pub key: String, pub pidl: Vec<u8>, pub path: Option<std::path::PathBuf>, pub size: u32, pub thumbnail: bool, pub token: u64 }
+
+impl IconRequest {
+    /// Asks for a picture's thumbnail or a file's own icon, resolved from a
+    /// filesystem path. `pidl` stays empty: the worker turns the path into a
+    /// Shell item, so the UI thread never makes that cross-process call.
+    pub fn for_path(key: String, path: std::path::PathBuf, size: u32, thumbnail: bool, token: u64) -> Self {
+        Self { key, pidl: Vec::new(), path: Some(path), size, thumbnail, token }
+    }
+}
 
 const MAX_PENDING: usize = 128;
 const MAX_READY: usize = 16;
@@ -327,7 +369,10 @@ fn bitmap_bytes(bitmap: HBITMAP) -> u64 {
 }
 
 fn load(request: &IconRequest) -> Option<(HBITMAP, BitmapAlpha)> {
-    let item = super::pidl::item_from_pidl(&request.pidl).ok()?;
+    let item = match &request.path {
+        Some(path) => super::pidl::item_from_parsing_name(&path.to_string_lossy()).ok()?,
+        None => super::pidl::item_from_pidl(&request.pidl).ok()?,
+    };
     let factory: IShellItemImageFactory = item.cast().ok()?;
     let size = SIZE { cx: request.size as i32, cy: request.size as i32 };
     let flags = if request.thumbnail { SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK } else { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK };
@@ -361,6 +406,18 @@ fn scan_rest(pixels: &[u8]) -> BitmapAlpha {
 mod tests {
     use super::*;
     #[test]
+    fn only_pictures_and_videos_ask_for_a_thumbnail() {
+        assert!(wants_thumbnail("photo.PNG"));
+        assert!(wants_thumbnail("clip.mp4"));
+        assert!(wants_thumbnail("scan.tiff"));
+        // Programs, documents and extension-less files keep their own icon.
+        assert!(!wants_thumbnail("app.exe"));
+        assert!(!wants_thumbnail("notes.txt"));
+        assert!(!wants_thumbnail("LICENSE"));
+        assert!(!wants_thumbnail("archive.tar.gz"));
+        assert!(!wants_thumbnail(""));
+    }
+    #[test]
     fn icon_list_choice_uses_scaled_dimensions() {
         // At 150%, the small system list is already the exact 24px target.
         assert!(icon_size_rank(24,24,24) < icon_size_rank(48,48,24));
@@ -368,7 +425,7 @@ mod tests {
         assert!(icon_size_rank(256,256,300) < icon_size_rank(48,48,300));
         assert_eq!(icon_size_rank(0,0,16), None);
     }
-    fn request(token: u64) -> IconRequest { IconRequest { key: "same-file".into(), pidl: vec![0,0], size: 48, thumbnail: true, token } }
+    fn request(token: u64) -> IconRequest { IconRequest { key: "same-file".into(), pidl: vec![0,0], path: None, size: 48, thumbnail: true, token } }
     #[test]
     fn pending_queue_is_bounded_and_cancellation_frees_capacity() {
         let mut state = LoaderState::default();

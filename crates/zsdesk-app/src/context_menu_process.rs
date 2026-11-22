@@ -36,6 +36,8 @@ struct Status{token:String,pid:u32,window:isize,phase:String,validation:u64,befo
 #[derive(Serialize,Deserialize)]
 struct Decision{token:String,validation:u64,permit:bool}
 fn wide(value:&str)->Vec<u16>{value.encode_utf16().chain(Some(0)).collect()}
+#[allow(dead_code)]
+pub(crate) fn trace(line:String){use std::io::Write;if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open("C:/Users/22357/AppData/Local/Temp/zsdesk_rc.txt"){let _=writeln!(file,"{line}");}}
 fn created(pid:u32)->Option<u64>{
     let process=unsafe{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid)}.ok()?;
     let(mut begin,mut end,mut kernel,mut user)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());
@@ -127,6 +129,7 @@ impl Client{
         if let Some(status)=&status{
             if status.phase=="validate"&&status.validation>self.last_validation{
                 let permit=before(status.before_invoke);self.last_validation=status.validation;
+                trace(format!("validate permit={permit} before_invoke={} phase={}",status.before_invoke,status.phase));
                 // Publish commitment before granting execution. Drop may only
                 // terminate workers that have never received this grant.
                 if permit&&status.before_invoke{self.committed=true;}
@@ -134,6 +137,7 @@ impl Client{
             }
             if status.phase=="done"{
                 self.complete=true;
+                trace(format!("done outcome={:?} error={:?}",status.outcome,status.error));
                 return Some(match &status.error{Some(error)=>Err(anyhow::anyhow!(error.clone())),None=>Ok(status.outcome.unwrap_or(MenuOutcome::Dismissed))});
             }
         }
@@ -241,7 +245,9 @@ fn run_worker(path:&Path)->Result<()>{
     unsafe{RegisterClassW(&WNDCLASSW{hInstance:instance,lpfnWndProc:Some(procedure),lpszClassName:class,..Default::default()});}
     let watch=Box::new(Watch{request:state.request.clone(),path:path.into(),
         #[cfg(test)]command:std::cell::Cell::new(None),#[cfg(test)]menu_open:std::cell::Cell::new(false)});
+    trace("worker: creating window".to_string());
     let window=unsafe{CreateWindowExW(WS_EX_TOOLWINDOW,class,w!("ZSdesk"),WS_POPUP,0,0,0,0,None,None,Some(instance),Some((&*watch as*const Watch).cast()))}?;
+    trace("worker: window ready".to_string());
     struct Window(HWND);impl Drop for Window{fn drop(&mut self){let _=unsafe{DestroyWindow(self.0)};}}let _window=Window(window);
     state.status.window=window.0 as isize;unsafe{SetTimer(Some(window),1,100,None);}
     let result=(||->Result<MenuOutcome>{
@@ -254,17 +260,23 @@ fn run_worker(path:&Path)->Result<()>{
             unsafe{windows::Win32::UI::Shell::SHMultiFileProperties(&data,0)}?;
             return Ok(MenuOutcome::ShellInvoked);
         }
+        trace("worker: before menu construction".to_string());
         let started=Instant::now();
         let background=if request.mode==Mode::Background{Some(zsdesk_windows::shell::pidl::item_from_pidl(&request.pidls[0])?)}else{None};
         let menu=if let Some(item)=&background{
             let folder:windows::Win32::UI::Shell::IShellFolder=unsafe{item.BindToHandler(None,&windows::Win32::UI::Shell::BHID_SFObject)}?;ShellMenu::for_folder_background(window,&folder)?
         }else if request.pidls.is_empty(){let folder=zsdesk_windows::desktop::folder_for_path(request.folder.as_deref().context("目录缺失")?)?;ShellMenu::for_folder_background(window,&folder)?}else{ShellMenu::for_items(window,&request.pidls)?};
+        trace("worker: menu constructed".to_string());
         state.status.bind_microseconds=started.elapsed().as_micros()as u64;let started=Instant::now();
         if request.mode==Mode::Open{
             menu.populate_for_invoke(request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
             state.allow(true)?;menu.invoke_verb(window,"open",false)?;return Ok(MenuOutcome::ShellInvoked);
         }
-        menu.populate(request.rename,request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;state.allow(false)?;
+        trace(format!("worker: populating rename={} extended={} options={:?}",request.rename,request.extended,request.options));
+        menu.populate(request.rename,request.extended)?;state.status.populate_microseconds=started.elapsed().as_micros()as u64;
+        trace("worker: populated".to_string());
+        state.allow(false)?;
+        trace("worker: allowed".to_string());
         #[cfg(test)]if request.probe.as_deref()==Some("modern-owner-copy"){
             ensure!(request.options.modern,"modern owner probe requires the native Windows 11 presenter");
             let count=unsafe{GetMenuItemCount(Some(menu.hmenu()))};

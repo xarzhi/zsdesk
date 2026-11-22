@@ -176,12 +176,21 @@ impl WindowState{
             unsafe{self.request_navigation(NavigationRequest::new(tab));}
         }else{unsafe{self.navigate_to(target);}}
     }
-    pub(super) fn apply_search_sort(&self){
+    pub(super) fn apply_search_sort(&mut self){
+        let (column,ascending)=match self.search_controls().sort{
+            SearchSort::NameAsc=>(Column::Name,true),SearchSort::NameDesc=>(Column::Name,false),
+            SearchSort::ModifiedDesc=>(Column::Modified,false),SearchSort::SizeDesc=>(Column::Size,false),
+        };
+        if self.custom_view{
+            // The drawn table sorts its own rows; the hidden Shell list keeps
+            // its default order because it is not what the user is looking at.
+            let key=match column{Column::Name=>file_view::SortKey::Name,Column::Modified=>file_view::SortKey::Modified,
+                Column::Size=>file_view::SortKey::Size,_=>file_view::SortKey::Name};
+            self.file_view.sort_by(key,ascending);
+            self.invalidate_rect(self.layout.browser);
+            return;
+        }
         if let Some(browser)=&self.browser{
-            let (column,ascending)=match self.search_controls().sort{
-                SearchSort::NameAsc=>(Column::Name,true),SearchSort::NameDesc=>(Column::Name,false),
-                SearchSort::ModifiedDesc=>(Column::Modified,false),SearchSort::SizeDesc=>(Column::Size,false),
-            };
             let _=browser.set_sort(column,ascending);
         }
     }

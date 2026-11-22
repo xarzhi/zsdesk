@@ -121,7 +121,7 @@ impl WindowState{
     }
     pub(super) fn cancel_fast_search(&mut self){
         if let Some(engine)=&self.fast_search{engine.cancel();}
-        self.fast_generation=0;self.fast_submitted=None;self.fast_events.clear();self.search_progress=None;
+        self.fast_generation=0;self.fast_submitted=None;self.fast_events.clear();self.search_progress=None;self.fast_last=None;
         self.discard_fast_restore("query cancelled");self.fast_reset_pending=false;self.fast_clearing=None;
         let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};
     }
@@ -144,6 +144,9 @@ impl WindowState{
         }
         let preferred=self.search_scope.as_ref().and_then(|s|s.as_path().map(PathBuf::from));
         self.fast_found=0;self.fast_events.clear();self.discard_fast_restore("query started");self.fast_reset_pending=true;self.fast_clearing=None;
+        // The drawn table owns the pane: a new page starts from an empty table,
+        // and the rows arrive from the index without going through the Shell.
+        if self.drawn_search(){self.reset_search_rows();}
         let controls=self.search_controls();let expression=self.search_expression(query);
         self.fast_generation=self.fast_search.as_ref().unwrap().start_page(&expression,preferred,controls.offset,super::search_panel::SEARCH_PAGE_SIZE,controls.sort);
         self.fast_submitted=Some(submitted);
@@ -297,47 +300,56 @@ impl WindowState{
         if self.fast_events.is_empty(){if let Some(engine)=&self.fast_search{self.fast_events.extend(engine.poll());}}
         let Some(mut event)=self.fast_events.pop_front()else{self.restore_fast_selection();return;};
         if event.generation==self.fast_generation{
-            if self.fast_clearing.is_some(){
-                match self.finish_fast_clear(){
-                    Ok(true)=>{},
-                    Ok(false)=>{self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;},
-                    Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
-                }
-            }
-            if event.reset || self.fast_reset_pending{
-                match self.reset_fast_results(){
-                    Ok(())=>{
-                        event.reset=false;self.fast_reset_pending=false;self.fast_events.push_front(event);
-                        unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
-                    },
-                    Err(error) if error.code().0 as u32==0x8000000A=>{
-                        self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
-                    },
-                    Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
-                }
-            }
-            self.pending_selection_valid();
-            if !event.paths.is_empty(){
-                if let Some(browser)=&self.browser{match browser.append_search_paths(&event.paths){
-                    Ok(added)=>self.fast_found+=added,
-                    Err(error) if error.code().0 as u32==0x8000000A=>{
-                        self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
-                    },
-                    Err(error)=>{self.show_message(format!("无法显示搜索结果：{error}"));}
-                }}
-            }
-            // Appending must not turn an external/user selection into our own
-            // expected state. Validate it before issuing any restoration calls.
-            self.pending_selection_valid();
-            if let Some(restore)=&mut self.fast_restore{
-                    restore.plan.queue(&event.paths);
-                    if event.finished && !restore.plan.finished{
-                        let missing=restore.plan.original.clone();restore.plan.queue(&missing);
-                        restore.plan.finished=true;restore.plan.retries=0;
+            if self.custom_view{
+                // The drawn table is the result view. Rows go straight into it
+                // and the hidden Shell list is never filled: one Shell item per
+                // result was what made a page take seconds to appear.
+                event.reset=false;self.fast_reset_pending=false;self.fast_clearing=None;
+                if !event.paths.is_empty(){self.queue_search_rows(&event.paths);}
+            }else{
+                if self.fast_clearing.is_some(){
+                    match self.finish_fast_clear(){
+                        Ok(true)=>{},
+                        Ok(false)=>{self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;},
+                        Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
                     }
+                }
+                if event.reset || self.fast_reset_pending{
+                    match self.reset_fast_results(){
+                        Ok(())=>{
+                            event.reset=false;self.fast_reset_pending=false;self.fast_events.push_front(event);
+                            unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
+                        },
+                        Err(error) if error.code().0 as u32==0x8000000A=>{
+                            self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
+                        },
+                        Err(error)=>{self.cancel_fast_search();self.show_message(format!("无法刷新搜索结果：{error}"));return;},
+                    }
+                }
+                self.pending_selection_valid();
+                if !event.paths.is_empty(){
+                    if let Some(browser)=&self.browser{match browser.append_search_paths(&event.paths){
+                        Ok(added)=>self.fast_found+=added,
+                        Err(error) if error.code().0 as u32==0x8000000A=>{
+                            self.fast_events.push_front(event);unsafe{SetTimer(Some(self.hwnd),TIMER_FAST_SEARCH,30,None);}return;
+                        },
+                        Err(error)=>{self.show_message(format!("无法显示搜索结果：{error}"));}
+                    }}
+                }
+                // Appending must not turn an external/user selection into our own
+                // expected state. Validate it before issuing any restoration calls.
+                self.pending_selection_valid();
+                if let Some(restore)=&mut self.fast_restore{
+                        restore.plan.queue(&event.paths);
+                        if event.finished && !restore.plan.finished{
+                            let missing=restore.plan.original.clone();restore.plan.queue(&missing);
+                            restore.plan.finished=true;restore.plan.retries=0;
+                        }
+                }
+                self.restore_fast_selection();
             }
-            self.restore_fast_selection();
             self.search_progress=Some(progress_text(&event,self.fast_found));
+            self.fast_last=Some(event.clone());
             self.record_search_progress(&event);
             self.refresh_status();self.relayout();self.position_children();self.invalidate_rect(self.layout.status);
         }
@@ -346,7 +358,7 @@ impl WindowState{
         else if let Some(engine)=&self.fast_search{let events=engine.poll();if !events.is_empty(){self.fast_events.extend(events);post(self.hwnd,WM_FAST_SEARCH,0,0);}}
     }
 }
-fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
+pub(super) fn progress_text(event:&crate::fast_search::SearchEvent,found:usize)->String{
     use crate::fast_search::BackendKind;
     if event.backend==BackendKind::Everything{
         if event.scanning&&!event.finished&&event.error.is_none(){return "Everything 正在准备文件名索引，完成后自动显示结果…".into();}

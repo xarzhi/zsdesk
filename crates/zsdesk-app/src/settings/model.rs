@@ -452,19 +452,27 @@ fn control_boxes(row: &Row, rect: RectF, pad: f32, measure: Measure<'_>, dpi: u3
         }
         Control::Segments => {
             let h = s(30.0);
+            // The strip sits inside the container with the same inset on all
+            // four sides; without it the leftmost pill glues itself to the
+            // border while the right end keeps a gap.
+            let inset = s(2.0);
             let widths: Vec<f32> = row.options.iter()
                 .map(|option| (measure(option, s(12.0), 400) + s(24.0)).max(s(72.0)))
                 .collect();
-            let total: f32 = widths.iter().sum::<f32>() + s(4.0);
+            let total: f32 = widths.iter().sum::<f32>() + inset * 2.0;
             let max = (rect.w - pad * 2.0 - s(220.0)).max(s(160.0));
             let scale_down = if total > max { max / total } else { 1.0 };
-            let mut x = right - total * scale_down;
+            let width = total * scale_down;
+            let left = right - width;
+            let mut x = left + inset * scale_down;
             let mut options = Vec::with_capacity(widths.len());
-            for width in widths {
-                options.push(RectF::new(x, rect.y + (rect.h - h) / 2.0 + s(1.0), width * scale_down - s(2.0), h - s(2.0)));
-                x += width * scale_down;
+            for option_width in widths {
+                let option_width = option_width * scale_down;
+                options.push(RectF::new(x, rect.y + (rect.h - h) / 2.0 + inset * scale_down,
+                    option_width, h - inset * 2.0 * scale_down));
+                x += option_width;
             }
-            (RectF::new(right - total * scale_down, rect.y + (rect.h - h) / 2.0, total * scale_down, h), options, None)
+            (RectF::new(left, rect.y + (rect.h - h) / 2.0, width, h), options, None)
         }
         Control::Select { .. } => {
             let h = s(30.0);
@@ -714,6 +722,30 @@ mod tests {
                     for option in &row.options {
                         assert!(option.x >= row.control.x - 0.01 && option.right() <= row.control.right() + 0.01);
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_segmented_control_pads_both_ends_equally() {
+        let ui = snapshot();
+        let sections = sections_for(&ui);
+        for (index, section) in sections.iter().enumerate() {
+            let l = layout(940, 900, 96, &sections, index, 0.0, &measure);
+            for group in &l.groups {
+                for row in &group.rows {
+                    let (Some(first), Some(last)) = (row.options.first(), row.options.last()) else { continue };
+                    let left = first.x - row.control.x;
+                    let right = row.control.right() - last.right();
+                    assert!(left >= 0.5, "{} glues its first option to the left border", section.id);
+                    assert!((left - right).abs() < 0.51,
+                        "{} pads {left} on the left but {right} on the right", section.id);
+                    // The inset matches vertically too, so the pill is centred.
+                    let top = first.y - row.control.y;
+                    let bottom = row.control.bottom() - last.bottom();
+                    assert!((top - left).abs() < 0.51, "{} is off centre", section.id);
+                    assert!((top - bottom).abs() < 0.51, "{} is off centre", section.id);
                 }
             }
         }

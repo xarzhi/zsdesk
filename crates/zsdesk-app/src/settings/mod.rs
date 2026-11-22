@@ -225,7 +225,11 @@ impl Dialog {
     /// Saves the preference block and lets the file-manager window refresh.
     fn commit(&mut self) {
         if let Ok(mut saved) = crate::storage::load(&self.config_path) {
+            // Column widths are dragged in the file pane, never chosen here:
+            // keep whatever the window stored while this dialog was open.
+            let columns = saved.ui.details_columns;
             saved.ui = self.ui.clone();
+            saved.ui.details_columns = columns;
             if let Err(error) = crate::storage::save(&self.config_path, &saved) {
                 self.message = Some(format!("设置未保存：{error}"));
             }

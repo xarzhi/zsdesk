@@ -6,8 +6,9 @@
 //! pale coloured ghosts in front of the material.
 //!
 //! The EDIT stays the input model: it keeps its position, focus, keyboard, IME,
-//! clipboard and undo behaviour. Only its window region is emptied, so it paints
-//! nothing, and the text, selection, caret and IME composition are drawn here
+//! clipboard and undo behaviour. It is made hollow instead — an empty window
+//! region plus a subclass that validates its paints — so it puts no pixels on
+//! screen, and the text, selection, caret and IME composition are drawn here
 //! with Direct2D, on top of the backdrop that the window itself painted.
 
 use super::*;
@@ -20,6 +21,28 @@ const MAX_MEASURE: f32 = 8192.0;
 /// Caret blink interval in milliseconds, close to the system default.
 pub(super) const CARET_INTERVAL: u32 = 530;
 pub(super) const TIMER_CARET: usize = 12;
+
+/// Marks a text field whose pixels must not reach the screen: the control keeps
+/// its position, focus, keyboard, IME and clipboard, but its subclass validates
+/// every paint instead of drawing one, and `paint_edits` draws the text.
+pub(super) const HOLLOW_FIELD: windows::core::PCWSTR = windows::core::w!("ZSDesk.HollowField");
+
+/// Window size a hollow field keeps while a material is on.
+///
+/// The subclass stops paints, but it cannot stop the compositor from showing
+/// whatever the control already has in its backing store: a click moves focus
+/// and makes the system recompose the control, and the white plate an EDIT
+/// erased into that store before it was hollowed out flashes once again. GDI
+/// clips that erase by the window rectangle (measured: the slab matched the
+/// control's rectangle exactly, 236×17 px), so a one-pixel control can only
+/// ever mark one pixel. Focus, keyboard, IME, clipboard and undo all still
+/// work, and the IME's candidate window still opens at the text origin.
+const HOLLOW_SIZE: i32 = 1;
+
+/// True when the field must stay invisible. A null handle has nothing to paint.
+pub(super) fn field_hollow(hwnd: HWND) -> bool {
+    hwnd.0.is_null() || unsafe { !GetPropW(hwnd, HOLLOW_FIELD).0.is_null() }
+}
 
 /// Everything one visible text field needs at paint time. Collected before the
 /// drawing closure runs, because measuring and scrolling need `&mut self`.
@@ -59,9 +82,10 @@ impl WindowState {
     /// Records where a field's text belongs and places the control there.
     ///
     /// Under a material the control is then squeezed to a single pixel: it keeps
-    /// its position, focus, keyboard, IME context and clipboard, but cannot paint
-    /// GDI pixels that DWM would compose with a zero alpha — those read as pale
-    /// coloured ghosts — because the text is drawn by `paint_edits` instead.
+    /// its position, focus, keyboard, IME context and clipboard, but the plate
+    /// it would erase there is clipped to that pixel, so it cannot paint the
+    /// white slab over the translucent field; the text is drawn by
+    /// `paint_edits` instead.
     pub(super) fn place_edit(&mut self, edit: HWND, area: LayoutRect) {
         if edit.0.is_null() { return; }
         if edit == self.search_edit { self.search_area = area; }
@@ -69,23 +93,66 @@ impl WindowState {
         else if edit == self.view_rename { self.view_rename_area = area; }
         else if edit == self.rename_hwnd { self.rename_area = area; }
         else { return; }
-        unsafe { move_control(edit, area); }
+        self.place_control(edit, area);
         self.sync_edit_regions();
     }
 
-    /// Applies the material rule to every text field: shrunk when DWM composites
-    /// the window by pixel alpha, restored to its real size when it does not.
-    pub(super) fn sync_edit_regions(&self) {
+    /// Moves a field's control to where its text lives.
+    ///
+    /// A hollow field is pinned to one pixel at the text origin, and the move
+    /// does not redraw: the control has nothing to show, and letting it repaint
+    /// on every layout is what puts its white backing store back on screen.
+    fn place_control(&self, edit: HWND, area: LayoutRect) {
+        if self.material {
+            unsafe { move_control_quiet(edit, LayoutRect::new(area.x, area.y, HOLLOW_SIZE, HOLLOW_SIZE)); }
+        } else {
+            unsafe { move_control(edit, area); }
+        }
+    }
+
+    /// Applies the material rule to every text field: hollowed out and squeezed
+    /// to a pixel when DWM composites the window by pixel alpha, restored to its
+    /// real size and colours when it does not.
+    ///
+    /// Hollowing takes three things, because none alone is enough. An empty
+    /// window region makes the control unhittable — clicks reach the chrome
+    /// instead of a native field — but it does *not* stop the control from
+    /// painting: GDI erases an EDIT's background without consulting that region
+    /// (measured: the window region is empty while the DC clip box still covers
+    /// the whole field). The hollow mark makes the subclass validate paints
+    /// instead of drawing them, which still leaves the white already in the
+    /// control's backing store, and the compositor shows it again every time
+    /// focus or layout makes it recompose the control. So the control is also
+    /// squeezed to one pixel: an erase clipped to one pixel is invisible, and a
+    /// transition repaints the chrome once to clear what was on screen.
+    pub(super) fn sync_edit_regions(&mut self) {
+        if self.material && self.edits_hollow { return; }
+        let changed = self.material != self.edits_hollow;
         for edit in self.edit_fields() {
             if edit.0.is_null() { continue; }
-            unsafe {
-                if self.material {
-                    let _ = SetWindowPos(edit, None, 0, 0, 1, 1, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-                } else if let Some(area) = self.edit_area(edit) {
+            let area = self.edit_area(edit);
+            if self.material {
+                // The mark goes on first: the squeeze that follows must not make
+                // the control paint the one pixel it keeps.
+                unsafe { let _ = SetPropW(edit, HOLLOW_FIELD, Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
+                if let Some(area) = area { self.place_control(edit, area); }
+                unsafe {
+                    let region = CreateRectRgn(0, 0, 0, 0);
+                    if !region.is_invalid() {
+                        // The window owns the region only when the call succeeds.
+                        if SetWindowRgn(edit, Some(region), true) == 0 { let _ = DeleteObject(region.into()); }
+                    }
+                }
+            } else if let Some(area) = area {
+                unsafe {
+                    let _ = RemovePropW(edit, HOLLOW_FIELD);
+                    let _ = SetWindowRgn(edit, None, true);
                     move_control(edit, area);
                 }
             }
         }
+        self.edits_hollow = self.material;
+        if changed && self.material { self.invalidate(); }
     }
 
     /// Rectangle a field's text is drawn into, in canvas pixels.
@@ -346,7 +413,7 @@ fn prefix_units(text: &str, units: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::prefix_units;
+    use super::*;
 
     #[test]
     fn prefix_units_respects_surrogate_pairs() {
@@ -354,5 +421,46 @@ mod tests {
         assert_eq!(prefix_units("a中b", 2), "a中");
         assert_eq!(prefix_units("😀x", 2), "😀");
         assert_eq!(prefix_units("abc", 9), "abc");
+    }
+
+    /// A material must leave the field unable to paint at all — an empty window
+    /// region alone still let an EDIT erase its own background onto the screen.
+    #[test]
+    fn a_material_marks_the_text_fields_hollow_and_classic_undoes_it() {
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE::default(), windows::core::w!("STATIC"), None,
+                WS_OVERLAPPED, 0, 0, 320, 80, None, None, None, None).expect("parent window");
+            let edit = child(parent, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true).expect("search field");
+            let mut state = WindowState::new(storage::default_session(),
+                std::env::temp_dir().join("zsdesk-hollow-field.json"), None, false);
+            state.hwnd = parent;
+            state.search_edit = edit;
+            state.material = true;
+            state.place_edit(edit, LayoutRect::new(10, 10, 200, 19));
+            assert!(field_hollow(edit), "a field under a material must not paint");
+            let region = CreateRectRgn(0, 0, 0, 0);
+            let mut box_ = RECT::default();
+            assert_ne!(windows::Win32::Graphics::Gdi::GetWindowRgn(edit, region).0, 0, "the field keeps a window region");
+            let _ = windows::Win32::Graphics::Gdi::GetRgnBox(region, &mut box_);
+            assert_eq!((box_.right - box_.left, box_.bottom - box_.top), (0, 0), "the region is empty");
+            // An erase is clipped by the control's rectangle, not by its region,
+            // so the control itself has to shrink: a click re-composes it and
+            // showed the white it erased before it was hollowed out.
+            let mut client = RECT::default();
+            let _ = GetClientRect(edit, &mut client);
+            assert_eq!((client.right - client.left, client.bottom - client.top), (1, 1),
+                "a hollow field is squeezed to one pixel");
+            state.material = false;
+            state.sync_edit_regions();
+            assert!(!field_hollow(edit), "a classic field paints itself again");
+            assert_eq!(windows::Win32::Graphics::Gdi::GetWindowRgn(edit, region).0, 0, "the empty region is gone");
+            let mut client = RECT::default();
+            let _ = GetClientRect(edit, &mut client);
+            assert_eq!((client.right - client.left, client.bottom - client.top), (200, 19),
+                "a classic field gets its text area back");
+            let _ = DeleteObject(region.into());
+            let _ = DestroyWindow(edit);
+            let _ = DestroyWindow(parent);
+        }
     }
 }
