@@ -62,6 +62,8 @@ pub(super) struct NavTree {
     height: i32,
     dpi: u32,
     loaded: bool,
+    /// Row whose name the in-place rename editor is covering.
+    editing: Option<usize>,
     /// Identity of the quick-access group the rows were built from, so a
     /// refresh can skip rebuilding the pane when nothing was pinned.
     signature: Vec<String>,
@@ -190,7 +192,14 @@ impl NavTree {
         let y = rect.y + index as f32 * row_h - self.scroll;
         let left = rect.x + self.s(6.0) + row.depth as f32 * self.s(INDENT)
             + self.s(CHEVRON) + self.s(2.0) + self.s(ICON) + self.s(6.0);
-        Some(RectF::new(left, y, (rect.right() - left - self.s(6.0)).max(0.0), row_h))
+        // The trailing gap matches what the painter leaves, so the editor's
+        // box ends exactly where the label does.
+        Some(RectF::new(left, y, (rect.right() - left - self.s(8.0)).max(0.0), row_h))
+    }
+
+    /// Marks (or clears) the row covered by the rename editor.
+    pub(super) fn set_editing(&mut self, index: Option<usize>) {
+        self.editing = index;
     }
 
     /// Location a row opens, for a drop or a reveal.
@@ -393,8 +402,12 @@ impl NavTree {
                 None => cv.glyph(glyph::FOLDER, icon_rect, s(14.0), text),
             }
             let text_left = icon_rect.right() + s(6.0);
-            cv.text(&row.name, RectF::new(text_left, y, (rect.right() - text_left - s(8.0)).max(0.0), row_h),
-                &TextStyle::ui(s(12.5)).align(Align::Start), text);
+            // The editor draws the label while it is open; leaving the old one
+            // underneath would show two names once the user starts typing.
+            if self.editing != Some(index) {
+                cv.text(&row.name, RectF::new(text_left, y, (rect.right() - text_left - s(8.0)).max(0.0), row_h),
+                    &TextStyle::ui(s(12.5)).align(Align::Start), text);
+            }
         }
         cv.pop_clip();
         // A hairline thumb tells the reader there is more below; the wheel and
@@ -454,6 +467,25 @@ mod tests {
         assert_eq!(tree.hit(10.0, 10.0, rect), NavHit::Chevron(0));
         assert_eq!(tree.hit(80.0, 10.0, rect), NavHit::Row(0));
         assert_eq!(tree.hit(80.0, 300.0, rect), NavHit::Empty);
+    }
+
+    /// The rename editor is placed on `label_rect`, which therefore has to be
+    /// the band the painter writes the label into: after the chevron, icon and
+    /// their gaps, one row high.
+    #[test]
+    fn the_label_rect_starts_after_the_icon_and_spans_one_row() {
+        let mut tree = NavTree { rows: vec![row("a", 0), row("b", 2)], dpi: 96, loaded: true, ..Default::default() };
+        tree.set_viewport(200, 200, 96);
+        let rect = RectF::new(0.0, 0.0, 200.0, 200.0);
+        let first = tree.label_rect(rect, 0).expect("a row has a label");
+        let second = tree.label_rect(rect, 1).expect("a nested row has a label");
+        assert_eq!(first.x, 6.0 + CHEVRON + 2.0 + ICON + 6.0);
+        assert_eq!(first.h, tree.row_height());
+        // Depth indents the label, which is why the field is placed from here
+        // instead of from a fixed offset.
+        assert_eq!(second.x - first.x, 2.0 * INDENT);
+        assert_eq!(second.y - first.y, tree.row_height());
+        assert_eq!(first.right(), rect.right() - 8.0);
     }
 
     #[test]

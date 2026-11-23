@@ -192,6 +192,9 @@ pub(super) struct FileView {
     /// an empty pane there means "still looking" or "nothing matched", never
     /// that the folder has no files.
     empty_message: Option<String>,
+    /// Row whose name the in-place rename editor is covering. Its name is not
+    /// painted, so the editor's own text is the only one on screen.
+    editing: Option<usize>,
     width: i32,
     height: i32,
 }
@@ -811,6 +814,70 @@ impl FileView {
         self.cell_rect(rect, dpi, index)
     }
 
+    /// Rectangle the name of `index` is painted into.
+    ///
+    /// The in-place rename editor is placed on exactly this rectangle, so its
+    /// text lands on the letters the row already shows instead of a guessed
+    /// offset — the previous `+26` guess drifted left of the name in details
+    /// view and away from the centred labels of the icon layouts.
+    pub(super) fn name_rect(&self, rect: RectF, dpi: u32, index: usize) -> Option<RectF> {
+        if self.is_devices() { return None; }
+        let cell = self.cell_rect(rect, dpi, index);
+        if self.layout.is_details() {
+            let s = |value: f32| value * dpi as f32 / 96.0;
+            let content = self.content_rect(rect, dpi);
+            let name = self.columns(RectF::new(content.x, cell.y, content.w, cell.h), dpi).into_iter().next()?.1;
+            let left = name_left(cell, s);
+            return Some(RectF::new(left, cell.y, (name.right() - left - s(6.0)).max(0.0), cell.h));
+        }
+        self.cell_text(cell, dpi).1.into_iter().next()
+    }
+
+    /// True when the name of `index` is centred inside its cell (every icon
+    /// layout), which is how the editor knows to centre its own text too.
+    pub(super) fn centers_names(&self) -> bool {
+        matches!(self.layout, Layout::Icons { .. })
+    }
+
+    /// Marks (or clears) the row covered by the rename editor.
+    pub(super) fn set_editing(&mut self, index: Option<usize>) {
+        self.editing = index;
+    }
+
+    /// Icon rectangle and text rectangles of one cell.
+    ///
+    /// Painting and the rename editor both read this, so a layout change can
+    /// never leave the editor behind on the old geometry.
+    fn cell_text(&self, cell: RectF, dpi: u32) -> (RectF, Vec<RectF>) {
+        let s = |value: f32| value * dpi as f32 / 96.0;
+        let label = s(18.0);
+        match self.layout {
+            Layout::Listing => {
+                let icon = RectF::new(cell.x + s(7.0), cell.y + (cell.h - s(16.0)) / 2.0, s(16.0), s(16.0));
+                (icon, vec![RectF::new(icon.right() + s(7.0), cell.y, (cell.right() - icon.right() - s(12.0)).max(0.0), cell.h)])
+            }
+            Layout::Content => {
+                let icon = RectF::new(cell.x + s(9.0), cell.y + (cell.h - s(32.0)) / 2.0, s(32.0), s(32.0));
+                let left = icon.right() + s(8.0);
+                let width = (cell.right() - left - s(8.0)).max(0.0);
+                let top = cell.y + s(5.0);
+                (icon, vec![
+                    RectF::new(left, top, width, s(18.0)),
+                    RectF::new(left, top + s(18.0), width, s(18.0)),
+                ])
+            }
+            Layout::Icons { icon, lines } => {
+                let size = s(icon);
+                let icon_rect = RectF::new(cell.x + (cell.w - size) / 2.0, cell.y + s(6.0), size, size);
+                let top = icon_rect.bottom() + s(4.0);
+                let mut rects = vec![RectF::new(cell.x + s(4.0), top, (cell.w - s(8.0)).max(0.0), label)];
+                if lines > 1 { rects.push(RectF::new(cell.x + s(4.0), top + label, (cell.w - s(8.0)).max(0.0), label)); }
+                (icon_rect, rects)
+            }
+            Layout::Details => (RectF::new(cell.x, cell.y, cell.w, cell.h), Vec::new()),
+        }
+    }
+
     /// Draws header, rows, selection, the scrollbar and the empty state.
     pub(super) fn paint(&self, cv: &Canvas, rect: RectF, dpi: u32, palette: &Palette, icons: &[Option<ID2D1Bitmap>]) {
         let s = |value: f32| value * dpi as f32 / 96.0;
@@ -889,9 +956,11 @@ impl FileView {
                 let area = RectF::new(area.x, row.y, area.w, row.h);
                 match column {
                     Column::Name => {
-                        let left = icon_rect.right() + s(6.0);
-                        cv.text(&entry.name, RectF::new(left, row.y, (area.right() - left - s(6.0)).max(0.0), row.h),
-                            &TextStyle::ui(s(12.5)), color);
+                        let left = name_left(row, s);
+                        if self.editing != Some(index) {
+                            cv.text(&entry.name, RectF::new(left, row.y, (area.right() - left - s(6.0)).max(0.0), row.h),
+                                &TextStyle::ui(s(12.5)), color);
+                        }
                     }
                     Column::Modified => cv.text(&modified_text(entry.modified), RectF::new(area.x + s(6.0), row.y, (area.w - s(10.0)).max(0.0), row.h),
                         &TextStyle::ui(s(12.0)), text.color(palette.text_secondary)),
@@ -1012,32 +1081,7 @@ impl FileView {
             }
             let color = text.color(palette.text);
             let Some(entry) = self.items.get(index) else { continue };
-            let label = s(18.0);
-            let (icon_rect, lines) = match self.layout {
-                Layout::Listing => {
-                    let icon = RectF::new(cell.x + s(7.0), cell.y + (cell.h - s(16.0)) / 2.0, s(16.0), s(16.0));
-                    (icon, vec![RectF::new(icon.right() + s(7.0), cell.y, (cell.right() - icon.right() - s(12.0)).max(0.0), cell.h)])
-                }
-                Layout::Content => {
-                    let icon = RectF::new(cell.x + s(9.0), cell.y + (cell.h - s(32.0)) / 2.0, s(32.0), s(32.0));
-                    let left = icon.right() + s(8.0);
-                    let width = (cell.right() - left - s(8.0)).max(0.0);
-                    let top = cell.y + s(5.0);
-                    (icon, vec![
-                        RectF::new(left, top, width, s(18.0)),
-                        RectF::new(left, top + s(18.0), width, s(18.0)),
-                    ])
-                }
-                Layout::Icons { icon, lines } => {
-                    let size = s(icon);
-                    let icon_rect = RectF::new(cell.x + (cell.w - size) / 2.0, cell.y + s(6.0), size, size);
-                    let top = icon_rect.bottom() + s(4.0);
-                    let mut rects = vec![RectF::new(cell.x + s(4.0), top, (cell.w - s(8.0)).max(0.0), label)];
-                    if lines > 1 { rects.push(RectF::new(cell.x + s(4.0), top + label, (cell.w - s(8.0)).max(0.0), label)); }
-                    (icon_rect, rects)
-                }
-                Layout::Details => (RectF::new(cell.x, cell.y, cell.w, cell.h), Vec::new()),
-            };
+            let (icon_rect, lines) = self.cell_text(cell, dpi);
             match icons.get(index - first) {
                 Some(Some(bitmap)) => cv.image(bitmap, fitted(icon_rect, bitmap), 1.0),
                 _ => {
@@ -1047,7 +1091,11 @@ impl FileView {
             }
             let Some(name_rect) = lines.first() else { continue };
             let align = if matches!(self.layout, Layout::Icons { .. }) { Align::Center } else { Align::Start };
-            cv.text(&entry.name, *name_rect, &TextStyle::ui(s(12.5)).align(align), color);
+            // The editor draws the name while it is open; painting the old one
+            // underneath would show two names once the user starts typing.
+            if self.editing != Some(index) {
+                cv.text(&entry.name, *name_rect, &TextStyle::ui(s(12.5)).align(align), color);
+            }
             if let Some(detail) = lines.get(1) {
                 // 平铺 / 内容 show a second line, like Explorer's tiles.
                 let mut summary = entry.kind();
@@ -1104,6 +1152,14 @@ fn fitted(rect: RectF, bitmap: &ID2D1Bitmap) -> RectF {
     let scale = (rect.w / size.width).min(rect.h / size.height);
     let (w, h) = (size.width * scale, size.height * scale);
     RectF::new(rect.x + (rect.w - w) / 2.0, rect.y + (rect.h - h) / 2.0, w.max(1.0), h.max(1.0))
+}
+
+/// X where a details row starts its name: after the icon and its gap.
+///
+/// The painter and the rename editor both go through this, so the editor can
+/// never drift from the letters it is supposed to cover.
+fn name_left(row: RectF, s: impl Fn(f32) -> f32) -> f32 {
+    row.x + s(PAD + ICON + 6.0)
 }
 
 /// The Shell reports display names, which drop a known extension or carry a
@@ -1536,5 +1592,55 @@ mod tests {
         assert!(same_name("Report.TXT", "report.txt"));
         assert!(!same_name("报告.txt", "报告.doc"));
         assert!(!same_name("a", "b"));
+    }
+
+    /// The rename editor is placed on `name_rect`, so that rectangle has to be
+    /// the one the painter writes the name into — not a guessed offset.
+    #[test]
+    fn the_rename_editor_lands_on_the_painted_name() {
+        let mut view = FileView { items: vec![entry("报告.docx", false, None, None)], loaded: true, ..Default::default() };
+        let rect = RectF::new(0.0, 0.0, 800.0, 400.0);
+        view.set_viewport(rect, 96);
+        let row = view.row_rect(rect, 96, 0);
+        let area = view.name_rect(rect, 96, 0).expect("a details row paints a name");
+        // After the 16 px icon and its gap, using the row's own height so the
+        // text keeps the same centre line.
+        assert_eq!(area.x, row.x + PAD + ICON + 6.0);
+        assert_eq!((area.y, area.h), (row.y, row.h));
+        let content = view.content_rect(rect, 96);
+        let name_column = view.columns(RectF::new(content.x, row.y, content.w, row.h), 96)[0].1;
+        assert_eq!(area.right(), name_column.right() - 6.0, "the field stops where the name column does");
+    }
+
+    #[test]
+    fn an_icon_layout_centres_the_rename_editor_on_its_label() {
+        let mut view = FileView { items: vec![entry("图片.png", false, None, None)], loaded: true, ..Default::default() };
+        let rect = RectF::new(0.0, 0.0, 800.0, 400.0);
+        for layout in [Layout::Icons { icon: 96.0, lines: 1 }, Layout::Icons { icon: 48.0, lines: 2 }, Layout::Content, Layout::Listing] {
+            view.set_layout(layout);
+            view.set_viewport(rect, 96);
+            let cell = view.row_rect(rect, 96, 0);
+            let area = view.name_rect(rect, 96, 0).expect("every layout paints a name");
+            let (icon, lines) = view.cell_text(cell, 96);
+            assert_eq!(Some(area), lines.first().copied(), "{layout:?} must rename on the label band");
+            if matches!(layout, Layout::Icons { .. }) {
+                // Icons put the label under the icon, and the label is centred,
+                // so the editor has to centre its text too.
+                assert!(area.y >= icon.bottom(), "{layout:?} label sits under the icon");
+                assert!(view.centers_names());
+            } else {
+                assert!(area.x > icon.x, "{layout:?} puts the label beside the icon");
+            }
+        }
+    }
+
+    #[test]
+    fn an_edited_row_drops_its_painted_name_so_only_the_editor_shows() {
+        let mut view = FileView { items: vec![entry("a.txt", false, None, None), entry("b.txt", false, None, None)], loaded: true, ..Default::default() };
+        assert_eq!(view.editing, None);
+        view.set_editing(Some(1));
+        assert_eq!(view.editing, Some(1), "the row under the editor is the one that stops painting its name");
+        view.set_editing(None);
+        assert_eq!(view.editing, None);
     }
 }

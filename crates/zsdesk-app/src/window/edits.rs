@@ -12,7 +12,7 @@
 //! with Direct2D, on top of the backdrop that the window itself painted.
 
 use super::*;
-use zsdesk_windows::gfx::{Canvas, RectF, TextStyle};
+use zsdesk_windows::gfx::{Canvas, Color, RectF, TextStyle};
 
 /// Width given to DirectWrite when measuring a single line: large enough for
 /// any field, small enough to keep its layout arithmetic exact.
@@ -20,7 +20,9 @@ const MAX_MEASURE: f32 = 8192.0;
 
 /// Caret blink interval in milliseconds, close to the system default.
 pub(super) const CARET_INTERVAL: u32 = 530;
-pub(super) const TIMER_CARET: usize = 12;
+/// Timer that blinks the self-drawn caret. Kept apart from the other timers:
+/// sharing an id with the navigation refresh made one of them stop the other.
+pub(super) const TIMER_CARET: usize = 13;
 
 /// Marks a text field whose pixels must not reach the screen: the control keeps
 /// its position, focus, keyboard, IME and clipboard, but its subclass validates
@@ -60,6 +62,13 @@ pub(super) struct EditPaint {
     text_width: f32,
     scroll: f32,
     focused: bool,
+    /// Draws the text with the same size the row uses (the rename field sits
+    /// on a painted name), and centres it when the row centres its label.
+    style: TextStyle,
+    center: bool,
+    /// Draws a real field behind the text. The in-place rename editor covers a
+    /// painted name, and text floating on the wallpaper reads as neither.
+    field_box: bool,
 }
 
 impl WindowState {
@@ -126,12 +135,18 @@ impl WindowState {
     /// squeezed to one pixel: an erase clipped to one pixel is invisible, and a
     /// transition repaints the chrome once to clear what was on screen.
     pub(super) fn sync_edit_regions(&mut self) {
-        if self.material && self.edits_hollow { return; }
         let changed = self.material != self.edits_hollow;
         for edit in self.edit_fields() {
             if edit.0.is_null() { continue; }
             let area = self.edit_area(edit);
             if self.material {
+                // The state is decided per control, not by `edits_hollow`: the
+                // rename editors are created lazily, long after the window
+                // switched to a material, so the window's own flag says nothing
+                // about them. A field made later kept its real class behaviour —
+                // it painted and it kept the system caret, which showed up as a
+                // second, blinking bar at the field's origin.
+                if field_hollow(edit) { continue; }
                 // The mark goes on first: the squeeze that follows must not make
                 // the control paint the one pixel it keeps.
                 unsafe { let _ = SetPropW(edit, HOLLOW_FIELD, Some(windows::Win32::Foundation::HANDLE(1usize as *mut _))); }
@@ -159,6 +174,31 @@ impl WindowState {
     fn edit_rect(&self, edit: HWND) -> Option<RectF> {
         let area = self.edit_area(edit)?;
         Some(RectF::new(area.x as f32, area.y as f32, area.width as f32, area.height as f32))
+    }
+
+    /// The control a `WM_COMMAND` notification id belongs to.
+    pub(super) fn edit_handle(&self, id: usize) -> Option<HWND> {
+        let edit = if id == ID_SEARCH { self.search_edit }
+            else if id == ID_ADDRESS { self.address_edit }
+            else if id == ID_VIEW_RENAME { self.view_rename }
+            else if id == ID_BOOKMARK_RENAME { self.rename_hwnd }
+            else { return None };
+        (!edit.0.is_null()).then_some(edit)
+    }
+
+    /// Repaints a field after the user typed, deleted or moved the caret.
+    ///
+    /// A hollow field paints nothing itself, so without this nothing on screen
+    /// changes until something else — the caret blink or Enter — happens to
+    /// repaint the window. That is what made in-place rename look dead while
+    /// typing and only take effect after Enter.
+    pub(super) fn refresh_edit(&mut self, edit: HWND) {
+        if edit.0.is_null() { return; }
+        self.caret_on = true;
+        match self.edit_area(edit) {
+            Some(area) => self.invalidate_rect(area),
+            None => self.invalidate(),
+        }
     }
 
     pub(super) fn visible_edit_at(&self, p: POINT) -> Option<HWND> {
@@ -215,12 +255,21 @@ impl WindowState {
     /// style the text is drawn with. The EDIT itself cannot answer this: it was
     /// shrunk to a pixel and scrolled its own (invisible) text to keep the caret
     /// in that pixel, so `EM_CHARFROMPOS` would be off by the scroll amount.
+    /// True when the field's text is drawn centred inside its box, because the
+    /// row it covers centres its label.
+    fn centers_edit(&self, edit: HWND) -> bool {
+        edit == self.view_rename && self.view_rename_index.is_some() && self.file_view.centers_names()
+    }
+
     fn edit_index_at(&self, edit: HWND, p: POINT) -> usize {
         let Some(area) = self.edit_area(edit) else { return 0 };
         let text = edit_text(edit);
-        let style = self.text_style();
-        let scroll = self.edit_scroll.get(&(edit.0 as isize)).copied().unwrap_or(0.0);
-        self.index_at(&text, &style, (p.x - area.x) as f32 + scroll)
+        let style = self.field_style(edit);
+        let width = area.width as f32;
+        let origin = area.x as f32 + if self.centers_edit(edit) {
+            ((width - self.text_width(&text, &style)) / 2.0).max(0.0)
+        } else { 0.0 };
+        self.index_at(&text, &style, p.x as f32 - origin)
     }
 
     /// Character index closest to `x` pixels into `text`.
@@ -248,6 +297,23 @@ impl WindowState {
         edit_fields_iter(self).any(|edit| unsafe { GetFocus() } == edit)
     }
 
+    /// Starts or stops the blink of the self-drawn caret.
+    ///
+    /// Driven from a posted message as well as from `EN_SETFOCUS`, because the
+    /// in-place rename editor is focused from inside an action: the window
+    /// state is still borrowed then, so the EDIT's `WM_COMMAND` notification
+    /// never reaches the handler and the caret stayed frozen — visible next to
+    /// the native caret the system drew at the field's own origin.
+    pub(super) fn edit_focus_changed(&mut self, focused: bool) {
+        self.caret_on = focused;
+        if focused {
+            unsafe { SetTimer(Some(self.hwnd), TIMER_CARET, CARET_INTERVAL, None); }
+        } else {
+            let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_CARET) };
+        }
+        self.invalidate();
+    }
+
     /// Blinks the caret while one of the fields has the focus.
     pub(super) fn tick_caret(&mut self) {
         if !self.any_edit_focused() {
@@ -271,12 +337,20 @@ impl WindowState {
             let selection = edit_selection(edit);
             let focused = unsafe { GetFocus() } == edit;
             focused_any |= focused;
-            let style = self.text_style();
-            let scroll = self.edit_scroll(edit, &text, &style, selection.1.max(selection.0), rect, focused);
+            let style = self.field_style(edit);
+            // A centred label (every icon layout) is drawn from a centred
+            // origin, so the field must not scroll: the text stays inside the
+            // cell the way the painted name does.
+            let center = self.centers_edit(edit);
+            let scroll = if center { 0.0 } else { self.edit_scroll(edit, &text, &style, selection.1.max(selection.0), rect, focused) };
             let caret = self.text_width(prefix_units(&text, selection.1.max(selection.0)), &style);
             let composition = if focused { edit_composition(edit) } else { String::new() };
             paints.push(EditPaint {
-                rect, text_width: self.text_width(&text, &style),
+                rect, text_width: self.text_width(&text, &style), style, center,
+                // The two in-place editors cover a painted label and need a
+                // surface of their own; the chrome fields have their own box.
+                field_box: edit == self.view_rename
+                    || (!self.rename_hwnd.0.is_null() && edit == self.rename_hwnd),
                 cue: if text.is_empty() && edit == self.search_edit { self.search_cue.clone() } else { String::new() },
                 sel_from: self.text_width(prefix_units(&text, selection.0), &style),
                 sel_to: self.text_width(prefix_units(&text, selection.1), &style),
@@ -293,34 +367,46 @@ impl WindowState {
     /// reads state.
     pub(super) fn paint_edits(&self, cv: &Canvas, edits: &[EditPaint]) {
         if edits.is_empty() { return; }
-        let style = self.text_style();
-        let text_color = paint::c(self.palette.text);
         let cue_color = paint::c(self.palette.text_secondary).with_alpha(0.8);
         let caret_width = self.sf(1.0).max(1.0);
         for edit in edits {
             let rect = edit.rect;
+            // Left edge of the text inside the field: a centred field shifts it
+            // so the value sits where the row paints its label.
+            let shift = rect.x + if edit.center { ((rect.w - edit.text_width) / 2.0).max(0.0) } else { 0.0 } - edit.scroll;
+            // A rename editor is a white box, the way Explorer opens one over a
+            // name: a solid surface hides the row underneath, and the value is
+            // legible over a wallpaper in either theme. Its text is therefore
+            // dark whatever colour the rest of the window uses.
+            let text_color = if edit.field_box { Color::rgba8(0x1B, 0x1B, 0x1B, 0xFF) } else { paint::c(self.palette.text) };
+            if edit.field_box {
+                let field = RectF::new(rect.x - self.sf(3.0), rect.y - self.sf(1.0),
+                    rect.w + self.sf(6.0), rect.h + self.sf(2.0));
+                cv.round(field, self.sf(2.0), Color::rgba8(0xFF, 0xFF, 0xFF, 0xFF));
+                cv.stroke_round(field, self.sf(2.0), paint::c(self.palette.accent), self.sf(1.0));
+            }
             cv.push_clip(rect);
             if edit.text.is_empty() {
-                if !edit.cue.is_empty() { cv.text(&edit.cue, rect, &style, cue_color); }
+                if !edit.cue.is_empty() { cv.text(&edit.cue, rect, &edit.style, cue_color); }
             } else {
                 if edit.selection.1 > edit.selection.0 {
-                    cv.fill(RectF::new(rect.x + edit.sel_from - edit.scroll, rect.y,
-                        (edit.sel_to - edit.sel_from).max(1.0), rect.h), paint::c(self.palette.accent).with_alpha(0.32));
+                    cv.fill(RectF::new(shift + edit.sel_from, rect.y,
+                        (edit.sel_to - edit.sel_from).max(1.0), rect.h), paint::c(self.palette.accent).with_alpha(if edit.field_box { 0.28 } else { 0.32 }));
                 }
-                cv.text(&edit.text, RectF::new(rect.x - edit.scroll, rect.y, edit.text_width + caret_width * 2.0, rect.h),
-                    &style, text_color);
+                cv.text(&edit.text, RectF::new(shift, rect.y, edit.text_width + caret_width * 2.0, rect.h),
+                    &edit.style, text_color);
                 if !edit.composition.is_empty() {
-                    cv.text(&edit.composition, RectF::new(rect.x + edit.caret - edit.scroll, rect.y,
-                        edit.composition_width + caret_width * 2.0, rect.h), &style, text_color);
-                    cv.line(rect.x + edit.caret - edit.scroll, rect.bottom() - self.sf(1.5),
-                        rect.x + edit.caret - edit.scroll + edit.composition_width,
+                    cv.text(&edit.composition, RectF::new(shift + edit.caret, rect.y,
+                        edit.composition_width + caret_width * 2.0, rect.h), &edit.style, text_color);
+                    cv.line(shift + edit.caret, rect.bottom() - self.sf(1.5),
+                        shift + edit.caret + edit.composition_width,
                         rect.bottom() - self.sf(1.5), text_color, caret_width);
                 }
             }
             // The caret sits on the placeholder too: an empty focused field has
             // to show where typing will land, exactly like the native control.
             if edit.focused && self.caret_on && edit.composition.is_empty() {
-                let caret_x = rect.x + edit.caret - edit.scroll;
+                let caret_x = shift + edit.caret;
                 cv.fill(RectF::new(caret_x, rect.y + self.sf(1.0), caret_width, rect.h - self.sf(2.0)), text_color);
             }
             cv.pop_clip();
@@ -332,6 +418,20 @@ impl WindowState {
         style.ellipsis = false;
         style.wrap = false;
         style
+    }
+
+    /// Style one field's text is drawn with.
+    ///
+    /// The rename editor covers a painted name, so it has to use the size the
+    /// row paints with; the search and address fields keep the chrome size.
+    fn field_style(&self, edit: HWND) -> TextStyle {
+        if edit == self.view_rename {
+            let mut style = TextStyle::ui(self.sf(12.5));
+            style.ellipsis = false;
+            style.wrap = false;
+            return style;
+        }
+        self.text_style()
     }
 
     /// Horizontal offset that keeps the caret inside the field, kept per control
@@ -460,6 +560,38 @@ mod tests {
                 "a classic field gets its text area back");
             let _ = DeleteObject(region.into());
             let _ = DestroyWindow(edit);
+            let _ = DestroyWindow(parent);
+        }
+    }
+
+    /// A field created after the window went translucent has to be hollowed
+    /// out too. The in-place rename editors are created on first use, and they
+    /// kept their class behaviour: the control painted and kept the system
+    /// caret, which the user saw as a second caret bar at the field's origin.
+    #[test]
+    fn a_field_created_after_the_material_is_hollowed_out_as_well() {
+        unsafe {
+            let parent = CreateWindowExW(WINDOW_EX_STYLE::default(), windows::core::w!("STATIC"), None,
+                WS_OVERLAPPED, 0, 0, 320, 80, None, None, None, None).expect("parent window");
+            let search = child(parent, "EDIT", "", ID_SEARCH, ES_AUTOHSCROLL as u32, true).expect("search field");
+            let mut state = WindowState::new(storage::default_session(),
+                std::env::temp_dir().join("zsdesk-lazy-hollow.json"), None, false);
+            state.hwnd = parent;
+            state.search_edit = search;
+            state.material = true;
+            state.place_edit(search, LayoutRect::new(10, 10, 200, 19));
+            assert!(field_hollow(search));
+            // The rename editor appears only when a rename starts.
+            let rename = child(parent, "EDIT", "", ID_VIEW_RENAME, ES_AUTOHSCROLL as u32, true).expect("rename field");
+            assert!(!field_hollow(rename), "a brand new field starts as a normal control");
+            state.view_rename = rename;
+            state.place_edit(rename, LayoutRect::new(40, 40, 160, 17));
+            assert!(field_hollow(rename), "placing it under the material hollows it out");
+            let mut client = RECT::default();
+            let _ = GetClientRect(rename, &mut client);
+            assert_eq!((client.right - client.left, client.bottom - client.top), (1, 1));
+            let _ = DestroyWindow(rename);
+            let _ = DestroyWindow(search);
             let _ = DestroyWindow(parent);
         }
     }

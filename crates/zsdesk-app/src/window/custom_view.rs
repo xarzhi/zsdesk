@@ -86,6 +86,9 @@ impl WindowState {
             self.view_images_wanted.clear();
         }
         let location = self.current_location().clone();
+        // Row indices belong to the listing that produced them, so an editor
+        // left open over the old rows must not survive into a new listing.
+        unsafe { self.cancel_view_rename(); }
         // Results come from the index, one page at a time: there is no folder
         // to read here, and asking the Shell to enumerate a search folder is
         // what made typing wait for the old results to be dropped first.
@@ -286,6 +289,8 @@ impl WindowState {
     pub(super) fn tree_scroll(&mut self, delta: f32) {
         if !self.custom_tree() { return; }
         self.nav_tree.scroll_by(delta);
+        // A rename editor in the pane rides on its row, not on the pane.
+        self.sync_rename_editor();
         self.invalidate_rect(self.layout.tree);
     }
 
@@ -497,6 +502,8 @@ impl WindowState {
     pub(super) fn view_scroll(&mut self, lines: f32) {
         let step = self.file_view.scroll_step(self.dpi);
         self.file_view.scroll_by(lines * step * 3.0, self.dpi);
+        // The rows moved under the editor: put it back on its name.
+        self.sync_rename_editor();
         self.invalidate_rect(self.layout.browser);
     }
 
@@ -693,7 +700,7 @@ impl WindowState {
         true
     }
 
-    /// Keyboard file commands for the drawn result rows.
+    /// Keyboard file commands for the drawn rows.
     ///
     /// The hidden Shell view holds no items while a search runs, so the usual
     /// route through its selection would quietly do nothing. The rows carry
@@ -702,11 +709,14 @@ impl WindowState {
     pub(super) fn search_shortcut(&mut self, action: super::keyboard::FileShortcut) -> bool {
         use super::keyboard::FileShortcut;
         use zsdesk_windows::shell::file_transfer;
-        if !self.drawn_search() { return false; }
-        if action == FileShortcut::Rename {
+        // F2 in a drawn folder renames the row in place, with the editor this
+        // pane owns. Sent to the hidden Shell view it would rename inside a
+        // window nobody can see, which read as "F2 does nothing".
+        if action == FileShortcut::Rename && self.custom_view {
             if let Some(index) = self.file_view.focus() { unsafe { self.begin_view_rename(index) }; }
             return true;
         }
+        if !self.drawn_search() { return false; }
         if action == FileShortcut::Paste {
             // Explorer pastes into the folder the search was started from.
             let origin = self.search_controls().origin.clone().and_then(|it| it.as_path().map(std::path::PathBuf::from));
@@ -899,25 +909,18 @@ impl WindowState {
         let Some(entry) = self.file_view.items.get(index).cloned() else { return };
         // Virtual items have no path of their own; their Shell view renames them.
         if entry.path.is_none() { return; }
+        let rect = self.view_rect();
+        // The editor sits on the exact rectangle the name is painted into, so
+        // the text does not shift when the panel opens. Everything else (icon
+        // column, centred labels in the icon layouts) follows from that rect.
+        let Some(name) = self.file_view.name_rect(rect, self.dpi, index) else { return };
         if !unsafe { self.ensure_view_rename_edit() } { return }
         self.tree_rename_index = None;
         self.view_rename_index = Some(index);
-        let rect = self.view_rect();
-        // The editor must line up with the painted cell, whatever the layout.
-        let row = self.file_view.row_rect(rect, self.dpi, index);
-        let content = self.file_view.content_rect(rect, self.dpi);
-        let name_area = if self.file_view.layout().id() == "details" {
-            self.file_view.columns(RectF::new(content.x, content.y, content.w, row.h), self.dpi)[0].1
-        } else {
-            // Grid layouts put the name under the icon: edit on the lower part
-            // of the cell instead of beside a 16 px column icon.
-            let unit = self.dpi as f32 / 96.0;
-            RectF::new(row.x + 4.0 * unit, (row.bottom() - 24.0 * unit).max(row.y), (row.w - 8.0 * unit).max(0.0), 24.0 * unit)
-        };
+        self.file_view.set_editing(Some(index));
+        self.nav_tree.set_editing(None);
         let line = self.edit_line_height();
-        let area = LayoutRect::new(name_area.x as i32 + self.s(26),
-            name_area.y as i32 + (name_area.h as i32 - line) / 2,
-            (name_area.w as i32 - self.s(32)).max(self.s(80)), line);
+        let area = rename_area(name, line);
         self.place_edit(self.view_rename, area);
         let name = entry.name.clone();
         let text = wide(&name);
@@ -929,6 +932,28 @@ impl WindowState {
         // Select the stem so typing replaces the name but keeps the extension.
         let stem = name.rfind('.').filter(|dot| *dot > 0).unwrap_or(name.len());
         unsafe { SendMessageW(self.view_rename, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(stem as isize))); }
+        // The row's painted name goes away with this frame; without the repaint
+        // the old letters would stay on screen under the editor.
+        self.invalidate();
+    }
+
+    /// Keeps an open rename editor on the name it covers.
+    ///
+    /// The pane scrolls and resizes under the editor, so its box has to follow
+    /// the row; otherwise the field floats over whatever moved into its place.
+    pub(super) fn sync_rename_editor(&mut self) {
+        if self.view_rename.0.is_null() || !unsafe { IsWindowVisible(self.view_rename) }.as_bool() { return; }
+        let line = self.edit_line_height();
+        let label = if let Some(index) = self.view_rename_index {
+            self.file_view.name_rect(self.view_rect(), self.dpi, index)
+        } else if let Some(index) = self.tree_rename_index {
+            self.nav_tree.label_rect(self.tree_rect(), index)
+        } else {
+            return;
+        };
+        let Some(label) = label else { return };
+        let area = rename_area(label, line);
+        self.place_edit(self.view_rename, area);
     }
 
     /// Opens the rename editor over a navigation-pane row.
@@ -946,10 +971,12 @@ impl WindowState {
         if !unsafe { self.ensure_view_rename_edit() } { return }
         self.view_rename_index = None;
         self.tree_rename_index = Some(index);
+        self.file_view.set_editing(None);
+        self.nav_tree.set_editing(Some(index));
         let line = self.edit_line_height();
-        let area = LayoutRect::new(label.x as i32 - self.s(2),
-            label.y as i32 + (label.h as i32 - line) / 2,
-            (label.w as i32).max(self.s(80)), line);
+        // The painted label starts at `label.x`; the editor's text starts there
+        // too, so the name does not jump when the field opens.
+        let area = rename_area(label, line);
         self.place_edit(self.view_rename, area);
         let text = wide(&name);
         unsafe {
@@ -958,11 +985,13 @@ impl WindowState {
             let _ = SetFocus(Some(self.view_rename));
             SendMessageW(self.view_rename, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
+        self.invalidate();
     }
 
     /// Renames the folder shown by the row being edited.
     pub(super) unsafe fn commit_tree_rename(&mut self) -> bool {
         let Some(index) = self.tree_rename_index.take() else { return false };
+        self.nav_tree.set_editing(None);
         let text = if self.view_rename.0.is_null() { String::new() } else { super::navigation::window_text(self.view_rename) };
         if !self.view_rename.0.is_null() { let _ = unsafe { ShowWindow(self.view_rename, SW_HIDE) }; }
         let Some(location) = self.nav_tree.location_of(index) else { return true };
@@ -992,6 +1021,7 @@ impl WindowState {
 
     pub(super) unsafe fn cancel_tree_rename(&mut self) -> bool {
         if self.tree_rename_index.take().is_none() { return false; }
+        self.nav_tree.set_editing(None);
         if !self.view_rename.0.is_null() { let _ = unsafe { ShowWindow(self.view_rename, SW_HIDE) }; }
         let _ = unsafe { SetFocus(Some(self.hwnd)) };
         true
@@ -1010,6 +1040,7 @@ impl WindowState {
     /// Renames the item being edited. Returns false when no editor was open.
     pub(super) unsafe fn commit_view_rename(&mut self) -> bool {
         let Some(index) = self.view_rename_index.take() else { return unsafe { self.commit_tree_rename() } };
+        self.file_view.set_editing(None);
         let text = if self.view_rename.0.is_null() { String::new() } else { super::navigation::window_text(self.view_rename) };
         if !self.view_rename.0.is_null() { let _ = unsafe { ShowWindow(self.view_rename, SW_HIDE) }; }
         let Some(entry) = self.file_view.items.get(index).cloned() else { return true };
@@ -1033,10 +1064,21 @@ impl WindowState {
 
     pub(super) unsafe fn cancel_view_rename(&mut self) -> bool {
         if self.view_rename_index.take().is_none() { return unsafe { self.cancel_tree_rename() } }
+        self.file_view.set_editing(None);
         if !self.view_rename.0.is_null() { let _ = unsafe { ShowWindow(self.view_rename, SW_HIDE) }; }
         self.focus_view();
         true
     }
+}
+
+/// Box the in-place rename editor occupies over a painted label.
+///
+/// The box keeps the label's centre line, so the text the editor draws sits on
+/// the same baseline as the name the row paints.
+fn rename_area(label: RectF, line: i32) -> LayoutRect {
+    let height = label.h.round() as i32;
+    LayoutRect::new(label.x.round() as i32, label.y.round() as i32 + (height - line).max(0) / 2,
+        label.w.round() as i32, line)
 }
 
 /// The system double-click interval, with a floor so a very short setting

@@ -120,6 +120,11 @@ const WM_DROP_HOVER: u32 = WM_APP + 52;
 const WM_DROP_LEAVE: u32 = WM_APP + 53;
 /// The thumbnail worker finished one picture: WPARAM carries its loader token.
 const WM_VIEW_IMAGES: u32 = WM_APP + 54;
+/// A text field gained (WPARAM=1) or lost (WPARAM=0) the focus. Posted by the
+/// field's subclass, because `EN_SETFOCUS` is lost when the field is focused
+/// from inside an action — the state is borrowed then, and a reentrant
+/// `WM_COMMAND` has nowhere to go.
+const WM_EDIT_FOCUS: u32 = WM_APP + 55;
 type Slot = RefCell<Option<WindowState>>;
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum BrowserRole{Fresh,Ordinary,Results}
@@ -814,6 +819,9 @@ impl WindowState {
                 self.place_edit(self.rename_hwnd, LayoutRect::new(r.x + pad, r.y + (r.height - line) / 2, r.width.max(self.s(140)) - pad * 2, line));
             }
         }
+        // An open rename editor sits on a row, and the row may have moved with
+        // the pane, a resize or a scroll.
+        self.sync_rename_editor();
         self.invalidate();
     }
 
@@ -1378,7 +1386,7 @@ unsafe fn reentrant(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         }
         WM_CLOSE | WM_LAYOUT | WM_ACTION | WM_SHELL_NAVIGATED | WM_SHELL_FOLDER_INVOKED | WM_SHELL_NAVIGATION_FAILED | WM_BOOKMARK_PATH_DROPPED
         | WM_OPEN_REQUEST | WM_TREE_NAVIGATE | WM_OPEN_TAB_PATH | WM_SHELL_SELECTION_CHANGED | crate::routing_control::WM_RESULT | WM_FAST_SEARCH | WM_DIAGNOSTIC
-        | WM_DROP_PATHS | WM_DROP_HOVER | WM_DROP_LEAVE | WM_VIEW_IMAGES
+        | WM_DROP_PATHS | WM_DROP_HOVER | WM_DROP_LEAVE | WM_VIEW_IMAGES | WM_EDIT_FOCUS
         | zsdesk_windows::shell::WM_TREE_STATE | tab_transfer::WM_TAB_TRANSFER
         | WM_CANCELMODE | WM_CAPTURECHANGED | WM_THEMECHANGED | WM_DWMCOMPOSITIONCHANGED | WM_SYSCOLORCHANGE => {
             defer_message(hwnd,msg,wp,lp);
@@ -1622,16 +1630,12 @@ impl WindowState {
                 let code = (wp.0 >> 16) as u32;
                 if lp.0 != 0 {
                     // Notifications from native EDIT children.
-                    if code == EN_SETFOCUS {
-                        self.caret_on = true;
-                        unsafe { SetTimer(Some(self.hwnd), edits::TIMER_CARET, edits::CARET_INTERVAL, None); }
-                        self.invalidate();
-                    }
-                    if code == EN_KILLFOCUS {
-                        self.caret_on = false;
-                        let _ = unsafe { KillTimer(Some(self.hwnd), edits::TIMER_CARET) };
-                        self.invalidate();
-                    }
+                    // A field tells the window when it gains or loses the focus
+                    // so the self-drawn caret can blink. The notification is
+                    // also posted from the field's subclass, because focusing a
+                    // rename editor from inside an action loses `WM_COMMAND`.
+                    if code == EN_SETFOCUS { self.edit_focus_changed(true); }
+                    if code == EN_KILLFOCUS { self.edit_focus_changed(false); }
                     if (id == ID_ADDRESS || id == ID_SEARCH) && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
                         self.invalidate_rect(self.layout.nav_row);
                         if id==ID_SEARCH && code==EN_SETFOCUS && !self.search_panel.open { post(self.hwnd,WM_ACTION,Command::FocusSearch.id() as usize,0); }
@@ -1639,6 +1643,12 @@ impl WindowState {
                     }
                     if id == ID_BOOKMARK_RENAME && code == EN_KILLFOCUS { post(self.hwnd, WM_ACTION, ACTION_COMMIT_RENAME, 0); }
                     if id == ID_VIEW_RENAME && code == EN_KILLFOCUS { post(self.hwnd, WM_ACTION, ACTION_VIEW_COMMIT, 0); }
+                    // A hollow field draws nothing itself: its text only reaches
+                    // the screen through the window's own paint, so every edit
+                    // and every selection move has to ask for one.
+                    if matches!(code, EN_CHANGE | EN_UPDATE) {
+                        if let Some(edit) = self.edit_handle(id) { self.refresh_edit(edit); }
+                    }
                     // Search as you type, after a short pause (like Windows 11).
                     if id == ID_SEARCH && code == EN_CHANGE && unsafe { GetFocus() } == self.search_edit {
                         unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 250, None); }
@@ -1648,6 +1658,7 @@ impl WindowState {
                 }
                 return Some(LRESULT(0));
             }
+            WM_EDIT_FOCUS => self.edit_focus_changed(wp.0 != 0),
             WM_ACTION => unsafe { self.action(wp.0, lp.0) },
             WM_SHELL_NAVIGATED => if lp.0 != 0 { unsafe { self.navigation_completed(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
             WM_SHELL_FOLDER_INVOKED => if lp.0 != 0 { unsafe { self.navigate_to(*Box::from_raw(lp.0 as *mut ShellLocation)); } },
@@ -1919,6 +1930,41 @@ fn accelerator_table() -> Vec<ACCEL> {
 }
 
 unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, parent: usize) -> LRESULT {
+    let result = unsafe { edit_field_proc(hwnd, msg, wp, lp, id, parent) };
+    // A hollow field still owns the thread's system caret. A focused EDIT
+    // creates one in `WM_SETFOCUS`, and the system draws it outside the
+    // control's paints — not clipped by the one-pixel window, which only hides
+    // the plate — so it shows as a second, blinking bar at the field's origin
+    // while `paint_edits` draws the real caret at the text position. Take the
+    // caret away again after every message that can bring it back.
+    if edits::field_hollow(hwnd) && matches!(msg, WM_SETFOCUS | WM_KILLFOCUS) {
+        // Focus also has to reach the window as a posted message: opening the
+        // rename editor focuses it from inside an action, when the state is
+        // borrowed, and the EDIT's own `EN_SETFOCUS` would be dropped there.
+        post(HWND(parent as *mut _), WM_EDIT_FOCUS, (msg == WM_SETFOCUS) as usize, 0);
+    }
+    if edits::field_hollow(hwnd) && matches!(msg, WM_SETFOCUS | WM_KILLFOCUS | WM_LBUTTONDOWN
+        | WM_LBUTTONDBLCLK | WM_CHAR | WM_KEYDOWN | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO
+        | WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION | WM_IME_ENDCOMPOSITION)
+    {
+        unsafe { drop_system_caret(hwnd) };
+    }
+    result
+}
+
+/// Removes the system caret a hollow field would otherwise show on screen.
+///
+/// `DestroyCaret` only works on the window that owns the caret, so the focused
+/// field is the one asked to give it up. Only hollow fields are touched: a
+/// classic window keeps its native fields and their carets untouched.
+unsafe fn drop_system_caret(hwnd: HWND) {
+    let focus = unsafe { GetFocus() };
+    if focus.0.is_null() || (focus != hwnd && !edits::field_hollow(focus)) { return; }
+    let _ = unsafe { HideCaret(Some(focus)) };
+    let _ = unsafe { DestroyCaret() };
+}
+
+unsafe extern "system" fn edit_field_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, id: usize, parent: usize) -> LRESULT {
     // A hollow field paints nothing: an EDIT erases its own background without
     // consulting its window region, so an empty region alone still left an
     // opaque plate on screen. The text, caret, selection and IME composition
@@ -1930,6 +1976,14 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             unsafe { BeginPaint(hwnd, &mut ps); }
             let _ = unsafe { EndPaint(hwnd, &ps) };
             return LRESULT(0);
+        }
+        // A hollow field puts no pixels on screen, so the only way its text,
+        // selection and caret reach the display is a repaint of the window that
+        // draws them. Typing, deleting, pasting and moving the caret all land
+        // here; without this the field looked dead until Enter committed and
+        // the list repainted for another reason.
+        if matches!(msg, WM_CHAR | WM_KEYUP | WM_PASTE | WM_CUT | WM_CLEAR | WM_UNDO) {
+            let _ = unsafe { InvalidateRect(Some(HWND(parent as *mut _)), None, false) };
         }
     }
     // EDIT focus notifications can arrive while the parent state is borrowed
@@ -2012,5 +2066,13 @@ fn edit_composing(hwnd:HWND)->bool{
         defer_message(h,WM_ACTION,WPARAM(10),LPARAM(1));defer_message(h,WM_ACTION,WPARAM(11),LPARAM(2));
         let q=DEFERRED_MESSAGES.with(|q|std::mem::take(&mut *q.borrow_mut()));
         assert_eq!(q.len(),3);assert_eq!(q[1].2.0,10);assert_eq!(q[2].3.0,2);
+    }
+    /// Two timers on one id share one setting: starting the caret blink stopped
+    /// the navigation refresh, and killing that refresh stopped the blink.
+    #[test]fn every_timer_uses_its_own_id(){
+        let ids=[TIMER_STATUS,TIMER_MESSAGE,TIMER_SEARCH,TIMER_FAST_SEARCH,TIMER_PLACEMENT,
+            TIMER_TREE_STATE,TIMER_REVEAL,TIMER_NAV_REFRESH,edits::TIMER_CARET];
+        let mut unique=ids.to_vec();unique.sort_unstable();unique.dedup();
+        assert_eq!(unique.len(),ids.len(),"a timer id is shared");
     }
 }

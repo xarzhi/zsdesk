@@ -2,7 +2,51 @@
 
 ## 未发布
 
-（暂无）
+### 重命名框里只留一个光标，并且会闪
+
+- 框里出现两个光标：左边一个在闪、右边一个不动。
+- 左边那个是**系统光标**。空心 EDIT 仍然持有线程的系统 caret，`WM_SETFOCUS` 时创建，系统
+  直接画在屏幕上（不会被 1px 窗口裁掉，只裁掉它自己的绘制），于是停在字段原点闪个不停；
+  右边那个是自绘光标，位置才对，却一直不动。
+- 不动的根因是焦点通知丢了：`EN_SETFOCUS` 走 `WM_COMMAND` 回父窗口，而重命名框是在
+  action 回调里 `SetFocus` 打开的——此时窗口状态还被借用，重入的 `WM_COMMAND` 落到
+  `DefWindowProc` 被丢弃，光标定时器从来没启动过。现在字段子类在
+  `WM_SETFOCUS`/`WM_KILLFOCUS` 里补发一条 `WM_EDIT_FOCUS`（可延迟、不会被借用吞掉），
+  由它启停闪烁。
+- 顺带修掉一个定时器 ID 冲突：光标闪烁用了 `TIMER_CARET=12`，和 `TIMER_NAV_REFRESH` 同一个
+  id，任一方 `KillTimer` 都会把另一方停掉。现在光标定时器是 13，并加了回归测试
+  `every_timer_uses_its_own_id`。
+- 系统光标在字段子类里销毁（`HideCaret` + `DestroyCaret`，只在空心字段、且焦点确实在该
+  字段时做），搜索框/地址栏/收藏夹重命名都因此只剩一个会闪的光标。
+- 真正的祸根其实是另一个：`sync_edit_regions` 用 `if material && edits_hollow { return }`
+  提前退出，而 `edits_hollow` 记的是「窗口上次切换后的状态」。重命名框是懒创建的，创建时
+  窗口早已是材质模式，于是它**从来没有被标记成空心**（只被挤成 1px）——既保留原生绘制的
+  行为，也保留系统光标。现在状态按控件判断，新字段一律补做空心化，并加了回归测试
+  `a_field_created_after_the_material_is_hollowed_out_as_well`。
+- 验证：`GetGUIThreadInfo` 采样确认 `hwndCaret` 一直为空；连续 10 帧 `PrintWindow` 中
+  「框内深色像素数」在 1398/1415 之间交替（差 17px 正好是一根光标），说明自绘光标真的在闪；
+  截图放大后框里只有一根光标，地址栏输入 `abc` 也只有一个光标。
+
+### 重命名：编辑框盖在名字上、输入即时可见、白底
+
+- 以前编辑框的位置是「名称列左边缘 + 26px、宽度 − 32px」猜出来的。详细视图里名字实际从
+  图标右侧 30px 开始（8 图标内边距 + 16 图标 + 6 间隙），编辑框偏左；图标/平铺视图里名字在
+  图标下方居中，编辑框却按单元格左下角摆，偏得更多。
+- 现在列表和导航树各自给出「这个名字到底画在哪」的矩形（`FileView::name_rect` /
+  `NavTree::label_rect`），绘制与编辑框读同一份几何；图标/内容视图还按行内的居中方式居中
+  文本，所以打开编辑框时名字不会跳。
+- 输入没反应：材质模式下 EDIT 是空心的（不画任何像素），文字全靠窗口自己绘制；改名期间
+  没有处理 `EN_CHANGE`，键入的内容要等光标闪烁（530ms）或回车才被画出来。现在
+  `EN_CHANGE`/`EN_UPDATE` 立刻重绘该字段，子类里对 `WM_CHAR`/`WM_KEYUP`/`WM_PASTE`/
+  `WM_CUT`/`WM_CLEAR`/`WM_UNDO` 直接让父窗口失效——输入、删除、粘贴、移动光标都即时可见。
+- 编辑期间该行不再绘制自己的名字，否则新输入的字会和旧名字叠在一起。
+- 编辑框改成白底 + 强调色 1px 细边 + 深色文字（收藏夹重命名同样），壁纸和深色主题下都清楚。
+- F2 现在直接打开这个自绘编辑框；以前 F2 被转给隐藏的 Shell 视图，等于没反应。
+- 滚动、缩放时编辑框跟着行移动（`sync_rename_editor`），不会悬在别的行上。
+- 新增测试：`the_rename_editor_lands_on_the_painted_name`、
+  `an_icon_layout_centres_the_rename_editor_on_its_label`、
+  `an_edited_row_drops_its_painted_name_so_only_the_editor_shows`、
+  `the_label_rect_starts_after_the_icon_and_spans_one_row`。
 
 ## 0.3.8 — 2026-11-22
 
