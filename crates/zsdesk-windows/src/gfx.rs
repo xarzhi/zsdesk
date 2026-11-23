@@ -8,6 +8,9 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
+use windows::Win32::Graphics::Imaging::{IWICBitmapScaler, WICBitmapInterpolationMode,
+    WICBitmapInterpolationModeFant, WICBitmapInterpolationModeLinear};
+
 use windows::{
     core::{Interface, PCWSTR, Result, w},
     Win32::{
@@ -294,19 +297,13 @@ impl Gfx {
         (w, h)
     }
 
-    /// Decodes a picture, scales it to cover `width`×`height`, blurs it and
-    /// pushes it towards black. The result is premultiplied BGRA, ready for
-    /// [`Gfx::upload`].
+    /// Decodes a picture once: converted to premultiplied BGRA and scaled down
+    /// so its long side is at most `max_edge`.
     ///
-    /// Blurring happens on the CPU after a WIC downscale because the render
-    /// target is a plain `ID2D1DCRenderTarget`, which cannot host D2D effects.
-    ///
-    /// Returns the picture together with its mean luminance (0..=1, BT.709
-    /// weights). The caller uses it to decide how much of a readability scrim
-    /// the picture needs instead of always washing it out.
-    pub fn wallpaper(&self, path: &std::path::Path, width: i32, height: i32, blur: u8, dim: u8) -> Option<(IWICBitmapSource, f32)> {
-        use windows::Win32::Graphics::Imaging::{IWICBitmapScaler, WICBitmapInterpolationModeFant};
-        let (width, height) = (width.max(1), height.max(1));
+    /// The decode is by far the most expensive step, so it is kept separate
+    /// from the window-size work: a live resize re-derives from this copy
+    /// instead of touching the file and the codec again.
+    pub fn wallpaper_base(&self, path: &std::path::Path, max_edge: i32) -> Option<IWICBitmapSource> {
         let factory = self.imaging_factory()?;
         let name = wide(&path.to_string_lossy());
         let decoder = unsafe {
@@ -317,15 +314,60 @@ impl Gfx {
         let source = self.convert(&frame.cast().ok()?)?;
         let (sw, sh) = Self::wic_size(&source);
         if sw == 0 || sh == 0 { return None; }
+        let factor = (max_edge.max(64) as f32 / sw.max(sh) as f32).min(1.0);
+        if factor >= 1.0 { return Some(source); }
+        let width = ((sw as f32 * factor).round() as i32).max(1);
+        let height = ((sh as f32 * factor).round() as i32).max(1);
+        self.scale(&source, width, height)
+    }
+
+    /// A scaler for `source`; the caller reads pixels straight out of it, which
+    /// keeps the intermediate out of memory.
+    fn scaler(&self, source: &IWICBitmapSource, width: i32, height: i32, mode: WICBitmapInterpolationMode) -> Option<IWICBitmapScaler> {
+        let factory = self.imaging_factory()?;
+        let scaler: IWICBitmapScaler = unsafe { factory.CreateBitmapScaler().ok()? };
+        unsafe { scaler.Initialize(source, width.max(1) as u32, height.max(1) as u32, mode).ok()? };
+        Some(scaler)
+    }
+
+    /// Fant-resamples `source`, materialising the pixels so the input can go.
+    fn scale(&self, source: &IWICBitmapSource, width: i32, height: i32) -> Option<IWICBitmapSource> {
+        use windows::Win32::Graphics::Imaging::WICBitmapCacheOnLoad;
+        let factory = self.imaging_factory()?;
+        let scaler = self.scaler(source, width, height, WICBitmapInterpolationModeFant)?;
+        let scaled: IWICBitmapSource = unsafe {
+            factory.CreateBitmapFromSource(Some(&scaler.cast().ok()?), WICBitmapCacheOnLoad)
+        }.ok()?.cast().ok()?;
+        Some(scaled)
+    }
+
+    /// Derives the picture for one window size from [`Gfx::wallpaper_base`]:
+    /// cover fit, centre crop, blur, dim.
+    ///
+    /// Blurring happens on the CPU because the render target is a plain
+    /// `ID2D1DCRenderTarget`, which cannot host D2D effects.
+    ///
+    /// Returns the picture together with its mean luminance (0..=1, BT.709
+    /// weights). The caller uses it to decide how much of a readability scrim
+    /// the picture needs instead of always washing it out.
+    pub fn wallpaper_render(&self, base: &IWICBitmapSource, width: i32, height: i32, blur: u8, dim: u8) -> Option<(IWICBitmapSource, f32)> {
+        let factory = self.imaging_factory()?;
+        let (width, height) = (width.max(1), height.max(1));
+        let (sw, sh) = Self::wic_size(base);
+        if sw == 0 || sh == 0 { return None; }
         // Cover fit: the shorter axis is cropped, never letterboxed.
         let factor = (width as f32 / sw as f32).max(height as f32 / sh as f32);
         let (cover_w, cover_h) = ((sw as f32 * factor).ceil() as i32, (sh as f32 * factor).ceil() as i32);
         let (cover_w, cover_h) = (cover_w.max(width), cover_h.max(height));
-        let scaler: IWICBitmapScaler = unsafe { factory.CreateBitmapScaler().ok()? };
-        unsafe { scaler.Initialize(&source, cover_w as u32, cover_h as u32, WICBitmapInterpolationModeFant).ok()? };
-        let scaled: IWICBitmapSource = unsafe {
-            factory.CreateBitmapFromSource(Some(&scaler.cast().ok()?), windows::Win32::Graphics::Imaging::WICBitmapCacheOnLoad)
-        }.ok()?.cast().ok()?;
+        // Pixels are read straight out of the scaler: materialising it first
+        // would write the cover bitmap twice per resize step.
+        let scaled: IWICBitmapSource = if cover_w as u32 == sw && cover_h as u32 == sh {
+            base.clone()
+        } else {
+            // Linear, not Fant: this runs on every resize step and the picture
+            // has already been filtered once when the base was decoded.
+            self.scaler(base, cover_w, cover_h, WICBitmapInterpolationModeLinear)?.cast().ok()?
+        };
         let stride = (cover_w * 4) as u32;
         let mut pixels = vec![0u8; stride as usize * cover_h as usize];
         unsafe { scaled.CopyPixels(std::ptr::null(), stride, &mut pixels) }.ok()?;
@@ -340,12 +382,15 @@ impl Gfx {
         if radius > 0 { box_blur(&mut canvas, width as usize, height as usize, radius); }
         if dim > 0 { dim_pixels(&mut canvas, dim); }
         // Mean luminance of what is actually drawn: the blur keeps it and the
-        // dim already applied has lowered it, both of which matter.
+        // dim already applied has lowered it, both of which matter. Every 16th
+        // pixel is plenty for an average and keeps a resize frame cheap.
         let mut total = 0.0f64;
-        for pixel in canvas.chunks_exact(4) {
+        let mut seen = 0.0f64;
+        for pixel in canvas.chunks_exact(4).step_by(16) {
             total += 0.0722 * f64::from(pixel[0]) + 0.7152 * f64::from(pixel[1]) + 0.2126 * f64::from(pixel[2]);
+            seen += 1.0;
         }
-        let mean = (total / (canvas.len() as f64 / 4.0) / 255.0) as f32;
+        let mean = (total / seen.max(1.0) / 255.0) as f32;
         let bitmap = unsafe { factory.CreateBitmapFromMemory(width as u32, height as u32, &GUID_WICPixelFormat32bppPBGRA,
             stride_of(width), &canvas) }.ok()?;
         Some((bitmap.cast().ok()?, mean))

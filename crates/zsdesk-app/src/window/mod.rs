@@ -107,6 +107,8 @@ const TIMER_TREE_STATE:usize=10;
 const TIMER_REVEAL:usize=11;
 /// Re-reads the pinned quick-access folders once the Shell has finished a pin.
 const TIMER_NAV_REFRESH:usize=12;
+/// Renders the wallpaper at the size a drag left behind.
+const TIMER_WALLPAPER:usize=13;
 const WM_FAST_SEARCH:u32=WM_APP+43;
 const WM_DIAGNOSTIC:u32=WM_APP+44;
 /// Starts an OLE drag of the selected rows. Runs outside the state borrow so
@@ -1481,7 +1483,9 @@ impl WindowState {
                 }
                 let _ = unsafe { EndPaint(self.hwnd, &ps) };
             }
-            WM_SIZE => {unsafe { self.resize();SetTimer(Some(self.hwnd),TIMER_PLACEMENT,300,None); }},
+            WM_SIZE => {
+                unsafe { self.resize();SetTimer(Some(self.hwnd),TIMER_PLACEMENT,300,None);SetTimer(Some(self.hwnd),TIMER_WALLPAPER,120,None); }
+            },
             WM_EXITSIZEMOVE => { self.remember_placement(); self.save(); unsafe { self.resize(); } }
             WM_LAYOUT => unsafe { self.resize() },
             WM_ACTIVATE => {
@@ -1514,6 +1518,16 @@ impl WindowState {
             WM_TIMER => {
                 if wp.0 == edits::TIMER_CARET { self.tick_caret(); }
                 if wp.0==TIMER_PLACEMENT{let _=unsafe{KillTimer(Some(self.hwnd),TIMER_PLACEMENT)};self.remember_placement();self.save();}
+                if wp.0==TIMER_WALLPAPER{
+                    let _=unsafe{KillTimer(Some(self.hwnd),TIMER_WALLPAPER)};
+                    // The stretch shown while dragging is replaced by the exact
+                    // size once the window stopped changing size.
+                    let (width, height) = self.client_size();
+                    let prefs = self.session.ui.appearance.wallpaper.clone().normalized();
+                    let Self { gfx, wallpaper, .. } = &mut *self;
+                    let settled = gfx.as_ref().is_some_and(|gfx| wallpaper.settle(gfx, width, height, &prefs));
+                    if settled { self.invalidate(); }
+                }
                 if wp.0 == TIMER_STATUS { self.refresh_status();self.poll_search_settings(); }
                 if wp.0 == TIMER_SEARCH { let _ = unsafe { KillTimer(Some(self.hwnd), TIMER_SEARCH) }; unsafe { self.live_search(); } }
                 if wp.0 == TIMER_FAST_SEARCH { let _=unsafe{KillTimer(Some(self.hwnd),TIMER_FAST_SEARCH)};self.poll_fast_search(); }
