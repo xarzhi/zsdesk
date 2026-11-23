@@ -257,6 +257,9 @@ pub fn build(snapshot: &Snapshot<'_>) -> Vec<Section> {
             Row::segments("search-scope", "默认搜索范围", "按 Ctrl+F 时搜索全部磁盘，或只搜索当前文件夹",
                 &["全部本地磁盘", "仅当前文件夹"], usize::from(!ui.search_all_files),
                 &["search-all-files", "search-current-folder"]),
+            Row::toggle_locked("search-recursive", "包含子文件夹",
+                "搜索当前文件夹时连同它下面的子文件夹一起搜索；选「全部本地磁盘」时不适用",
+                ui.search_recursive, !ui.search_all_files),
         ]),
         group(Some("Everything"), vec![
             Row::button("search-everything-program", "已安装的 Everything", &everything, "选择"),
@@ -678,6 +681,40 @@ mod tests {
         let on = build(&Snapshot { ui: &ui, integration: 2, open: None });
         let rows: Vec<&Row> = on.iter().flat_map(|section| &section.groups).flat_map(|group| &group.rows).collect();
         assert!(matches!(rows.iter().find(|row| row.id == "integration-recycle").unwrap().control, Control::Toggle { enabled: true, .. }));
+    }
+
+    #[test]
+    fn search_recursion_switch_lives_next_to_the_scope_choice() {
+        let ui = snapshot();
+        let sections = sections_for(&ui);
+        let search = sections.iter().find(|section| section.id == "search").expect("search section");
+        let row = search.groups.iter().flat_map(|group| &group.rows)
+            .find(|row| row.id == "search-recursive").expect("recursion row");
+        // 默认搜索范围是全部磁盘时，这个开关没有意义，应灰显。
+        assert!(matches!(row.control, Control::Toggle { on: false, enabled: false }));
+
+        let narrow = ExplorerUi { search_all_files: false, search_recursive: true, ..ui };
+        let sections = sections_for(&narrow);
+        let search = sections.iter().find(|section| section.id == "search").unwrap();
+        let row = search.groups.iter().flat_map(|group| &group.rows)
+            .find(|row| row.id == "search-recursive").unwrap();
+        assert!(matches!(row.control, Control::Toggle { on: true, enabled: true }));
+    }
+
+    #[test]
+    fn the_recursion_switch_fits_on_screen_without_scrolling() {
+        for dpi in [96u32, 120, 144] {
+            let ui = ExplorerUi { search_all_files: false, search_recursive: true, ..snapshot() };
+            let sections = sections_for(&ui);
+            let index = sections.iter().position(|section| section.id == "search").unwrap();
+            let l = layout(scale(DIALOG_W, dpi) as i32, scale(DIALOG_H, dpi) as i32, dpi, &sections, index, 0.0, &measure);
+            let scope = &l.groups[0];
+            assert_eq!(scope.rows.len(), 2, "范围 card holds the scope choice and the recursion switch at {dpi} dpi");
+            let row = &scope.rows[1];
+            let top = l.view.y + row.control.y;
+            assert!(top >= l.view.y && top + row.control.h <= l.view.bottom(),
+                "the recursion switch starts below the fold at {dpi} dpi");
+        }
     }
 
     #[test]

@@ -190,6 +190,7 @@ pub fn interface_settings_menu(ui: &ExplorerUi) -> MenuSpec {
         submenu("搜索范围", vec![
             entry("搜索全部本地磁盘", "search-all-files", true, ui.search_all_files),
             entry("仅搜索当前文件夹", "search-current-folder", true, !ui.search_all_files),
+            entry("包含子文件夹", "search-recursive", true, ui.search_recursive),
         ]),
         submenu("Everything 搜索", vec![
             item("索引设置…", "search-index-settings"),
@@ -224,6 +225,7 @@ pub fn apply_interface_setting(ui: &mut ExplorerUi, choice: &str) -> bool {
         "hover-preview" => ui.hover_preview = !ui.hover_preview,
         "search-all-files" => ui.search_all_files = true,
         "search-current-folder" => ui.search_all_files = false,
+        "search-recursive" => ui.search_recursive = !ui.search_recursive,
         _ => {
             let Some(item) = choice.strip_prefix("command-bar-item-").and_then(CommandBarItem::from_key) else { return false };
             let visible = ui.command_bar.item_visible(item);

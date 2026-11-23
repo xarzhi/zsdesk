@@ -55,7 +55,8 @@ impl WindowState{
             location if !self.session.ui.search_all_files => location.as_path().map(PathBuf::from),
             _ => None,
         };
-        let controls = self.search_panel.tabs.entry(id).or_insert_with(|| SearchControls { scope, ..Default::default() });
+        let recursive = self.session.ui.search_recursive;
+        let controls = self.search_panel.tabs.entry(id).or_insert_with(|| SearchControls { scope, recursive, ..Default::default() });
         let text = controls.draft.clone().unwrap_or(fallback);
         controls.draft = Some(text.clone());
         self.search_scope = controls.origin.clone();

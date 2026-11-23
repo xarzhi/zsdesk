@@ -120,7 +120,8 @@ impl WindowState {
     }
 
     pub(super) fn search_controls(&self) -> SearchControls {
-        self.search_panel.tabs.get(&self.session.active_tab().id).cloned().unwrap_or_default()
+        self.search_panel.tabs.get(&self.session.active_tab().id).cloned()
+            .unwrap_or(SearchControls { recursive: self.session.ui.search_recursive, ..Default::default() })
     }
 
     /// Names the folder depth the status line is counting, so a small result
@@ -134,7 +135,11 @@ impl WindowState {
     }
 
     pub(super) fn search_controls_mut(&mut self) -> &mut SearchControls {
-        self.search_panel.tabs.entry(self.session.active_tab().id).or_default()
+        // A tab that has never searched starts from the saved preference, so
+        // the switch in 设置 also covers tabs opened in this session.
+        let recursive = self.session.ui.search_recursive;
+        self.search_panel.tabs.entry(self.session.active_tab().id)
+            .or_insert_with(|| SearchControls { recursive, ..Default::default() })
     }
 
     pub(super) fn paint_search_panel(&self, cv: &Canvas) {
@@ -314,6 +319,10 @@ impl WindowState {
     pub(super) unsafe fn toggle_search_recursive(&mut self) {
         let recursive = !self.search_controls().recursive;
         self.search_controls_mut().recursive = recursive;
+        // Remember the choice: 设置 shows the same switch, and 设置 itself
+        // writes this preference back for tabs opened later.
+        self.session.ui.search_recursive = recursive;
+        self.save();
         self.show_message(if recursive { "搜索范围：包含子文件夹".into() } else { "搜索范围：仅当前文件夹".into() });
         unsafe { self.request_integrated_search(true); }
     }

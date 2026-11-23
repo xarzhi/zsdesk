@@ -924,6 +924,13 @@ impl WindowState {
             self.search_controls_mut().scope = scope;
             unsafe { SetTimer(Some(self.hwnd), TIMER_SEARCH, 20, None); }
         }
+        if old.search_recursive != ui.search_recursive {
+            self.search_controls_mut().recursive = ui.search_recursive;
+            // Only refresh results the user is actually looking at; a closed
+            // panel must not pop back open just because the preference changed.
+            let showing = self.search_panel.open && matches!(self.current_location(), ShellLocation::Search { .. });
+            if showing { unsafe { self.request_integrated_search(true); } }
+        }
         if old.search_backend != ui.search_backend { self.search_backend_changed(); }
         // Switching back to one window per folder collapses this window to the
         // tab the user is looking at; the tab strip disappears with the layout.

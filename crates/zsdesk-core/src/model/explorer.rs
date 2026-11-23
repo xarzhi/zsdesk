@@ -397,6 +397,9 @@ pub struct ExplorerUi {
     pub command_bar: CommandBarPreferences,
     pub context_menu: ContextMenuPreferences,
     pub search_all_files: bool,
+    /// Descend into subfolders when a search is limited to a folder. Off by
+    /// default: picking a folder searches that folder, not its whole subtree.
+    pub search_recursive: bool,
     pub search_backend: SearchBackendPreference,
     pub everything_executable: Option<PathBuf>,
     pub space_preview: bool,
@@ -426,7 +429,8 @@ impl Default for ExplorerUi {
         Self { tab_placement:TabPlacement::Top, show_tree: true, tree_width: 220, show_bookmarks: true,
             details_columns: [132, 96, 86], show_preview: false, show_details: false,
             command_bar: CommandBarPreferences::default(), context_menu: ContextMenuPreferences::default(),
-            search_all_files: true, search_backend: SearchBackendPreference::Everything, space_preview: true,
+            search_all_files: true, search_recursive: false,
+            search_backend: SearchBackendPreference::Everything, space_preview: true,
             everything_executable:None,
             hover_preview: false, preview_provider: PreviewProviderPreference::System,
             forward_unhandled_windows: true,
@@ -623,6 +627,7 @@ mod tests {
         assert_eq!(ui.command_bar, CommandBarPreferences::default());
         assert_eq!(ui.context_menu, ContextMenuPreferences::default());
         assert!(ui.search_all_files && ui.space_preview);
+        assert!(!ui.search_recursive, "a folder search stays on that folder unless asked");
     }
 
     #[test]
