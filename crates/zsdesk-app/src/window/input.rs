@@ -689,7 +689,7 @@ impl WindowState {
             unsafe { ExplorerBrowserHost::create_transient(self.hwnd, win_rect(self.layout.browser), self.modern, panes) }
         } else { unsafe { ExplorerBrowserHost::create(self.hwnd, win_rect(self.layout.browser), self.modern, panes) } };
         match created {
-            Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);},
+            Ok(browser) => {browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));self.browser = Some(browser);self.guard_native_view();},
             Err(error) => self.show_message(format!("无法切换窗格：{error}")),
         }
         self.icons.clear();

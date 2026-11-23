@@ -130,7 +130,7 @@ impl WindowState{
         let panes=Panes{preview:false,details:self.session.ui.show_details};
         let browser=unsafe{ExplorerBrowserHost::create(self.hwnd,win_rect(self.layout.browser),self.modern,panes)?};
         browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));
-        self.browser=Some(browser);self.theme_children();Ok(())
+        self.browser=Some(browser);self.guard_native_view();self.theme_children();Ok(())
     }
     pub(super) fn start_fast_search(&mut self,query:&str){
         let submitted=self.submitted_search(query);

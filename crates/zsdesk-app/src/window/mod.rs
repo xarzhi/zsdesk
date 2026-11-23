@@ -52,7 +52,7 @@ use anyhow::{Context, Result};
 use windows::{core::{PCWSTR, PWSTR}, Win32::{
     Foundation::{COLORREF, HWND, HINSTANCE, LPARAM, LRESULT, WPARAM, POINT, RECT},
     Graphics::{Dwm::{DwmDefWindowProc, DwmSetWindowAttribute, DWMWA_CLOAK}, Gdi::{BeginPaint, BitBlt, CreateFontIndirectW, CreateRectRgn, CreateSolidBrush, DeleteObject, EndPaint,
-        InvalidateRect, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, SetWindowRgn, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
+        InvalidateRect, GetDC, ReleaseDC, ScreenToClient, ClientToScreen, SetBkColor, SetTextColor, SetWindowRgn, HBRUSH, HDC, HFONT, PAINTSTRUCT, SRCCOPY,
         MonitorFromRect, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL}},
     System::{DataExchange::COPYDATASTRUCT, LibraryLoader::GetModuleHandleW, Ole::{OleInitialize, OleUninitialize, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, DROPEFFECT_NONE}, SystemServices::{MK_CONTROL, MK_SHIFT}},
     UI::{Controls::*, HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi, SystemParametersInfoForDpi},
@@ -682,6 +682,7 @@ impl WindowState {
         #[cfg(test)]
         let browser = unsafe { ExplorerBrowserHost::create_transient(hwnd, win_rect(self.layout.browser), self.modern, panes)? };
         self.browser = Some(browser);
+        self.guard_native_view();
         stage("browser");
         if let Some(browser)=&self.browser{browser.set_context_menu_options(crate::context_preferences::native(&self.session.ui.context_menu));}
         self.tree = unsafe { NamespaceTreeHost::create(hwnd, win_rect(self.layout.tree)) }.ok();

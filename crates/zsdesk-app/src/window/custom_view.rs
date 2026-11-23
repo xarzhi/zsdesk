@@ -29,6 +29,40 @@ impl WindowState {
         Some(self.current_location().clone())
     }
 
+    /// Hides a freshly created Shell host while the drawn list owns the pane.
+    /// New hosts are visible the moment they are created, and a visible Shell
+    /// view paints its white background before the next navigation completes —
+    /// that is the flash seen right after a search starts.
+    pub(super) fn guard_native_view(&self) {
+        let Some(browser) = &self.browser else { return };
+        browser.set_visible(!self.session.ui.custom_view);
+        // Hiding the view uncovers the pane, and the Shell's white background is
+        // still sitting in the window surface. The repaint that would replace it
+        // is deferred while a Shell call holds the state, so the white stays on
+        // screen for as long as that call runs; put the painted pane back now.
+        self.repaint_pane_now();
+    }
+
+    /// Copies the pane of the painted surface straight to the window.
+    ///
+    /// Only the surface is needed, so this works while the state is borrowed and
+    /// no message can be dispatched. While the Shell view is visible the blit is
+    /// clipped away by `WS_CLIPCHILDREN`, so it never paints over the view.
+    pub(super) fn repaint_pane_now(&self) {
+        let (Some(surface), area) = (self.surface.as_ref(), self.layout.browser) else { return };
+        if area.is_empty() { return; }
+        let dc = unsafe { GetDC(Some(self.hwnd)) };
+        if dc.is_invalid() { return; }
+        let _ = unsafe {
+            BitBlt(dc, area.x, area.y, area.width, area.height, Some(surface.dc), area.x, area.y, SRCCOPY)
+        };
+        unsafe { ReleaseDC(Some(self.hwnd), dc); }
+        // The surface is from before this transition; ask for a real repaint so
+        // the frame that follows shows the new state, not the previous one.
+        let rect = RECT { left: area.x, top: area.y, right: area.x + area.width, bottom: area.y + area.height };
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), Some(&rect), false) };
+    }
+
     /// Loads the current folder and shows or hides the Shell view to match.
     pub(super) fn sync_file_view(&mut self) {
         // The search box names the folder it searches; a tab that moved has to
@@ -66,6 +100,9 @@ impl WindowState {
         // Every navigation builds a fresh Shell view that shows itself: keep it
         // hidden on each sync, not only when the mode changes.
         if let Some(browser) = &self.browser { browser.set_visible(!enabled); }
+        // Whatever the Shell left on the pane must be replaced before this
+        // message ends; the next paint may be deferred behind a Shell call.
+        if !enabled { self.repaint_pane_now(); }
         if !enabled { return; }
         // The table keeps the widths the user dragged, whatever folder the
         // window moves to next.

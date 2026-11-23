@@ -14,7 +14,7 @@ extern "C" {
 use windows::{
     core::{implement, w, Error, IUnknown, IUnknownImpl, Interface, Ref, Result, HRESULT},
     Win32::{
-        Foundation::{HWND, LPARAM, RECT, WPARAM, PROPERTYKEY},
+        Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM, PROPERTYKEY},
         System::{
             Com::{
                 CoCreateInstance, IServiceProvider, IServiceProvider_Impl, CLSCTX_INPROC_SERVER,
@@ -23,6 +23,7 @@ use windows::{
         },
         UI::{
             Shell::{
+                DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass,
                 ICommDlgBrowser, ICommDlgBrowser2, ICommDlgBrowser2_Impl, ICommDlgBrowser_Impl,
                 IExplorerBrowser, IExplorerBrowserEvents, IExplorerBrowserEvents_Impl, IShellView,
                 EBO_ALWAYSNAVIGATE, EBO_NOBORDER, EBO_SHOWFRAMES, EBO_NAVIGATEONCE, EBO_NOPERSISTVIEWSTATE, EBF_NODROPTARGET,
@@ -31,7 +32,8 @@ use windows::{
                 EP_Commands, EP_DetailsPane, EP_PreviewPane, EP_Ribbon,
                 EPS_DEFAULT_ON, EPS_DEFAULT_OFF, EPS_FORCE, EPS_DONTCARE,
             },
-            WindowsAndMessaging::{FindWindowExW, GetParent, PostMessageW, ShowWindow, SW_HIDE, SW_SHOW},
+            WindowsAndMessaging::{FindWindowExW, GetParent, PostMessageW, ShowWindow, SW_HIDE, SW_SHOW,
+                WM_ERASEBKGND, WM_SHOWWINDOW, WM_WINDOWPOSCHANGING, WINDOWPOS, SWP_SHOWWINDOW},
         },
     },
 };
@@ -45,6 +47,34 @@ use super::{
 };
 
 const S_FALSE: HRESULT = HRESULT(1);
+
+/// `SetWindowSubclass` id for the ExplorerBrowser host guard.
+const HOST_GUARD_ID: usize = 0x5A53_4448;
+
+/// Subclass procedure of the ExplorerBrowser host: while the drawn list owns
+/// the pane the host may not become visible or erase itself, so the Shell can
+/// never flash its white background over the painted rows.
+unsafe extern "system" fn hide_while_drawn(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM,
+    _id: usize, data: usize) -> LRESULT {
+    if data != 0 {
+        let suppressed = unsafe { &*(data as *const Cell<bool>) };
+        if suppressed.get() {
+            match message {
+                WM_SHOWWINDOW if wp.0 != 0 => {
+                    let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+                    return LRESULT(0);
+                }
+                WM_WINDOWPOSCHANGING => {
+                    let position = lp.0 as *mut WINDOWPOS;
+                    if !position.is_null() { unsafe { (*position).flags &= !SWP_SHOWWINDOW; } }
+                }
+                WM_ERASEBKGND => return LRESULT(1),
+                _ => {}
+            }
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, message, wp, lp) }
+}
 const E_NOINTERFACE: HRESULT = HRESULT(0x8000_4002u32 as i32);
 
 /// Optional Shell panes shown next to the file list.
@@ -110,6 +140,12 @@ pub struct ExplorerBrowserHost {
     results_location: Rc<RefCell<Option<ShellLocation>>>,
     search_materializing_until: Cell<Option<std::time::Instant>>,
     search_metrics:Cell<SearchMaterializationMetrics>,
+    /// True while the drawn list owns the pane: the native view must stay off
+    /// screen, even when the Shell decides to show itself mid-navigation.
+    suppressed: Rc<Cell<bool>>,
+    /// The ExplorerBrowser host window, subclassed once so the Shell cannot
+    /// re-show it behind the painted rows.
+    host_window: Cell<isize>,
 }
 
 impl ExplorerBrowserHost {
@@ -191,7 +227,10 @@ impl ExplorerBrowserHost {
             results_location,
             search_materializing_until: Cell::new(None),
             search_metrics:Cell::new(SearchMaterializationMetrics::default()),
+            suppressed: Rc::new(Cell::new(false)),
+            host_window: Cell::new(0),
         };
+        host.install_host_guard();
         Ok(host)
     }
 
@@ -591,7 +630,13 @@ impl ExplorerBrowserHost {
 }
 
 impl Drop for ExplorerBrowserHost {
-    fn drop(&mut self) { unsafe { self.destroy(); } }
+    fn drop(&mut self) {
+        let host = self.host_window.get();
+        if host != 0 {
+            let _ = unsafe { RemoveWindowSubclass(HWND(host as *mut _), Some(hide_while_drawn), HOST_GUARD_ID) };
+        }
+        unsafe { self.destroy(); }
+    }
 }
 
 impl ExplorerBrowserHost {
@@ -614,10 +659,16 @@ impl ExplorerBrowserHost {
     /// and the host keeps painting after the view is hidden. The outermost child
     /// of the owner is hidden instead.
     pub fn set_visible(&self, visible: bool) {
+        // Recorded before the Shell gets a chance to show itself: the guard
+        // below turns any such show back into a hide. Hiding is not enough on
+        // its own — the Shell leaves its white background in the owner's
+        // surface, so the owner has to put its painted pixels back; the window
+        // does that as soon as this returns.
+        self.suppressed.set(!visible);
         let command = if visible { SW_SHOW } else { SW_HIDE };
         /* The host is what has to go: the view window alone leaves the host's
            scroll bars and column header painted over the list. */
-        if let Ok(host) = unsafe { FindWindowExW(Some(HWND(self.owner as *mut _)), None, w!("ExplorerBrowserControl"), None) } {
+        if let Some(host) = self.host() {
             let _ = unsafe { ShowWindow(host, command) };
         }
         let Ok(view) = (unsafe { self.current_view() }) else { return };
@@ -630,6 +681,31 @@ impl ExplorerBrowserHost {
         }
         let _ = unsafe { ShowWindow(target, command) };
     }
+    /// The ExplorerBrowser host window, found once and guarded afterwards.
+    fn host(&self) -> Option<HWND> {
+        let stored = self.host_window.get();
+        if stored != 0 { return Some(HWND(stored as *mut _)); }
+        let Ok(host) = (unsafe { FindWindowExW(Some(HWND(self.owner as *mut _)), None, w!("ExplorerBrowserControl"), None) }) else {
+            return None;
+        };
+        self.host_window.set(host.0 as isize);
+        self.install_host_guard();
+        Some(host)
+    }
+
+    /// Keeps the Shell from painting its own view while the drawn list owns the
+    /// pane. Hiding the host once is not enough: navigation re-shows it, and a
+    /// visible Shell view paints a white rectangle over the rows for a frame or
+    /// two — the flash reported after every search.
+    fn install_host_guard(&self) {
+        let Some(host) = (unsafe { FindWindowExW(Some(HWND(self.owner as *mut _)), None, w!("ExplorerBrowserControl"), None) }).ok() else {
+            return;
+        };
+        self.host_window.set(host.0 as isize);
+        let state = Rc::as_ptr(&self.suppressed) as usize;
+        let _ = unsafe { SetWindowSubclass(host, Some(hide_while_drawn), HOST_GUARD_ID, state) };
+    }
+
     /// Display names of the selected items, in view order.
     pub fn selected_names(&self) -> Vec<String> {
         use windows::Win32::UI::Shell::{IShellItemArray, SIGDN_NORMALDISPLAY, SVGIO_SELECTION};
