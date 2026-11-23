@@ -70,11 +70,11 @@ extern "C" { fn zs_menu_shared_host(enabled:i32); }
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, ShellInvoked, NativeHandled }
+pub enum MenuOutcome { Dismissed, Application(u32), Rename, Open, Explore, Properties, ShellInvoked, NativeHandled }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct MenuInterceptions { pub rename: bool, pub open: bool }
-impl MenuInterceptions { fn bits(self) -> u32 { u32::from(self.rename) | (u32::from(self.open) << 1) } }
+pub struct MenuInterceptions { pub rename: bool, pub open: bool, pub properties: bool }
+impl MenuInterceptions { fn bits(self) -> u32 { u32::from(self.rename) | (u32::from(self.open) << 1) | (u32::from(self.properties) << 2) } }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -94,6 +94,11 @@ fn intercepted_verb(verb: Option<&str>, intercept: MenuInterceptions) -> Option<
         Some(verb) if intercept.rename && verb.eq_ignore_ascii_case("rename") => Some(MenuOutcome::Rename),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("open") => Some(MenuOutcome::Open),
         Some(verb) if intercept.open && verb.eq_ignore_ascii_case("explore") => Some(MenuOutcome::Explore),
+        // 属性 is a modeless sheet the Shell builds for the caller's thread. The
+        // isolated menu process has no window of its own to own it, so the menu
+        // returns this outcome instead of invoking: the window that drew the
+        // selection shows the sheet.
+        Some(verb) if intercept.properties && verb.eq_ignore_ascii_case("properties") => Some(MenuOutcome::Properties),
         _ => None,
     }
 }
@@ -106,6 +111,7 @@ fn decode_native_result(result: NativeMenuResult, applications: &[u32]) -> Resul
         1 if applications.contains(&result.command) => Some(MenuOutcome::Application(result.command)),
         2 => Some(MenuOutcome::Rename), 3 => Some(MenuOutcome::Open), 4 => Some(MenuOutcome::Explore),
         5 => Some(MenuOutcome::ShellInvoked), 6 => None, 7 => Some(MenuOutcome::NativeHandled),
+        8 => Some(MenuOutcome::Properties),
         _ => return Err(windows::core::Error::from_hresult(windows::core::HRESULT(0x8000ffffu32 as i32))),
     })
 }
@@ -690,8 +696,21 @@ mod policy_tests {
         assert!(decode_native_result(NativeMenuResult { kind: 5, command: 19, status: failed.0, phase: 2 }, &applications).is_err());
     }
     #[test]
+    fn properties_is_handed_back_when_the_caller_asks_for_it() {
+        // A property sheet belongs to the window that asked for it; the isolated
+        // menu process has none, so the command must come back instead of being
+        // invoked there — where it returns success and opens nothing.
+        let intercept = MenuInterceptions { properties: true, ..Default::default() };
+        assert_eq!(intercepted_verb(Some("Properties"), intercept), Some(MenuOutcome::Properties));
+        assert_eq!(intercepted_verb(Some("properties"), MenuInterceptions::default()), None);
+        assert_eq!(intercept.bits() & 4, 4, "the native side reads this bit");
+        assert_eq!(MenuInterceptions { open: true, ..Default::default() }.bits() & 4, 0);
+        let decoded = decode_native_result(NativeMenuResult { kind: 8, command: 1, status: 0, phase: 2 }, &[]);
+        assert_eq!(decoded.unwrap(), Some(MenuOutcome::Properties));
+    }
+    #[test]
     fn only_requested_open_and_rename_interceptions_defer_shell_execution() {
-        let intercept = MenuInterceptions { open: true, rename: true };
+        let intercept = MenuInterceptions { open: true, rename: true, properties: true };
         assert_eq!(intercepted_verb(Some("ReName"), intercept), Some(MenuOutcome::Rename));
         assert_eq!(intercepted_verb(Some("open"), intercept), Some(MenuOutcome::Open));
         assert_eq!(intercepted_verb(Some("explore"), intercept), Some(MenuOutcome::Explore));

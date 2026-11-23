@@ -59,7 +59,7 @@ pub(super) fn show(window:HWND,view:&IShellView,position:LPARAM)->windows::core:
     let options=menu::context_menu_options();
     let mut mode=WorkerMode::More;
     let targets=if pidls.is_empty()&&folder.is_none(){mode=WorkerMode::Background;background.clone().into_iter().collect()}else{pidls.clone()};
-    let client=Client::spawn_extended(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
+    let client=Client::spawn_extended(owner,point,targets,folder.clone(),options,MenuInterceptions{rename:true,open:true,properties:true},mode,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
     if !current(owner,generation){return Ok(());}
     ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,view:Some(view.clone()),pidls,folder,background,client,targets:Vec::new()});});
@@ -85,13 +85,34 @@ pub(super) fn show_items(window:HWND,items:Vec<(Vec<u8>,Option<ShellLocation>)>,
     let point=point(window,position);let pidls:Vec<Vec<u8>>=items.iter().map(|(pidl,_)|pidl.clone()).collect();
     let targets:Vec<Option<ShellLocation>>=items.into_iter().map(|(_,target)|target).collect();
     let client=Client::spawn_extended(owner,point,pidls.clone(),None,menu::context_menu_options(),
-        MenuInterceptions{rename:true,open:true},WorkerMode::More,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
+        MenuInterceptions{rename:true,open:true,properties:true},WorkerMode::More,unsafe{GetKeyState(VK_SHIFT.0 as i32)}<0)
         .map_err(|error|failure(&format!("无法启动系统菜单：{error:#}")))?;
     if !current(owner,generation){return Ok(());}
     ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,Session{generation,view:None,pidls,folder:None,background:None,client,targets});});
     unsafe{SetTimer(Some(owner),TIMER,50,None)};Ok(())
 }
 
+/// Shows the Shell's property sheet for a selection the drawn list owns.
+///
+/// A property sheet is a modeless window owned by the window that asked for it.
+/// The isolated menu process has no such window — its own is a zero-sized popup —
+/// so invoking 属性 there returns success and creates nothing. The menu therefore
+/// hands the command back and the sheet is built here, on the window that drew
+/// the rows, the same way Alt+Enter opens it.
+fn show_properties(owner:HWND,pidls:&[Vec<u8>],folder:Option<&PathBuf>)->bool{
+    let items=if pidls.is_empty(){
+        let Some(folder)=folder else{return false};
+        match zsdesk_windows::shell::pidl::location_pidl(&ShellLocation::Path(folder.clone())) {
+            Some(pidl)=>vec![pidl],
+            None=>{eprintln!("properties: 无法生成目录标识");return false;}
+        }
+    }else{pidls.to_vec()};
+    let result=zsdesk_windows::shell::menu::ShellMenu::for_items(owner,&items).and_then(|menu|{
+        menu.populate_for_invoke(false)?;
+        menu.invoke_verb(owner,"properties",false)
+    });
+    match result{Ok(())=>true,Err(error)=>{eprintln!("properties: {error:#}");false}}
+}
 fn open_folder(owner:HWND,pidls:&[Vec<u8>])->bool{
     if pidls.len()!=1{return false;}
     let Ok(item)=zsdesk_windows::shell::pidl::item_from_pidl(&pidls[0])else{return false;};
@@ -135,6 +156,11 @@ pub(super) fn poll(owner:HWND){
                 if let Ok(client)=Client::spawn(owner,point,session.pidls.clone(),session.folder.clone(),menu::context_menu_options(),MenuInterceptions::default(),WorkerMode::Open){
                     if current(owner,generation){session.client=client;ACTIVE.with(|active|{active.borrow_mut().insert(owner.0 as isize,session);});}
                 }
+            }
+        },
+        Some(Ok(MenuOutcome::Properties)) if valid=>{
+            if !show_properties(owner,&session.pidls,session.folder.as_ref()){
+                menu::report_failure(owner,HRESULT(0x80004005u32 as i32));
             }
         },
         Some(Ok(MenuOutcome::ShellInvoked))=>{

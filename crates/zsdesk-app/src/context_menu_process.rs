@@ -20,7 +20,7 @@ pub fn pending_workers()->usize{let mut workers=REAPERS.lock().unwrap_or_else(|e
     #[cfg(test)]fn RaiseException(code:u32,flags:u32,count:u32,arguments:*const usize);
 }
 #[derive(Clone,Copy,Debug,Serialize,Deserialize,PartialEq,Eq)]
-pub enum Mode{More,Properties,Open,Background}
+pub enum Mode{More,Open,Background}
 #[derive(Clone,Serialize,Deserialize)]
 struct Request{
     token:String,parent:u32,parent_created:u64,owner:isize,point:[i32;2],pidls:Vec<Vec<u8>>,folder:Option<PathBuf>,
@@ -253,13 +253,6 @@ fn run_worker(path:&Path)->Result<()>{
     let result=(||->Result<MenuOutcome>{
         let request=state.request.clone();zsdesk_windows::shell::menu::set_context_menu_options(request.options.clone());
         #[cfg(test)]if request.probe.as_deref()==Some("dismiss"){state.allow(false)?;return Ok(MenuOutcome::Dismissed);}
-        if request.mode==Mode::Properties{
-            state.allow(true)?;
-            let pidls=if request.pidls.is_empty(){vec![zsdesk_windows::shell::pidl::location_pidl(&zsdesk_core::model::explorer::ShellLocation::Path(request.folder.clone().context("目录缺失")?)).context("目录标识无效")?]}else{request.pidls.clone()};
-            let data=zsdesk_windows::desktop::data_object(window,&pidls)?;
-            unsafe{windows::Win32::UI::Shell::SHMultiFileProperties(&data,0)}?;
-            return Ok(MenuOutcome::ShellInvoked);
-        }
         trace("worker: before menu construction".to_string());
         let started=Instant::now();
         let background=if request.mode==Mode::Background{Some(zsdesk_windows::shell::pidl::item_from_pidl(&request.pidls[0])?)}else{None};
@@ -288,7 +281,7 @@ fn run_worker(path:&Path)->Result<()>{
         let point=POINT{x:request.point[0],y:request.point[1]};
         let outcome=if let Some(item)=&background{menu.track_background_item(window,point,item,&mut||state.allow(true))?}
             else if request.pidls.is_empty(){menu.track_folder_background(window,point,request.folder.as_deref().unwrap(),0,&mut||state.allow(true))?}
-            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open},&mut||state.allow(true))?};
+            else{menu.track_selected_before(window,point,&request.pidls,0,MenuInterceptions{rename:request.rename,open:request.open,properties:true},&mut||state.allow(true))?};
         Ok(outcome)
     })();
     // Modeless property pages/extension dialogs belong to the worker. Keep their

@@ -7,8 +7,8 @@
 #include <vector>
 
 namespace menu_dispatch {
-enum Kind : uint32_t { Dismissed=0, Application=1, Rename=2, Open=3, Explore=4, Invoked=5, Expanded=6, NativeHandled=7 };
-enum Intercept : uint32_t { InterceptRename=1, InterceptOpen=2 };
+enum Kind : uint32_t { Dismissed=0, Application=1, Rename=2, Open=3, Explore=4, Invoked=5, Expanded=6, NativeHandled=7, Properties=8 };
+enum Intercept : uint32_t { InterceptRename=1, InterceptOpen=2, InterceptProperties=4 };
 enum Phase : uint32_t { BeforePresentation=0, Presented=1, Executing=2 };
 struct Result { uint32_t kind=Dismissed,command=0;HRESULT status=S_OK;uint32_t phase=BeforePresentation; };
 static_assert(sizeof(Result)==16,"Menu result ABI");
@@ -50,6 +50,10 @@ inline Result Dispatch(IContextMenu* menu,HWND owner,UINT command,UINT first,POI
             if(!_wcsicmp(verb,L"open")){result.kind=Open;return result;}
             if(!_wcsicmp(verb,L"explore")){result.kind=Explore;return result;}
         }
+        // The property sheet is modeless and owned by the caller's window; the
+        // isolated menu process has no window to own it, so hand the command
+        // back to the window that drew the selection.
+        if((intercept&InterceptProperties)&&!_wcsicmp(verb,L"properties")){result.kind=Properties;return result;}
     }
     result.phase=Executing;
     if(before){result.status=before(beforeContext);if(FAILED(result.status))return result;}
