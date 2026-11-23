@@ -9,6 +9,29 @@ pub use zsdesk_core::model::explorer::SearchBackendPreference as BackendPreferen
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchOptions { pub backend: BackendPreference }
 
+/// Starts the managed engine before the first keystroke needs it.
+///
+/// A cold engine costs its own start-up plus the index load — measured at
+/// 0.4–1.5 s here — and every one of those milliseconds used to land between
+/// pressing a key and seeing a row. The query itself is a plain IPC round trip
+/// (about 0.1 s), so warming the engine at window start moves that cost off the
+/// search path entirely. Repeated calls are cheap and do not stack up.
+pub(crate) fn warm_up(profile: PathBuf) {
+    // Tests must never start a background indexer behind their own assertions.
+    if cfg!(test) { return; }
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    if BUSY.swap(true, Ordering::AcqRel) { return; }
+    let worker = thread::Builder::new().name("zsdesk-search-warmup".into()).spawn(move || {
+        // Any query forces `ensure_running` + `wait_ready`; the text matches
+        // nothing, so the reply carries no rows and no event is delivered.
+        let _ = everything::query_page(&profile,
+            &everything::QueryOptions { text: "ZSDesk warm-up".into(), limit: 1, ..Default::default() },
+            0x5a5347ff, &|| false);
+        BUSY.store(false, Ordering::Release);
+    });
+    if worker.is_err() { BUSY.store(false, Ordering::Release); }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all="snake_case")]
 pub enum MaintenanceRole { Pending, Writer, Reader }

@@ -709,6 +709,11 @@ impl WindowState {
                 self.show_message(format!("后台搜索启动失败：{error:#}"));
             }
             stage("quick-search");
+            // The engine's start-up and index load are the slowest part of a
+            // first search. Pay for them now, in the background, while the user
+            // is still looking at the folder instead of typing a keyword.
+            crate::fast_search::warm_up(self.config_path.clone());
+            stage("search-warmup");
         }
         stage("done");
         Ok(())

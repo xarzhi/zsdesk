@@ -91,6 +91,9 @@ impl WindowState{
         }
     }
     pub(super) unsafe fn open_integrated_search(&mut self){
+        // Focusing the box is the clearest signal a search is about to start;
+        // warm the engine again in case it was released while the window idled.
+        crate::fast_search::warm_up(self.config_path.clone());
         self.end_address_edit();
         unsafe { self.sync_search_tab_edit(); }
         if !self.search_panel.open{
