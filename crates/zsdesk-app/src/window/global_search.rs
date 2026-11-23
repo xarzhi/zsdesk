@@ -348,7 +348,7 @@ impl WindowState{
                 }
                 self.restore_fast_selection();
             }
-            self.search_progress=Some(progress_text(&event,self.fast_found));
+            self.search_progress=Some(format!("{}{}",progress_text(&event,self.fast_found),self.search_scope_note()));
             self.fast_last=Some(event.clone());
             self.record_search_progress(&event);
             self.refresh_status();self.relayout();self.position_children();self.invalidate_rect(self.layout.status);

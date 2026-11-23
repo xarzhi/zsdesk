@@ -48,6 +48,9 @@ impl SearchCategory {
 pub(super) struct SearchControls {
     pub category: SearchCategory,
     pub scope: Option<PathBuf>,
+    /// Descend into subfolders of `scope`. Off by default, so choosing a
+    /// folder means that folder, not its whole subtree.
+    pub recursive: bool,
     /// Folder to restore when this tab leaves its search results.
     pub origin: Option<ShellLocation>,
     /// The tab's native EDIT text, including an unsubmitted refinement.
@@ -62,7 +65,7 @@ pub(super) struct SearchControls {
 
 impl Default for SearchControls {
     fn default() -> Self {
-        Self { category: SearchCategory::All, scope: None, origin: None, draft: None, sort: SearchSort::NameAsc,
+        Self { category: SearchCategory::All, scope: None, recursive: false, origin: None, draft: None, sort: SearchSort::NameAsc,
             offset: 0, total: 0, shown: 0, busy: false, error: None }
     }
 }
@@ -93,6 +96,7 @@ impl WindowState {
         menus::submenu("搜索选项",vec![
             menus::submenu("文件类型",categories),
             menus::item("搜索范围…","search-scope"),
+            menus::entry("包含子文件夹","search-recursive",controls.scope.is_some(),controls.recursive),
             menus::item("结果排序…","search-order"),
             menus::entry("上一页结果","search-page-previous",!controls.busy&&controls.offset>0,false),
             menus::entry("下一页结果","search-page-next",!controls.busy&&controls.shown>0&&u64::from(controls.offset)+(controls.shown as u64)<controls.total,false),
@@ -104,6 +108,7 @@ impl WindowState {
     }
 
     pub(super) unsafe fn apply_search_option(&mut self,id:&str)->bool {
+        if id=="search-recursive"{unsafe{self.toggle_search_recursive();}return true;}
         let hit=match id {
             "search-scope"=>SearchPanelHit::Scope,"search-order"=>SearchPanelHit::Sort,
             "search-page-previous"=>SearchPanelHit::Previous,"search-page-next"=>SearchPanelHit::Next,
@@ -116,6 +121,16 @@ impl WindowState {
 
     pub(super) fn search_controls(&self) -> SearchControls {
         self.search_panel.tabs.get(&self.session.active_tab().id).cloned().unwrap_or_default()
+    }
+
+    /// Names the folder depth the status line is counting, so a small result
+    /// count is never mistaken for a broken index.
+    pub(super) fn search_scope_note(&self) -> &'static str {
+        match self.search_panel.tabs.get(&self.session.active_tab().id) {
+            Some(controls) if controls.scope.is_some() =>
+                if controls.recursive { " · 含子文件夹" } else { " · 仅当前文件夹" },
+            _ => "",
+        }
     }
 
     pub(super) fn search_controls_mut(&mut self) -> &mut SearchControls {
@@ -275,10 +290,13 @@ impl WindowState {
             menus::entry("全部磁盘", "all", true, controls.scope.is_none()),
             menus::entry("当前文件夹", "current", current.is_some(), current.is_some() && controls.scope == current),
             menus::item("选择文件夹…", "choose"),
+            menus::MenuItemSpec::Separator,
+            menus::entry("包含子文件夹", "recursive", controls.scope.is_some(), controls.recursive),
         ]);
         let choice = super::input::popup(self.hwnd, &spec, Some(self.layout.search_panel.scope));
         let scope = match choice.as_deref() {
             Some("all") => None,
+            Some("recursive") => { unsafe { self.toggle_search_recursive(); } return; },
             Some("current") => { let Some(path) = current else { return }; Some(path) },
             Some("choose") => match choose_scope(self.hwnd) {
                 Ok(Some(path)) => Some(path), Ok(None) => return,
@@ -287,6 +305,16 @@ impl WindowState {
             _ => return,
         };
         self.search_controls_mut().scope = scope;
+        unsafe { self.request_integrated_search(true); }
+    }
+
+    /// Switches between "this folder" and "this folder and everything under
+    /// it". The query itself carries the choice, so a new page or a refresh
+    /// keeps it without touching the Engine's index scope.
+    pub(super) unsafe fn toggle_search_recursive(&mut self) {
+        let recursive = !self.search_controls().recursive;
+        self.search_controls_mut().recursive = recursive;
+        self.show_message(if recursive { "搜索范围：包含子文件夹".into() } else { "搜索范围：仅当前文件夹".into() });
         unsafe { self.request_integrated_search(true); }
     }
 

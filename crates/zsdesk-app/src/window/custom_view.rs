@@ -187,7 +187,8 @@ impl WindowState {
             // The text was built when the batch was queued, before the rows
             // existed; without this the line keeps saying "当前页 0 项".
             if let Some(event) = self.fast_last.clone() {
-                self.search_progress = Some(super::global_search::progress_text(&event, self.fast_found));
+                self.search_progress = Some(format!("{}{}", super::global_search::progress_text(&event, self.fast_found),
+                    self.search_scope_note()));
             }
             if !self.search_controls().busy {
                 self.file_view.set_empty_message(Some("没有匹配的项目".into()));

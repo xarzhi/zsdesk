@@ -19,11 +19,18 @@ pub(super) struct SubmittedSearch{
 }
 
 /// Group user syntax so OR expressions cannot escape a chosen folder/category.
+///
+/// A folder scope is the folder itself unless the user asked for its subtree:
+/// `parent:` matches direct children only, while a trailing backslash matches
+/// everything below the path. Both are path filters, so the Engine's index
+/// scope is never modified.
 fn expression(raw:&str,controls:&SearchControls)->String{
     let mut terms=Vec::new();
     if let Some(scope)=&controls.scope{
         let path=scope.to_string_lossy().replace('/',"\\");
-        terms.push(format!("\"{}\\\"",path.trim_end_matches('\\')));
+        let path=path.trim_end_matches('\\');
+        if controls.recursive { terms.push(format!("\"{path}\\\"")); }
+        else { terms.push(format!("parent:\"{path}\"")); }
     }
     let category=controls.category.query_prefix();
     if !category.is_empty(){terms.push(category.to_owned());}
@@ -210,8 +217,17 @@ impl WindowState{
     #[test]fn scope_keeps_sibling_paths_and_or_terms_out(){
         let controls=SearchControls{scope:Some(PathBuf::from(r"E:\中文 目录")),category:SearchCategory::Documents,..Default::default()};
         let query=expression("alpha | beta",&controls);
-        assert!(query.starts_with("\"E:\\中文 目录\\\" ext:doc;"));
+        assert!(query.starts_with("parent:\"E:\\中文 目录\" ext:doc;"),"{query}");
         assert!(query.ends_with("<alpha | beta>"));
+    }
+    #[test]fn a_folder_scope_is_the_folder_itself_unless_subfolders_are_asked_for(){
+        let folder=Some(PathBuf::from(r"E:\资料"));
+        let direct=expression("图纸",&SearchControls{scope:folder.clone(),..Default::default()});
+        assert_eq!(direct,r#"parent:"E:\资料" <图纸>"#);
+        let deeper=expression("图纸",&SearchControls{scope:folder,recursive:true,..Default::default()});
+        assert_eq!(deeper,r#""E:\资料\" <图纸>"#);
+        // Without a scope there is nothing to be recursive about.
+        assert_eq!(expression("图纸",&SearchControls{recursive:true,..Default::default()}),"<图纸>");
     }
     #[test]fn categories_work_without_a_keyword(){
         let controls=SearchControls{category:SearchCategory::Folders,..Default::default()};
