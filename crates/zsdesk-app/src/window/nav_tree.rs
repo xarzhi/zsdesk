@@ -45,6 +45,9 @@ pub(super) struct NavRow {
     /// quick-access group keeps its own item, so its menu is the one Explorer
     /// shows there (取消固定 instead of 固定).
     pub pidl: Option<Vec<u8>>,
+    /// A row of the pinned quick-access group. Only those can be reordered by
+    /// dragging: the other groups are fixed by the Shell.
+    pub pinned: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +70,11 @@ pub(super) struct NavTree {
     /// Identity of the quick-access group the rows were built from, so a
     /// refresh can skip rebuilding the pane when nothing was pinned.
     signature: Vec<String>,
+    /// The order the user dragged the pinned rows into, by address. Empty means
+    /// "whatever the Shell hands over", which is Explorer's own order.
+    pinned_order: Vec<String>,
+    /// Insertion line shown while a pinned row is dragged: `(row, below)`.
+    drop_line: Option<(usize, bool)>,
 }
 
 impl NavTree {
@@ -95,9 +103,127 @@ impl NavTree {
                 has_children: true,
                 expanded: false,
                 pidl: row.pidl,
+                pinned: false,
             })
             .collect();
+        // The roots are laid out as [主文件夹, 图库] | [pinned …] | [此电脑, 网络]:
+        // the rows between the two rules are the quick-access group, and they
+        // are the only ones a drag may reorder.
+        if let Some((start, end)) = self.pin_range() {
+            for row in &mut self.rows[start..end] { row.pinned = true; }
+        }
+        self.apply_pinned_order();
     }
+
+    /// First and one-past-last pinned row, delimited by the two group rules.
+    fn pin_range(&self) -> Option<(usize, usize)> {
+        let first = self.rows.iter().position(|row| row.separator)?;
+        let second = self.rows[first + 1..].iter().position(|row| row.separator).map(|at| at + first + 1)?;
+        (second > first + 1).then_some((first + 1, second))
+    }
+
+    /// Reorders the pinned group to the stored order. Rows the order does not
+    /// name keep their Shell position after the named ones, so a pin made in
+    /// Explorer still shows up at the end instead of disappearing.
+    fn apply_pinned_order(&mut self) {
+        if self.pinned_order.is_empty() { return; }
+        let Some((start, end)) = self.pin_range() else { return };
+        let mut blocks = self.group_blocks(start, end);
+        blocks.sort_by_key(|(address, _)| {
+            self.pinned_order.iter().position(|ordered| ordered.eq_ignore_ascii_case(address))
+                .unwrap_or(self.pinned_order.len())
+        });
+        let flattened: Vec<NavRow> = blocks.into_iter().flat_map(|(_, rows)| rows).collect();
+        self.rows.splice(start..end, flattened);
+    }
+
+    /// The pinned rows split into one block per root, children included.
+    fn group_blocks(&self, start: usize, end: usize) -> Vec<(String, Vec<NavRow>)> {
+        let mut blocks: Vec<(String, Vec<NavRow>)> = Vec::new();
+        let mut index = start;
+        while index < end {
+            let root = &self.rows[index];
+            let address = root.location.as_ref().map(ShellLocation::address).unwrap_or_default();
+            let mut block = vec![self.rows[index].clone()];
+            index += 1;
+            while index < end && self.rows[index].depth > 0 {
+                block.push(self.rows[index].clone());
+                index += 1;
+            }
+            blocks.push((address, block));
+        }
+        blocks
+    }
+
+    /// Stores the order the pinned rows must keep. Applied at once so the pane
+    /// follows a reload without waiting for the next window.
+    pub(super) fn set_pinned_order(&mut self, order: &[String]) {
+        if self.pinned_order == order { return; }
+        self.pinned_order = order.to_vec();
+        if self.loaded { self.apply_pinned_order(); }
+    }
+
+    /// Addresses of the pinned roots, in the order they are drawn.
+    pub(super) fn pinned_addresses(&self) -> Vec<String> {
+        let Some((start, end)) = self.pin_range() else { return Vec::new() };
+        self.rows[start..end].iter()
+            .filter(|row| row.depth == 0 && !row.separator)
+            .filter_map(|row| row.location.as_ref().map(ShellLocation::address))
+            .collect()
+    }
+
+    /// True when the row is a pinned root a drag may move.
+    pub(super) fn is_pinned_root(&self, index: usize) -> bool {
+        self.rows.get(index).is_some_and(|row| row.pinned && row.depth == 0 && !row.separator)
+    }
+
+    /// The pinned root a row belongs to, so a drop on an expanded child still
+    /// lands on its folder's block.
+    pub(super) fn pinned_root_of(&self, index: usize) -> Option<usize> {
+        let (start, end) = self.pin_range()?;
+        if index < start || index >= end { return None; }
+        let mut root = index;
+        while root > start && self.rows[root].depth > 0 { root -= 1; }
+        self.is_pinned_root(root).then_some(root)
+    }
+
+    /// Moves the block of pinned rows starting at `from` so that it sits before
+    /// `before` (one-past-the-end of the group means "at the end").
+    /// Returns whether the pane changed.
+    pub(super) fn move_pinned(&mut self, from: usize, before: usize) -> bool {
+        let Some((start, end)) = self.pin_range() else { return false };
+        let Some(from) = self.pinned_root_of(from) else { return false };
+        let before = match self.pinned_root_of(before) {
+            Some(root) => root,
+            // Dropping past the last root appends to the group.
+            None if before >= end => end,
+            None => return false,
+        };
+        if before == from { return false; }
+        let mut length = 1;
+        while from + length < end && self.rows[from + length].depth > 0 { length += 1; }
+        // Dropping inside the dragged block itself is not a move.
+        if before > from && before < from + length { return false; }
+        // The selected folder follows its row instead of keeping an index that
+        // now names whatever landed there.
+        let selected = self.selection.and_then(|at| self.rows.get(at)).and_then(|row| row.location.clone());
+        let block: Vec<NavRow> = self.rows.drain(from..from + length).collect();
+        let insert_at = if before >= from + length { before - length } else { before };
+        let insert_at = insert_at.clamp(start, self.rows.len());
+        self.rows.splice(insert_at..insert_at, block);
+        self.selection = selected.as_ref().and_then(|location| self.locate(location));
+        self.hover = None;
+        true
+    }
+
+    /// Insertion line under the pointer while a pinned row is dragged.
+    pub(super) fn set_drop_line(&mut self, line: Option<(usize, bool)>) -> bool {
+        if self.drop_line == line { return false; }
+        self.drop_line = line;
+        true
+    }
+
+    pub(super) fn drop_line(&self) -> Option<(usize, bool)> { self.drop_line }
 
     /// Re-reads the pinned quick-access folders from the Shell.
     ///
@@ -185,6 +311,12 @@ impl NavTree {
     pub(super) fn set_hover(&mut self, index: Option<usize>) { self.hover = index; }
     pub(super) fn hover(&self) -> Option<usize> { self.hover }
 
+    /// Top edge of a row in client pixels, for hit details the row index alone
+    /// cannot answer (which half of the row the pointer is on).
+    pub(super) fn row_top(&self, rect: RectF, index: usize) -> f32 {
+        rect.y + index as f32 * self.row_height() - self.scroll
+    }
+
     /// Where the label of one row starts, so the rename editor can sit on it.
     pub(super) fn label_rect(&self, rect: RectF, index: usize) -> Option<RectF> {
         let row = self.rows.get(index)?;
@@ -257,6 +389,7 @@ impl NavTree {
                 expanded: false,
                 separator: false,
                 pidl: None,
+                pinned: false,
             });
             at += 1;
         }
@@ -409,6 +542,15 @@ impl NavTree {
                     &TextStyle::ui(s(12.5)).align(Align::Start), text);
             }
         }
+        // The insertion line is where the dragged folder will land, so a drop
+        // reads before it happens instead of only afterwards.
+        if let Some((index, below)) = self.drop_line {
+            let y = rect.y + index as f32 * row_h - self.scroll + if below { row_h } else { 0.0 };
+            if y >= rect.y - 1.0 && y <= rect.bottom() + 1.0 {
+                cv.line(rect.x + s(8.0), y, rect.right() - s(10.0), y,
+                    Color::rgba8(palette.accent.r, palette.accent.g, palette.accent.b, 0xFF), s(2.0));
+            }
+        }
         cv.pop_clip();
         // A hairline thumb tells the reader there is more below; the wheel and
         // the arrow keys do the scrolling. A neutral grey keeps it readable on
@@ -444,11 +586,18 @@ mod tests {
     use super::*;
 
     fn row(name: &str, depth: u8) -> NavRow {
-        NavRow { name: name.into(), location: Some(ShellLocation::Path(PathBuf::from(name))), icon: 0, depth, has_children: true, expanded: false, separator: false, pidl: None }
+        NavRow { name: name.into(), location: Some(ShellLocation::Path(PathBuf::from(name))), icon: 0, depth, has_children: true, expanded: false, separator: false, pidl: None, pinned: false }
     }
 
     fn rule() -> NavRow {
-        NavRow { name: String::new(), location: None, icon: 0, depth: 0, has_children: false, expanded: false, separator: true, pidl: None }
+        NavRow { name: String::new(), location: None, icon: 0, depth: 0, has_children: false, expanded: false, separator: true, pidl: None, pinned: false }
+    }
+
+    /// The pane as the Shell hands it over: [home] | [alpha, beta, gamma] | [pc].
+    fn grouped() -> NavTree {
+        let mut rows = vec![row("home", 0), rule(), row("alpha", 0), row("beta", 0), row("gamma", 0), rule(), row("pc", 0)];
+        for row in &mut rows[2..5] { row.pinned = true; }
+        NavTree { rows, dpi: 96, loaded: true, ..Default::default() }
     }
 
     #[test]
@@ -533,5 +682,49 @@ mod tests {
         assert!(tree.rows[0].expanded, "a branch that was open must open again");
         assert!(!tree.rows[2].expanded, "a branch that was closed must stay closed");
         assert_eq!(tree.hover, None, "a stale hover index would point at another row");
+    }
+
+    /// Dragging a pinned folder moves its block — the branch it has open
+    /// included — and keeps the selection on the folder, not on the index.
+    #[test]
+    fn a_pinned_row_drags_its_block_and_the_selection_follows_it() {
+        let mut tree = grouped();
+        // alpha unfolded: its child sits right below it and must travel with it.
+        tree.rows[2].expanded = true;
+        tree.rows.insert(3, row("alpha-child", 1));
+        tree.selection = Some(5); // gamma, after alpha's child
+        let before = tree.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+        assert!(tree.move_pinned(5, 2), "gamma moves above alpha");
+        let after = tree.rows.iter().map(|row| row.name.clone()).collect::<Vec<_>>();
+        assert_ne!(before, after);
+        // gamma did not drag alpha's branch with it.
+        let position = |name: &str| tree.rows.iter().position(|row| row.name == name).unwrap();
+        assert!(position("gamma") < position("alpha"));
+        assert_eq!(position("alpha-child"), position("alpha") + 1, "the branch stays under its folder");
+        assert_eq!(tree.selected_location().and_then(|location| location.as_path().map(|path| path.to_string_lossy().into_owned())),
+            Some("gamma".to_string()), "the selection must follow the folder it names");
+        assert_eq!(tree.pinned_addresses().first().map(String::as_str), Some("gamma"));
+    }
+
+    /// A stored order is what the pane opens with; rows it does not name stay
+    /// behind the named ones instead of disappearing.
+    #[test]
+    fn a_stored_order_reorders_only_the_named_pinned_rows() {
+        let mut tree = grouped();
+        tree.set_pinned_order(&["gamma".into(), "beta".into()]);
+        let names: Vec<&str> = tree.rows[2..5].iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["gamma", "beta", "alpha"]);
+        // The other groups never move.
+        assert_eq!(tree.rows[0].name, "home");
+        assert_eq!(tree.rows[tree.rows.len() - 1].name, "pc");
+    }
+
+    #[test]
+    fn only_quick_access_rows_are_draggable() {
+        let tree = grouped();
+        assert!(tree.is_pinned_root(2));
+        assert!(!tree.is_pinned_root(0), "主文件夹 is not a pinned row");
+        assert!(!tree.is_pinned_root(6), "此电脑 is not a pinned row");
+        assert_eq!(tree.pinned_root_of(3), Some(3));
     }
 }

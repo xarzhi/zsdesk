@@ -94,6 +94,9 @@ impl WindowState {
         if custom_tree {
             let tree = self.tree_rect();
             self.nav_tree.set_viewport(tree.w.max(0.0) as i32, tree.h.max(0.0) as i32, self.dpi);
+            // The order the user dragged the pinned rows into survives a reload
+            // (and a restart) instead of snapping back to the Shell's order.
+            self.nav_tree.set_pinned_order(&self.session.ui.quick_access_order);
             let location = self.current_location().clone();
             self.nav_tree.reveal(&location);
         }
@@ -109,7 +112,10 @@ impl WindowState {
         self.file_view.set_column_widths(self.session.ui.details_columns);
         self.file_view.set_viewport(self.view_rect(), self.dpi);
         self.start_file_list();
-        self.mirror_selection(&[]);
+        // A pending "在文件夹中显示" request owns the selection until it lands:
+        // clearing the Shell here would make the browser that asked verify an
+        // empty selection and send the request again.
+        if self.reveal.is_none() { self.mirror_selection(&[]); }
     }
 
     /// Starts a background listing of the folder on screen. The pane shows
@@ -233,8 +239,11 @@ impl WindowState {
         }
         if !applied { return; }
         self.file_view.set_viewport(self.view_rect(), self.dpi);
-        let names = self.file_view.file_names();
-        self.mirror_selection(&names);
+        // Rows landed while a reveal was waiting for them: the request can now
+        // be answered instead of sitting on its timer for another interval. It
+        // also owns the Shell selection until then, so the mirror waits.
+        if self.reveal.is_some() { self.poll_reveal(); }
+        else { let names = self.file_view.file_names(); self.mirror_selection(&names); }
         self.refresh_status();
         self.invalidate_rect(self.layout.browser);
         self.invalidate_rect(self.layout.status);
@@ -265,6 +274,84 @@ impl WindowState {
     pub(super) fn tree_hit(&self, p: POINT) -> nav_tree::NavHit {
         if !self.custom_tree() { return nav_tree::NavHit::Empty; }
         self.nav_tree.hit(p.x as f32, p.y as f32, self.tree_rect())
+    }
+
+    /// Press on a pinned quick-access row: remembers the spot so the pointer
+    /// leaving it turns the press into a reorder. The row is selected but not
+    /// opened yet — navigating now would rebuild the pane (and its row indices)
+    /// under the drag. A release without movement still opens it, in
+    /// `finish_tree_drag`.
+    pub(super) fn tree_press(&mut self, p: POINT, index: usize) {
+        self.tree_press = Some((p, index));
+        self.tree_drag = None;
+        self.tree_focus = true;
+        if self.nav_tree.selection != Some(index) {
+            self.nav_tree.selection = Some(index);
+            self.invalidate_rect(self.layout.tree);
+        }
+    }
+
+    /// Pointer moved while a pinned row is held. Returns whether the drag owns
+    /// the pointer now (the caller then skips hover and other hit tests).
+    pub(super) fn tree_drag_move(&mut self, p: POINT) -> bool {
+        let Some((start, index)) = self.tree_press else { return false };
+        let width = unsafe { GetSystemMetricsForDpi(SM_CXDRAG, self.dpi) }.max(2);
+        let height = unsafe { GetSystemMetricsForDpi(SM_CYDRAG, self.dpi) }.max(2);
+        if self.tree_drag.is_none()
+            && (p.x - start.x).abs() < width && (p.y - start.y).abs() < height {
+            return false;
+        }
+        self.tree_drag.get_or_insert(index);
+        let rect = self.tree_rect();
+        if !rect.contains(p.x as f32, p.y as f32) {
+            // Outside the pane there is no insertion point, and releasing
+            // cancels instead of landing somewhere the pointer never showed.
+            if self.nav_tree.set_drop_line(None) { self.invalidate_rect(self.layout.tree); }
+            return true;
+        }
+        let row = match self.tree_hit(p) {
+            nav_tree::NavHit::Row(row) | nav_tree::NavHit::Chevron(row) => row,
+            nav_tree::NavHit::Empty => {
+                if self.nav_tree.set_drop_line(None) { self.invalidate_rect(self.layout.tree); }
+                return true;
+            }
+        };
+        // Lower half of a row inserts after it, upper half before it, so the
+        // line appears exactly where the folder will land.
+        let row_h = self.nav_tree.row_height();
+        let below = p.y as f32 > self.nav_tree.row_top(rect, row) + row_h / 2.0;
+        if self.nav_tree.set_drop_line(Some((row, below))) {
+            self.invalidate_rect(self.layout.tree);
+        }
+        true
+    }
+
+    /// Ends a press on the navigation pane: a drag reorders the pinned group, a
+    /// press that never moved is a plain click and opens the folder.
+    /// Returns whether the press belonged to the tree.
+    pub(super) fn finish_tree_drag(&mut self, p: POINT) -> bool {
+        let Some((_, index)) = self.tree_press.take() else { return false };
+        let dragged = self.tree_drag.take();
+        let line = self.nav_tree.drop_line();
+        self.nav_tree.set_drop_line(None);
+        match dragged {
+            Some(from) => {
+                if let Some((row, below)) = line {
+                    let before = if below { row + 1 } else { row };
+                    if self.nav_tree.move_pinned(from, before) {
+                        self.session.ui.quick_access_order = self.nav_tree.pinned_addresses();
+                        self.save();
+                    }
+                }
+                self.invalidate_rect(self.layout.tree);
+            }
+            // No movement: this was the click the press deferred.
+            None => {
+                let _ = index;
+                self.tree_click(p);
+            }
+        }
+        true
     }
 
     /// Click on a tree row: expanders toggle, labels navigate.

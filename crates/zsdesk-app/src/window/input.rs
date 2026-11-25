@@ -202,6 +202,17 @@ impl WindowState {
             self.tracking_mouse = unsafe { TrackMouseEvent(&mut track) }.is_ok();
         }
         if self.drag_edit_selection(p) { return; }
+        // A held pinned row turns into a reorder once the pointer leaves the
+        // press point, the same threshold the file list uses for its drag.
+        if self.tree_press.is_some() {
+            if unsafe { GetKeyState(VK_LBUTTON.0 as i32) } < 0 {
+                if self.tree_drag_move(p) { return; }
+            } else {
+                self.tree_press = None;
+                self.tree_drag = None;
+                self.nav_tree.set_drop_line(None);
+            }
+        }
         // A held row press turns into a Shell drag once the pointer moves far
         // enough: the drawn list has no Shell view behind it to start one.
         if self.view_press.is_some() {
@@ -279,6 +290,15 @@ impl WindowState {
         }
         if self.custom_tree() && self.tree_rect().contains(p.x as f32, p.y as f32) {
             self.end_address_edit();
+            // A pinned quick-access row starts a reorder instead of opening on
+            // the press; every other row keeps navigating immediately.
+            if let nav_tree::NavHit::Row(index) = self.tree_hit(p) {
+                if self.nav_tree.is_pinned_root(index) {
+                    let _ = unsafe { SetCapture(self.hwnd) };
+                    self.tree_press(p, index);
+                    return;
+                }
+            }
             self.tree_click(p);
             return;
         }
@@ -315,6 +335,12 @@ impl WindowState {
         // candidate for a drag here.
         self.view_press = None;
         let had_capture = unsafe { GetCapture() } == self.hwnd;
+        // The navigation pane's press is answered before any other release
+        // path: it either reorders the pinned group or opens the row.
+        if self.finish_tree_drag(p) {
+            if had_capture { let _ = unsafe { ReleaseCapture() }; }
+            return;
+        }
         if self.end_edit_drag() {
             if had_capture { let _ = unsafe { ReleaseCapture() }; }
             return;

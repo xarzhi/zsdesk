@@ -414,6 +414,9 @@ pub struct ExplorerUi {
     /// Branches the navigation tree had open, so the next window opens with the
     /// same folders unfolded instead of collapsing to the roots.
     pub tree_expanded: Vec<ShellLocation>,
+    /// Order the user dragged the pinned quick-access rows into, by address.
+    /// Empty means "the order the Shell reports", which is Explorer's own.
+    pub quick_access_order: Vec<String>,
     /// Opens the file manager when the user signs in. The login entry is
     /// reconciled with this switch on every launch.
     pub autostart: bool,
@@ -436,6 +439,7 @@ impl Default for ExplorerUi {
             forward_unhandled_windows: true,
             recycle_bin_takeover: true,
             navigation_auto_expand: None, open_mode: OpenMode::default(), tree_expanded: Vec::new(),
+            quick_access_order: Vec::new(),
             autostart: true,
             appearance: AppearancePreferences::default(),
             custom_view: true,

@@ -503,6 +503,11 @@ struct WindowState {
     /// leaves that spot the press turns into a Shell drag of the selection
     /// instead of a click, which is how Explorer's own list behaves.
     view_press: Option<(POINT, usize)>,
+    /// The pinned navigation row a left press landed on, and where. Moving away
+    /// from that spot reorders the quick-access group instead of navigating.
+    tree_press: Option<(POINT, usize)>,
+    /// Pinned row being dragged: the root of the block that follows the pointer.
+    tree_drag: Option<usize>,
     /// EDIT whose selection is being dragged out with the pointer.
     edit_drag: Option<isize>,
     /// Horizontal scroll per self-drawn text field, keyed by window handle.
@@ -611,6 +616,7 @@ impl WindowState {
             file_view: file_view::FileView::default(), custom_view: false, search_paths: Vec::new(), search_seen: Default::default(),
             search_queue: Vec::new(), search_listing: false, search_token: 0,
             view_rename: HWND::default(), view_rename_index: None, tree_rename_index: None, last_click: None, view_press: None,
+            tree_press: None, tree_drag: None,
             edit_drag: None, edit_scroll: HashMap::new(), caret_on: true, caret_timer: false, search_cue: String::new(), search_area: LayoutRect::default(), address_area: LayoutRect::default(), view_rename_area: LayoutRect::default(), rename_area: LayoutRect::default(),
             nav_tree: nav_tree::NavTree::default(), tree_focus: false,
             active: true, silent: false, layout: ChromeLayout::default(),

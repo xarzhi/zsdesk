@@ -107,6 +107,9 @@ impl WindowState{
             "pid":std::process::id(),"hwnd":self.hwnd.0 as usize,"version":env!("CARGO_PKG_VERSION"),"location":self.current_location(),
             "native_view":self.browser.as_ref().and_then(|b|b.view_mode()),"fullscreen":self.fullscreen_restore.is_some(),
             "navigation_pending":self.pending.is_some(),"items":status.items,"selected":status.selected,
+            // The drawn list keeps its own selection: the Shell view behind it
+            // is hidden, so its numbers are not what the user sees highlighted.
+            "view_rows":self.file_view.items.len(),"view_selection":self.file_view.file_names(),
             "item_paths":paths,"selected_paths":selected,"fast_generation":self.fast_generation,"fast_found":self.fast_found,
             "search_maintenance_role":self.fast_search.as_ref().map(|engine|engine.maintenance_role()),
             "search_progress":self.search_progress,"message":self.status,"icon_cache_items":self.icons.len(),

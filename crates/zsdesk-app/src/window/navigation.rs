@@ -57,8 +57,38 @@ impl WindowState {
             if std::time::Instant::now()<pending.deadline {self.reveal=Some(pending);unsafe {SetTimer(Some(self.hwnd),TIMER_REVEAL,REVEAL_INTERVAL_MS,None)};}
             return;
         }
-        let confirmed=self.browser.as_ref().is_some_and(|browser|browser.reveal_children(&pending.names).unwrap_or(false));
-        if confirmed {let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};return;}
+        // The drawn list is what the user sees, and the Shell view behind it is
+        // hidden: selecting in the Shell would move no highlight on screen and
+        // leave whatever the previous navigation had selected looking like the
+        // answer. The rows own the selection in this mode, so the request is
+        // applied there instead, once the listing holds the item.
+        if self.custom_view {
+            let names: Vec<String> = pending.names.iter()
+                .map(|name| name.to_string_lossy().into_owned()).collect();
+            if self.file_view.select_names(&names) {
+                // The Shell still has to agree: the browser that asked for this
+                // reveal verifies the selection through it before it stops
+                // re-sending the request.
+                self.mirror_selection(&names);
+                self.file_view.reveal_focus(self.dpi);
+                self.invalidate_rect(self.layout.browser);
+                self.refresh_status();
+                let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};
+                return;
+            }
+            // The rows on screen are older than the request whenever the item
+            // was created after this folder was listed — a download that just
+            // finished is the usual case, and then "show in folder" has nothing
+            // to highlight. Re-read the folder once instead of giving up; the
+            // listing calls back into this poll as soon as its rows arrive.
+            if pending.tries==0 && pending.folder.as_ref().is_some_and(|folder|
+                pending.names.iter().all(|name|folder.join(name).exists())) {
+                self.reload_file_view();
+            }
+        } else {
+            let confirmed=self.browser.as_ref().is_some_and(|browser|browser.reveal_children(&pending.names).unwrap_or(false));
+            if confirmed {let _=unsafe {KillTimer(Some(self.hwnd),TIMER_REVEAL)};return;}
+        }
         pending.tries=pending.tries.saturating_add(1);
         if pending.tries<REVEAL_TRIES&&std::time::Instant::now()<pending.deadline {
             self.reveal=Some(pending);unsafe {SetTimer(Some(self.hwnd),TIMER_REVEAL,REVEAL_INTERVAL_MS,None)};

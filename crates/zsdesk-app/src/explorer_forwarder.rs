@@ -20,7 +20,12 @@ pub fn owns_integration(profile:&Path)->bool{
 struct Apartment;
 impl Drop for Apartment{fn drop(&mut self){unsafe{CoUninitialize();}}}
 #[derive(Clone)]
-struct Snapshot{window:HWND,pid:u32,folder:PathBuf,selected:Vec<PathBuf>,browser:IWebBrowser2,this_pc:bool,recycle:bool}
+struct Snapshot{window:HWND,pid:u32,folder:PathBuf,selected:Vec<PathBuf>,browser:IWebBrowser2,this_pc:bool,recycle:bool,
+    /// Explorer is still navigating in this window. A `/select` launch first
+    /// shows the shell's start location — which comes with its own default
+    /// selection — and only then navigates to the requested folder, so that
+    /// state must never be mistaken for the answer.
+    busy:bool}
 impl Snapshot{
     /// Navigation roots that are forwarded as a whole location instead of a
     /// file-system folder.
@@ -45,9 +50,12 @@ impl Snapshot{
         if !(0..=128).contains(&count){return None;}
         let mut selected=Vec::with_capacity(count as usize);
         for i in 0..count{selected.push(PathBuf::from(unsafe{items.Item(&VARIANT::from(i)).ok()?.Path().ok()?}.to_string()));}
-        Some(Self{window:self.window,pid:self.pid,folder,selected,browser:self.browser.clone(),this_pc:self.this_pc,recycle:self.recycle})
+        Some(Self{window:self.window,pid:self.pid,folder,selected,browser:self.browser.clone(),this_pc:self.this_pc,recycle:self.recycle,
+            busy:busy(&self.browser)})
     }
 }
+/// Whether the window still has a navigation in flight.
+fn busy(browser:&IWebBrowser2)->bool{unsafe{browser.Busy()}.map(|value|value.as_bool()).unwrap_or(false)}
 fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{
     let mut result=Vec::new();let mut counts=HashMap::new();
     for index in 0..unsafe{shell.Count()?}.clamp(0,128){
@@ -70,7 +78,7 @@ fn windows(shell:&IShellWindows)->Result<Vec<Snapshot>>{
             for i in 0..count{selected.push(PathBuf::from(unsafe{items.Item(&VARIANT::from(i))?.Path()?}.to_string()));}
             let this_pc=folder.to_string_lossy().eq_ignore_ascii_case("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}");
             let recycle=folder.to_string_lossy().eq_ignore_ascii_case(zsdesk_core::model::explorer::RECYCLE_BIN_ADDRESS);
-            Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc,recycle})
+            Ok(Snapshot{window,pid,folder,selected,browser:browser.clone(),this_pc,recycle,busy:busy(&browser)})
         })();
         // A window mid-navigation may pair a start folder with unrelated
         // selected items. Keep it and let the forwarding loop wait until it
@@ -98,12 +106,26 @@ fn profile_windows(profile:&Path)->Vec<HWND>{
     }windows
 }
 fn find_target(profile:&Path)->Option<HWND>{profile_windows(profile).into_iter().next()}
+/// Appends one line of evidence to `forwarding.log`: which window state a
+/// takeover was based on and which selection followed it. When a caller's
+/// "show this item" request lands in the wrong place, this is what shows what
+/// Windows actually reported. The file is discarded once it grows past 128 KiB.
+fn log(profile:&Path,value:serde_json::Value){
+    let path=profile.with_file_name("forwarding.log");
+    if std::fs::metadata(&path).is_ok_and(|meta|meta.len()>128*1024){let _=std::fs::remove_file(&path);}
+    let line=format!("{}\n",serde_json::to_string(&value).unwrap_or_default());
+    if let Ok(mut file)=std::fs::OpenOptions::new().create(true).append(true).open(&path){
+        use std::io::Write;let _=file.write_all(line.as_bytes());
+    }
+}
 fn send(window:HWND,tag:usize,packet:&[u8])->bool{
     let data=COPYDATASTRUCT{dwData:tag,cbData:packet.len()as u32,lpData:packet.as_ptr()as*mut _};let mut response=0;
     unsafe{SendMessageTimeoutW(window,WM_COPYDATA,WPARAM(0),LPARAM(&data as*const _ as isize),SMTO_ABORTIFHUNG,500,Some(&mut response))}.0!=0&&response==1
 }
 fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
     use zsdesk_core::model::explorer::ShellLocation;
+    log(profile,serde_json::json!({"event":"forward","window":snapshot.window.0 as isize,"pid":snapshot.pid,"busy":snapshot.busy,
+        "folder":snapshot.folder,"selected":snapshot.selected,"this_pc":snapshot.this_pc,"recycle":snapshot.recycle}));
     let packet=if snapshot.this_pc{serde_json::to_vec(&(Some(ShellLocation::ThisPc),None::<String>))?}
         else if snapshot.recycle{serde_json::to_vec(&(Some(ShellLocation::recycle_bin()),None::<String>))?}
         else{crate::reveal::encode(&snapshot.folder,&snapshot.selected).context("文件位置请求超出支持范围")?};
@@ -138,16 +160,25 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
         if let Some(confirmed)=profile_windows(profile).into_iter().find(|window|send(*window,verify,confirmation)){break confirmed;}
         ensure!(Instant::now()<deadline,"导航或选中状态未确认，保留系统窗口");thread::sleep(Duration::from_millis(15));
     };
-    // Explorer can apply the requested selection a moment after the window is
-    // created. The folder is already open, so wait briefly and forward the
-    // selection as a follow-up; otherwise a late `/select` would be lost when
-    // the system window closes and the item would never be highlighted.
+    // The window exists before the requested selection does. A `/select` launch
+    // navigates and then selects, and a caller of `SHOpenFolderAndSelectItems`
+    // lets the shell select into the window it just asked for, which arrives a
+    // moment later still. The folder is forwarded first so it opens at once and
+    // the selection follows as a second request — the system window is closed
+    // right after this, so a selection that shows up later would otherwise be
+    // lost and the item would never be highlighted. This window is invisible
+    // the whole time, so waiting for the selection costs the user nothing.
     if !snapshot.special()&&snapshot.selected.is_empty(){
-        for _ in 0..5{
+        let deadline=Instant::now()+FOLLOW_UP_WAIT;
+        while Instant::now()<deadline{
             thread::sleep(Duration::from_millis(40));
             let Some(current)=snapshot.refresh()else{break;};
-            if current.selected.is_empty()||!current.consistent(){continue;}
-            if let Some(follow_up)=crate::reveal::encode(&current.folder,&current.selected){let _=send(target,crate::reveal::COPYDATA_TAG,&follow_up);}
+            if current.busy||current.selected.is_empty()||!current.consistent(){continue;}
+            if let Some(follow_up)=crate::reveal::encode(&current.folder,&current.selected){
+                log(profile,serde_json::json!({"event":"follow_up","window":snapshot.window.0 as isize,"pid":snapshot.pid,
+                    "folder":current.folder,"selected":current.selected}));
+                let _=send(target,crate::reveal::COPYDATA_TAG,&follow_up);
+            }
             break;
         }
     }
@@ -167,7 +198,43 @@ fn forward(profile:&Path,executable:&Path,snapshot:&Snapshot)->Result<()>{
     ensure!(hidden||snapshot.equivalent(&latest),"来源窗口已改变，保留系统窗口");
     let foreground=unsafe{GetForegroundWindow()}==snapshot.window;
     if foreground{crate::instance::request_activation(target);}
-    unsafe{snapshot.browser.Quit()}?;Ok(())
+    unsafe{snapshot.browser.Quit()}?;
+    // A `/select` launch runs in its own explorer.exe helper process. Once its
+    // only window is taken over that helper has nothing left to show, but it
+    // does not always exit; Windows then hands the next `/select` to it, and a
+    // helper without a window answers by opening its own default folder — which
+    // is how a reveal ends up highlighting an unrelated item or nothing at all.
+    reap_helper(profile,snapshot.pid);
+    Ok(())
+}
+/// Ends an explorer.exe helper that owned a taken-over window and kept running
+/// without any window of its own. The shell process and any process that still
+/// shows a window are left alone.
+fn reap_helper(profile:&Path,pid:u32){
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess,TerminateProcess,PROCESS_TERMINATE};
+    if pid==0{return;}
+    let mut shell=0u32;unsafe{GetWindowThreadProcessId(GetShellWindow(),Some(&mut shell));}
+    if pid==shell{return;}
+    for _ in 0..20{if !owns_windows(pid){break;}thread::sleep(Duration::from_millis(20));}
+    if owns_windows(pid){return;}
+    unsafe{
+        if let Ok(process)=OpenProcess(PROCESS_TERMINATE,false,pid){
+            let _=TerminateProcess(process,0);let _=CloseHandle(process);
+            log(profile,serde_json::json!({"event":"reap","pid":pid}));
+        }
+    }
+}
+unsafe extern "system" fn note_window_of(window:HWND,param:LPARAM)->windows::core::BOOL{
+    let wanted=param.0 as *const (u32,*mut bool);
+    let mut pid=0u32;unsafe{GetWindowThreadProcessId(window,Some(&mut pid));}
+    if !wanted.is_null()&&pid==unsafe{(*wanted).0}{unsafe{*(*wanted).1=true;}return windows::core::BOOL(0);}
+    windows::core::BOOL(1)
+}
+fn owns_windows(pid:u32)->bool{
+    let mut found=false;let context=(pid,&mut found as *mut bool);
+    unsafe{let _=EnumWindows(Some(note_window_of),LPARAM(&context as *const _ as isize));}
+    found
 }
 
 /// Explorer opens a double-clicked file-system folder itself instead of
@@ -197,6 +264,12 @@ static CONCEAL: AtomicBool = AtomicBool::new(false);
 /// falls back to Explorer when it cannot show a folder; concealing that window
 /// and forwarding it back would loop.
 static SUPPRESS_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a forwarded window is kept around to let a late selection land.
+/// `SHOpenFolderAndSelectItems` (used by browsers' "show in folder") asks the
+/// shell to select into a window that already exists, so its selection can
+/// arrive well after the folder does.
+const FOLLOW_UP_WAIT:Duration=Duration::from_millis(1500);
 
 /// Leaves new Explorer windows alone for `window` (used by these fallbacks).
 pub fn suppress(window:Duration){
@@ -286,7 +359,7 @@ impl Bridge{
                     since.clear();
                 }else{
                     // A window that could not be taken over must not stay invisible.
-                    let stale:Vec<_>=since.iter().filter(|(_,at)|at.elapsed()>=Duration::from_millis(2500)).map(|(window,_)|*window).collect();
+                    let stale:Vec<_>=since.iter().filter(|(_,at)|at.elapsed()>=Duration::from_millis(4000)).map(|(window,_)|*window).collect();
                     for window in stale{concealed.remove(&window);since.remove(&window);reveal(window);}
                 }
                 if refresh.elapsed()>=Duration::from_secs(2){
@@ -320,12 +393,18 @@ impl Bridge{
                                 if baseline.contains(&key)||(!hidden&&!unsafe{IsWindowVisible(snapshot.window)}.as_bool())||!unsafe{IsWindowEnabled(snapshot.window)}.as_bool(){continue;}
                                 if snapshot.recycle&&!recycle_allowed{continue;}
                                 // Explorer resolves `explorer.exe /select` in two
-                                // steps: a window is created at the start folder
-                                // and only then navigates to the requested one.
-                                // Forwarding the first state would open the wrong
-                                // folder, so wait for a settled pair.
-                                if !snapshot.consistent(){candidates.remove(&key);continue;}
-                                let settle=if hidden{Duration::from_millis(40)}else{Duration::from_millis(600)};
+                                // steps: a window is created at its start
+                                // location and only then navigates to the
+                                // requested one. Forwarding the first state would
+                                // open the wrong folder, and that start location
+                                // brings its own default selection along, which
+                                // used to be forwarded as if it were the answer.
+                                if snapshot.busy||!snapshot.consistent(){candidates.remove(&key);continue;}
+                                // A concealed window is invisible, so a short
+                                // settle costs nothing while it still keeps a
+                                // start state that has not begun navigating from
+                                // being taken for the request.
+                                let settle=if hidden{Duration::from_millis(250)}else{Duration::from_millis(600)};
                                 match candidates.get(&key){
                                     Some((old,at)) if old.equivalent(&snapshot)&&at.elapsed()>=settle=>{
                                         baseline.insert(key);candidates.remove(&key);concealed.remove(&key);since.remove(&key);
@@ -333,7 +412,11 @@ impl Bridge{
                                         match result{Ok(())=>{forwarded+=1;write_status(&profile,true,forwarded,None);},Err(error)=>{if hidden{reveal(key);}write_status(&profile,true,forwarded,Some(&format!("{error:#}"))) }}
                                     }
                                     Some((old,_)) if old.equivalent(&snapshot)=>{}
-                                    _=>{candidates.insert(key,(snapshot,Instant::now()));}
+                                    _=>{
+                                        log(&profile,serde_json::json!({"event":"candidate","window":key,"pid":snapshot.pid,"hidden":hidden,
+                                            "busy":snapshot.busy,"folder":snapshot.folder,"selected":snapshot.selected}));
+                                        candidates.insert(key,(snapshot,Instant::now()));
+                                    }
                                 }
                             }
                         }

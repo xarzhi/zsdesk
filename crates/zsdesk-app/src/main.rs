@@ -36,7 +36,28 @@ impl Drop for ApplicationLifetime {
     fn drop(&mut self) { if let Some(handle) = self.0.take() { let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) }; } }
 }
 
+/// Hides the console window a console-subsystem build is handed.
+///
+/// Release builds are GUI programs, but a debug build is compiled as a console
+/// program so tracing reaches the terminal. Started by Explorer or by a login
+/// entry, that console belongs to nobody: it just sits on the desktop as an
+/// empty black window. A console that also serves a shell is left alone, so
+/// running the program from a terminal keeps the terminal — only a console
+/// created for this process alone (`GetConsoleProcessList` reporting one
+/// process) is ours to hide.
+fn hide_own_console() {
+    use windows::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    let mut attached = [0u32; 2];
+    if unsafe { GetConsoleProcessList(&mut attached) } != 1 { return; }
+    let console = unsafe { GetConsoleWindow() };
+    if console.0.is_null() { return; }
+    let _ = unsafe { ShowWindow(console, SW_HIDE) };
+}
+
 fn main() {
+    // Command-line modes answer on stdout, so their console stays visible.
+    if !app::is_import_cli() { hide_own_console(); }
     if let Some(result)=context_menu_process::run_worker_if_requested(){if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;}
     if let Some(result)=window::preview_process::run_if_requested(){
         if let Err(error)=result{eprintln!("{error:#}");std::process::exit(1);}return;

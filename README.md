@@ -10,7 +10,7 @@ Windows 原生文件管理器，使用 Rust、Win32/COM、Direct2D 和 DirectWri
 
 ## 版本
 
-当前版本：0.3.8。
+当前版本：0.3.9。
 
 | 版本 | Cargo features | 功能 |
 |---|---|---|

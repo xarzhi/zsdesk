@@ -1244,9 +1244,26 @@ mod tests {
             hidden: false, size, modified, created: None, icon: 0, drive: None }
     }
 
+    /// A "在文件夹中显示" request names a file; the list must highlight that row
+    /// (by label or real name) and say so, or the caller keeps retrying and the
+    /// old selection stays on screen looking like the answer.
     #[test]
-    fn sorting_keeps_folders_first_and_follows_natural_order() {
-        let mut items = vec![entry("b.txt", false, Some(2), None), entry("a", true, None, None), entry("a10.txt", false, Some(3), None), entry("a2.txt", false, Some(1), None)];
+    fn a_reveal_selects_the_named_row_or_reports_a_miss() {
+        let mut view = FileView::default();
+        view.items = vec![entry("alpha.txt", false, None, None), entry("报告.docx", false, None, None),
+            entry("zulu.txt", false, None, None)];
+        assert!(view.select_names(&["zulu.txt".into()]));
+        assert_eq!(view.file_names(), ["zulu.txt".to_string()]);
+        assert!(view.select_names(&["报告.docx".into(), "alpha.txt".into()]));
+        assert_eq!(view.selection.len(), 2);
+        // Not in the folder yet (still enumerating): the request must not stick
+        // a wrong row into the selection.
+        assert!(!view.select_names(&["missing.txt".into()]));
+        assert_eq!(view.selection.len(), 2, "a failed reveal leaves the selection alone");
+    }
+
+    #[test]
+    fn sorting_keeps_folders_first_and_follows_natural_order() {        let mut items = vec![entry("b.txt", false, Some(2), None), entry("a", true, None, None), entry("a10.txt", false, Some(3), None), entry("a2.txt", false, Some(1), None)];
         sort_items(&mut items, SortKey::Name, true);
         let names: Vec<_> = items.iter().map(|item| item.name.as_str()).collect();
         assert_eq!(names, ["a", "a2.txt", "a10.txt", "b.txt"]);
